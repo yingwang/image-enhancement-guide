@@ -48,6 +48,13 @@ extra:
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/yingwang
+  alternate:
+    - name: 中文
+      link: /image-enhancement-guide/
+      lang: zh
+    - name: English
+      link: /image-enhancement-guide/en/
+      lang: en
 
 markdown_extensions:
   - admonition
@@ -95,25 +102,46 @@ plugins:
         - zh
 
 nav:
-  - 首页: README.md
-  - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
-  - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
-  - 第 3 章 — 损失函数全景: chapters/03-losses.md
-  - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
-  - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
-  - 第 6 章 — CNN 时代: chapters/06-cnn.md
-  - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
-  - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
-  - 第 9 章 — 扩散的条件控制: chapters/09-control.md
-  - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
-  - 第 11 章 — 训练稳定性: chapters/11-training.md
-  - 第 12 章 — 评估方法论: chapters/12-evaluation.md
-  - 第 13 章 — 视频不只是图像加时间: chapters/13-video-basics.md
-  - 第 14 章 — VSR / 帧插值 / 视频修复: chapters/14-video-models.md
-  - 第 15 章 — 推理优化: chapters/15-inference.md
-  - 第 16 章 — 真实场景案例: chapters/16-cases.md
-  - 第 17 章 — 失败案例集: chapters/17-failures.md
-  - 第 18 章 — SOTA 模型: chapters/18-sota.md
+  - 中文:
+    - 首页: README.md
+    - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
+    - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
+    - 第 3 章 — 损失函数全景: chapters/03-losses.md
+    - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
+    - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
+    - 第 6 章 — CNN 时代: chapters/06-cnn.md
+    - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
+    - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
+    - 第 9 章 — 扩散的条件控制: chapters/09-control.md
+    - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
+    - 第 11 章 — 训练稳定性: chapters/11-training.md
+    - 第 12 章 — 评估方法论: chapters/12-evaluation.md
+    - 第 13 章 — 视频不只是图像加时间: chapters/13-video-basics.md
+    - 第 14 章 — VSR / 帧插值 / 视频修复: chapters/14-video-models.md
+    - 第 15 章 — 推理优化: chapters/15-inference.md
+    - 第 16 章 — 真实场景案例: chapters/16-cases.md
+    - 第 17 章 — 失败案例集: chapters/17-failures.md
+    - 第 18 章 — SOTA 模型: chapters/18-sota.md
+  - English:
+    - Home: en/README.md
+    - Ch. 1 — Degradation Model: en/chapters/01-degradation-model.md
+    - Ch. 2 — Pixel, Feature, Latent: en/chapters/02-representation.md
+    - Ch. 3 — Loss Landscape: en/chapters/03-losses.md
+    - Ch. 4 — Pitfalls of Metrics: en/chapters/04-metrics.md
+    - Ch. 5 — Data & Degradation: en/chapters/05-degradation-pipeline.md
+    - Ch. 6 — The CNN Era: en/chapters/06-cnn.md
+    - Ch. 7 — Transformer in Low-Level Vision: en/chapters/07-transformer.md
+    - Ch. 8 — Diffusion Basics: en/chapters/08-diffusion.md
+    - Ch. 9 — Conditioning Diffusion: en/chapters/09-control.md
+    - Ch. 10 — Task-Specific Models: en/chapters/10-task-specific.md
+    - Ch. 11 — Training Stability: en/chapters/11-training.md
+    - Ch. 12 — Evaluation Methodology: en/chapters/12-evaluation.md
+    - Ch. 13 — Video Is Not Image × N: en/chapters/13-video-basics.md
+    - Ch. 14 — VSR / VFI / Restoration: en/chapters/14-video-models.md
+    - Ch. 15 — Inference Optimization: en/chapters/15-inference.md
+    - Ch. 16 — Real-World Cases: en/chapters/16-cases.md
+    - Ch. 17 — Failure Modes: en/chapters/17-failures.md
+    - Ch. 18 — SOTA Models: en/chapters/18-sota.md
 
 copyright: |
   Copyright &copy; 2026 Ying Wang —

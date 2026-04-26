@@ -45,11 +45,15 @@ jobs:
             "mkdocs>=1.6" \
             "mdx-truly-sane-lists>=1.3"
 
-      - name: Assemble docs/ from chapters/
+      - name: Assemble docs/ from chapters/ + en/
         run: |
-          mkdir -p docs/chapters docs/stylesheets docs/javascripts
+          mkdir -p docs/chapters docs/en/chapters docs/stylesheets docs/javascripts
           cp README.md docs/README.md
           cp -r chapters/. docs/chapters/
+          cp en/README.md docs/en/README.md
+          if [ -d en/chapters ] && [ "$(ls -A en/chapters)" ]; then
+            cp -r en/chapters/. docs/en/chapters/
+          fi
           cp stylesheets/extra.css docs/stylesheets/extra.css
           cp javascripts/mathjax.js docs/javascripts/mathjax.js
 
