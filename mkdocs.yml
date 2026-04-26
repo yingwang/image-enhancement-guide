@@ -1,5 +1,5 @@
-site_name: 影像增强：从原理到工程 / Image Enhancement: From Principles to Engineering
-site_description: 从退化模型 y = D(x) + n 出发，理解影像增强的第一性原理，掌握从 CNN/Transformer 到扩散模型的完整工程实践。
+site_name: "影像增强：从原理到工程 / Image Enhancement: From Principles to Engineering"
+site_description: "从退化模型 y = D(x) + n 出发，理解影像增强的第一性原理，掌握从 CNN/Transformer 到扩散模型的完整工程实践。"
 site_url: https://yingwang.github.io/image-enhancement-guide/
 repo_url: https://github.com/yingwang/image-enhancement-guide
 repo_name: yingwang/image-enhancement-guide
