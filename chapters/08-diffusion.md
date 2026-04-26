@@ -572,10 +572,15 @@ def train_diffusion_enhancement(
             lr_img = lr_img.to(device)
             hr_img = hr_img.to(device)
 
-            # 1. 编码到潜空间
+            # 0. 关键: 把 LR 上采样到 HR 同样大小, 让 latent 空间对齐
+            # 否则 vae.encode(lr_img) 的潜空间比 hr_latent 小, 不能直接 concat
+            lr_img_upsampled = F.interpolate(lr_img, size=hr_img.shape[-2:],
+                                             mode='bicubic', align_corners=False)
+
+            # 1. 编码到潜空间 (此时 hr_latent 和 lr_latent 同 spatial 大小)
             with torch.no_grad():
                 hr_latent = vae.encode(hr_img).latent_dist.sample() * 0.18215
-                lr_latent = vae.encode(lr_img).latent_dist.mean * 0.18215
+                lr_latent = vae.encode(lr_img_upsampled).latent_dist.mean * 0.18215
 
             # 2. 加噪到 hr_latent
             B = hr_latent.shape[0]
@@ -609,16 +614,22 @@ def train_diffusion_enhancement(
 ```python
 @torch.no_grad()
 def diffusion_enhance(unet, vae, scheduler, lr_img,
+                       target_size=None,
                        num_inference_steps=20, guidance_scale=2.0):
     """
     给定 LR 图, 生成 HR 估计。
+    target_size: (H, W) HR 输出尺寸; 默认 LR 的 4×。
     """
     device = lr_img.device
+    if target_size is None:
+        target_size = (lr_img.shape[-2] * 4, lr_img.shape[-1] * 4)
 
-    # 1. LR 编码到 latent
-    lr_latent = vae.encode(lr_img).latent_dist.mean * 0.18215
+    # 1. 关键: 把 LR 上采样到目标尺寸再过 VAE, 让 latent 空间等于 HR 的 latent 大小
+    lr_upsampled = F.interpolate(lr_img, size=target_size,
+                                 mode='bicubic', align_corners=False)
+    lr_latent = vae.encode(lr_upsampled).latent_dist.mean * 0.18215
 
-    # 2. 从纯噪声开始 (latent 大小 = LR latent 大小)
+    # 2. 从纯噪声开始 (与 LR latent 同 spatial 大小)
     x_t = torch.randn_like(lr_latent)
 
     # 3. 设置 inference 时间步 (DPM-Solver / DDIM)
@@ -636,7 +647,9 @@ def diffusion_enhance(unet, vae, scheduler, lr_img,
     return hr_img.clamp(0, 1)
 ```
 
-注意输出是 latent 解码后的图，分辨率取决于 VAE 配置（通常 LR 的 8× = 上采样 8×）。如果要 4× SR，可以让 LR 一开始就是 2× 上采样过的，最终输出就是 4×。
+注意一个关键点：**LR 必须先被上采样到目标 HR 尺寸再过 VAE**——这样得到的 latent 与 hr_latent 同样大小，可以直接 concat。如果直接 `vae.encode(lr_img)`，得到的潜空间是 LR 大小（HR/8 比 LR/8 大 4×），shape 不匹配。
+
+输出分辨率由 `target_size` 决定，VAE 解码后的图就是这个尺寸。
 
 ## 8.15 小结
 

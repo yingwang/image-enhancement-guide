@@ -225,15 +225,26 @@ class ControlNetForSR(nn.Module):
     ControlNet 复制其 encoder + mid block, 加 zero conv。
     """
 
-    def __init__(self, sd_unet: nn.Module, lr_input_channels: int = 3):
+    def __init__(self, sd_unet: nn.Module, lr_input_channels: int = 3,
+                 latent_channels: int = 4):
         super().__init__()
         # 复制主 UNet 的 encoder + mid (浅拷贝结构, 深拷贝权重)
         self.input_blocks = copy.deepcopy(sd_unet.input_blocks)
         self.middle_block = copy.deepcopy(sd_unet.middle_block)
 
-        # 第一层 conv 接受 LR 输入
-        # SD UNet 第一层是 (3 → 320), 这里改成 (3 → 320)
-        # 如果 LR 已经被 VAE 编码到 latent, 用 (4 → 320)
+        # 关键: 复制后必须替换第一层 conv, 因为 SD UNet 的第一层是 4 通道入,
+        # 而 ControlNet 接受 (x_t || lr_latent) 共 8 通道 (官方 ControlNet 用单独
+        # 的 condition embedding, 这里为简洁直接 concat 到输入)
+        old_conv = self._first_conv(self.input_blocks)
+        new_conv = nn.Conv2d(
+            latent_channels * 2, old_conv.out_channels,
+            kernel_size=old_conv.kernel_size, padding=old_conv.padding,
+        )
+        with torch.no_grad():
+            new_conv.weight[:, :latent_channels] = old_conv.weight
+            new_conv.weight[:, latent_channels:] = 0      # 让多出的通道初始无效
+            new_conv.bias[:] = old_conv.bias
+        self._replace_first_conv(self.input_blocks, new_conv)
 
         # Zero convs 接每个 input_block 输出
         self.zero_convs = nn.ModuleList()
@@ -246,7 +257,7 @@ class ControlNetForSR(nn.Module):
             self._get_block_out_ch(self.middle_block),
         )
 
-        # LR 在喂给 ControlNet 前的预处理 (downsample 到 latent 大小)
+        # LR 在喂给 ControlNet 前的预处理 (RGB -> latent 大小)
         self.cond_pre = nn.Sequential(
             nn.Conv2d(lr_input_channels, 16, 3, padding=1, stride=2),
             nn.SiLU(),
@@ -254,8 +265,25 @@ class ControlNetForSR(nn.Module):
             nn.SiLU(),
             nn.Conv2d(32, 64, 3, padding=1, stride=2),
             nn.SiLU(),
-            nn.Conv2d(64, 4, 3, padding=1),
+            nn.Conv2d(64, latent_channels, 3, padding=1),
         )
+
+    @staticmethod
+    def _first_conv(input_blocks):
+        for m in input_blocks[0].modules():
+            if isinstance(m, nn.Conv2d):
+                return m
+        raise RuntimeError("no conv found in first input block")
+
+    @staticmethod
+    def _replace_first_conv(input_blocks, new_conv):
+        # 简化: 真实 SD UNet 第一个 input_block 通常是单独的 input conv,
+        # 这里用搜索-替换示意。生产实现请按具体 UNet 结构精确替换。
+        for parent in input_blocks.modules():
+            for name, child in list(parent.named_children()):
+                if isinstance(child, nn.Conv2d) and child.in_channels in (4, 8):
+                    setattr(parent, name, new_conv)
+                    return
 
     def forward(self, x_t, lr_img, t, context):
         """
@@ -267,7 +295,7 @@ class ControlNetForSR(nn.Module):
         # 把 LR 处理到 latent 大小
         lr_latent = self.cond_pre(lr_img)
 
-        # ControlNet 的输入 = 噪声 latent + LR latent (concat)
+        # ControlNet 的输入 = 噪声 latent + LR latent (concat 成 8 通道)
         h = torch.cat([x_t, lr_latent], dim=1)
 
         outs = []
@@ -435,9 +463,18 @@ def tile_diffusion_inference(
 
     blend_mask = blend_mask.to(hr_img_tensor.device)
 
-    # 滑动窗口推理
-    for top in range(0, H - tile_size + 1, stride):
-        for left in range(0, W - tile_size + 1, stride):
+    # 滑动窗口推理 - 关键: 用 anchored ranges 保证最后一个 tile 落在 H-tile_size,
+    # 否则当 (H - tile_size) 不是 stride 整数倍时, 右/下边缘会缺失覆盖。
+    def anchored_starts(total: int, tile: int, step: int):
+        if total <= tile:
+            return [0]
+        starts = list(range(0, total - tile, step))
+        if starts[-1] + tile < total:
+            starts.append(total - tile)
+        return starts
+
+    for top in anchored_starts(H, tile_size, stride):
+        for left in anchored_starts(W, tile_size, stride):
             tile = hr_img_tensor[:, :, top:top+tile_size, left:left+tile_size]
             tile_out = pipeline(tile, **pipe_kwargs)
 

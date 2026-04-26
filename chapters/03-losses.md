@@ -377,10 +377,10 @@ def diffusion_simple_loss(model, x0, t, noise_scheduler):
 v-prediction（Salimans & Ho 2022）改成预测：
 
 $$
-v_t = \alpha_t \epsilon - \sigma_t x_0
+v_t = \sqrt{\bar{\alpha}_t} \cdot \epsilon - \sqrt{1 - \bar{\alpha}_t} \cdot x_0
 $$
 
-这个量在所有 $t$ 上数值范围相对均匀，训练更稳，特别是在低 $t$ 区域。Stable Diffusion 2.x、SDXL refiner、Imagen 都用 v-prediction。
+其中 $\sqrt{\bar{\alpha}_t}$ 是信号缩放系数、$\sqrt{1 - \bar{\alpha}_t}$ 是噪声缩放系数（与 8.3 节同一定义）。这个量在所有 $t$ 上数值范围相对均匀，训练更稳，特别是在低 $t$ 区域。Stable Diffusion 2.x、Imagen 用 v-prediction；SDXL base 模型则仍用 epsilon-prediction（具体看 checkpoint 的 `prediction_type` 配置）。
 
 ### x0-prediction
 

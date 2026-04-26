@@ -176,7 +176,7 @@ loss_fn_alex = lpips.LPIPS(net='alex')   # net='alex' 更接近人眼, 'vgg' 用
 def lpips_distance(pred: torch.Tensor, target: torch.Tensor,
                    loss_fn: lpips.LPIPS) -> torch.Tensor:
     """计算 LPIPS 距离。
-    输入: [-1, 1] 范围的 RGB, shape (B, 3, H, W)
+    输入: [0, 1] 范围的 RGB, shape (B, 3, H, W)。函数内部会缩放到 [-1, 1]。
     返回: (B,) 每张图的 LPIPS 距离 (越小越像)
     """
     return loss_fn(pred * 2 - 1, target * 2 - 1).flatten()

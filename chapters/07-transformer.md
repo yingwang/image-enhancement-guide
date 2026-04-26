@@ -202,13 +202,13 @@ $$
 
 其中 $Q, K, V \in \mathbb{R}^{N \times d}$，$N = HW$ 是空间长度。$QK^T$ 是 $N \times N$，**复杂度 $O(N^2 d)$**。
 
-Restormer 的转置 attention：把 $Q, K, V$ 转置一下，变成 $\mathbb{R}^{d \times N}$。然后：
+Restormer 的转置 attention：把 $Q, K, V$ 转置一下，变成 $\mathbb{R}^{d \times N}$，并对 $Q, K$ 沿 token 维做 L2 归一化（$\hat{q}, \hat{k}$）。然后：
 
 $$
-\text{attention}(Q, K, V) = V \cdot \text{softmax}(K Q^T / \sqrt{N})
+\text{attention}(Q, K, V) = V \cdot \text{softmax}\!\left( \alpha \cdot \hat{k} \hat{q}^T \right)
 $$
 
-现在 $KQ^T$ 是 $d \times d$ 的小矩阵——**复杂度 $O(d^2 N)$**。
+其中 $\alpha$ 是每个 head 一个的可学温度参数。注意这里**用 cosine 相似度 + 温度**，不是除以 $\sqrt{N}$——这是 Restormer 与 vanilla attention 的另一个差异。$\hat{k} \hat{q}^T$ 是 $d \times d$ 的小矩阵——**复杂度 $O(d^2 N)$**。
 
 ### 这个 attention 在做什么
 
@@ -306,19 +306,20 @@ SwinIR 的 W-MSA 范围只有 $8 \times 8$。论文做实验发现：**SwinIR �
 
 这意味着 SwinIR 的容量没用满。HAT 的目标：**让模型利用更多的输入信息**。
 
-### 三个 attention 组合
+### 两类 attention block 组合
 
-HAT 的 HAB（Hybrid Attention Block）同时用三种 attention：
+HAT 的核心 block 不是单一的"三合一 attention"，而是 group 级别的两类 block 组合：
 
-1. **W-MSA**（窗口自注意力）：保留 SwinIR 的局部 + shifted window
-2. **CAB**（Channel Attention Block）：给 features 加 RCAN 风格的 channel attention，弥补 W-MSA 不会聚焦"重要通道"
-3. **OCAB**（Overlapping Cross-Attention Block）：跨窗口的 attention，让相邻窗口直接交换信息（不需要 shifted window 的间接传播）
-
-OCAB 的 trick：把 $8 \times 8$ 窗口扩大到 $12 \times 12$（包含相邻窗口的边缘），在扩大窗口内做 attention，但只输出原窗口大小的结果。这样每个窗口能直接看到相邻窗口的边缘像素。
+1. **HAB（Hybrid Attention Block）**：W-MSA + CAB 在同一个 block 内
+   - **W-MSA**（窗口自注意力）：继承 SwinIR 的局部 + shifted window
+   - **CAB**（Channel Attention Block）：给 features 加 RCAN 风格的 channel attention，弥补 W-MSA 不会聚焦"重要通道"
+2. **OCAB（Overlapping Cross-Attention Block）**：作为独立 block 放在 residual group 内
+   - 把 $8 \times 8$ 窗口扩大到 $12 \times 12$（包含相邻窗口的边缘），在扩大窗口内做 cross-attention
+   - 让每个窗口能直接看到相邻窗口的边缘像素，不依赖 shifted window 的间接传播
 
 ### 性能
 
-HAT-L（大版本）在 Set5 4× 上 **33.4 dB**，比 SwinIR 提升约 0.5 dB——**这在 SR 领域是非常显著的提升**。
+HAT-L（大版本）在 Set5 4× 上 **约 33.0–33.4 dB**（取决于训练设置和是否预训练 ImageNet），比 SwinIR 提升约 0.5 dB——**这在 SR 领域是非常显著的提升**。
 
 代价：参数量 ~40M，推理慢。生产环境很少直接用 HAT-L，但它**展示了 attention 设计还有多少空间**。
 
@@ -470,6 +471,9 @@ class SwinTransformerBlock(nn.Module):
         # 窗口分割 + attention + reverse
         windows = window_partition(x, self.window_size)             # (B*nW, M, M, C)
         windows = windows.view(-1, self.window_size ** 2, C)
+        # 注意: 完整 SW-MSA 还需要传入 attention mask, 防止 cyclic shift 后的
+        # "环绕" 像素跨真实图像边界相互 attend。这里省略 mask 让代码可读,
+        # 实际 SwinIR / Swin Transformer 的 self.attn 接受一个 mask 参数。
         attn_windows = self.attn(windows)
         attn_windows = attn_windows.view(-1, self.window_size,
                                          self.window_size, C)
@@ -487,7 +491,7 @@ class SwinTransformerBlock(nn.Module):
         return x
 ```
 
-实际 SwinIR 的代码在这上面加 RSTB（多个 STL 包一层残差）+ patch merging（如果分多 stage）+ 上采样头。完整 SwinIR 大约 1000 行。
+实际 SwinIR 的代码在这上面加 attention mask（处理 SW-MSA 的环绕问题）+ RSTB（多个 STL 包一层残差）+ patch merging（如果分多 stage）+ 上采样头。完整 SwinIR 大约 1000 行。
 
 ## 7.13 小结
 

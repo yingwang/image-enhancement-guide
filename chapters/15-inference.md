@@ -239,18 +239,27 @@ class TRTInferencer:
         self.context = self.engine.create_execution_context()
 
     def infer(self, input_array: np.ndarray) -> np.ndarray:
-        # 分配 GPU 内存
-        d_input  = cuda.mem_alloc(input_array.nbytes)
-        d_output = cuda.mem_alloc(input_array.nbytes)  # 假设输出大小相同
-
-        cuda.memcpy_htod(d_input, input_array)
-
-        # 运行推理
+        # 1. 设置动态输入 shape, 然后查询输出实际 shape
+        # 注意: SR 模型的输出 shape != 输入 shape (放大了 scale 倍)
         self.context.set_input_shape("input", input_array.shape)
-        bindings = [int(d_input), int(d_output)]
-        self.context.execute_v2(bindings)
+        out_shape = tuple(self.context.get_tensor_shape("output"))
 
-        output = np.empty_like(input_array)
+        # 2. 按真实 shape 分配显存
+        in_size  = int(np.prod(input_array.shape) * np.dtype(np.float32).itemsize)
+        out_size = int(np.prod(out_shape) * np.dtype(np.float32).itemsize)
+        d_input  = cuda.mem_alloc(in_size)
+        d_output = cuda.mem_alloc(out_size)
+        cuda.memcpy_htod(d_input, input_array.astype(np.float32))
+
+        # 3. TensorRT 10+ 推荐用 name-based API
+        self.context.set_tensor_address("input",  int(d_input))
+        self.context.set_tensor_address("output", int(d_output))
+        stream = cuda.Stream()
+        self.context.execute_async_v3(stream.handle)
+        stream.synchronize()
+
+        # 4. 拷贝回 CPU
+        output = np.empty(out_shape, dtype=np.float32)
         cuda.memcpy_dtoh(output, d_output)
         return output
 ```
@@ -328,11 +337,16 @@ mlmodel.save("model.mlpackage")
 iOS 17+ 支持 4-bit 权重量化，模型大小再减一半：
 
 ```python
-mlmodel_quantized = ct.optimize.coreml.OpPalettizerConfig(
-    nbits=4,
-    granularity="per_grouped_channel",
-    group_size=16,
-).apply(mlmodel)
+import coremltools.optimize.coreml as cto
+
+config = cto.OptimizationConfig(
+    global_config=cto.OpPalettizerConfig(
+        nbits=4,
+        granularity="per_grouped_channel",
+        group_size=16,
+    ),
+)
+mlmodel_quantized = cto.palettize_weights(mlmodel, config)
 ```
 
 实测：模型大小 50MB → 12MB，质量损失 <0.3 dB。

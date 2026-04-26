@@ -144,12 +144,16 @@ from typing import Optional
 
 
 class RealESRGANDegradation:
-    """Real-ESRGAN 风格的退化合成 (简化但完整)。
+    """Real-ESRGAN 风格退化的主流程示意 (非完整实现)。
     输入: HR clean image (B, 3, H, W) in [0, 1]
     输出: LR degraded image (B, 3, H/scale, W/scale) in [0, 1]
-    
-    省略部分: 真实代码里 blur kernel 类型更多, sinc 滤波, 
-    GPU 上的可微 JPEG 等; 这里给出主流程。
+
+    与官方 Real-ESRGAN 的差异:
+    - JPEG 用占位符 (官方用 diffjpeg)
+    - 没有 sinc 滤波 (官方用来模拟过锐化伪影)
+    - 模糊核只有各向同性高斯 (官方还有各向异性、广义高斯、plateau)
+    - 退化顺序固定 (官方的最终阶段 sinc/resize/JPEG 顺序随机化)
+    本节后面会逐项展开这些缺失部分。
     """
 
     def __init__(self, scale: int = 4):

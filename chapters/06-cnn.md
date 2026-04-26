@@ -352,10 +352,11 @@ Real-ESRGAN 沿用 RRDB 网络，只换数据 pipeline 和训练损失，效果�
 ### 移除清单
 
 - ❌ Batch Normalization
-- ❌ Layer Normalization 在每个 block 内
 - ❌ GELU / Swish（用更简单的 SimpleGate 代替）
 - ❌ Self-Attention（保留极简的 channel attention）
 - ❌ ReLU（Plain net 完全不用激活函数）
+
+注意：NAFNet **保留了简化的 LayerNorm2d**（每个 block 的 spatial 路径和 channel 路径开头各一次），并不是把所有归一化层都移除。它移除的是非线性 + attention 这两类"花架构"，归一化反而是稳定训练的必需。
 
 ### SimpleGate（替代 GELU）
 
@@ -374,7 +375,7 @@ class SimpleGate(nn.Module):
         return x1 * x2
 ```
 
-视觉影响：和 GELU 类似的非线性能力，**0 计算开销**（只是 reshape + multiply），无浮点运算。
+视觉影响：和 GELU 类似的非线性能力，**没有可学参数 + 比 GELU 便宜**（只是 chunk + 元素级乘法，没有 erf/exp 的近似计算）。
 
 ### Simplified Channel Attention（SCA）
 
@@ -645,12 +646,18 @@ class SRBaseline(nn.Module):
         self.tail = nn.Conv2d(ch, 3, 3, padding=1)
 
         # ICNR 初始化 PixelShuffle 前的卷积
+        # 注意 scale: 4× 总放大用两次 ×2, 所以这里 ICNR scale=2 与 UpsampleBlock 内部一致
+        # 如果是 ×3 直接放大, 应传 scale=3
+        per_step_scale = 2 if scale == 4 else scale
         for m in self.up.modules():
             if isinstance(m, nn.Conv2d):
-                self._icnr_init(m.weight)
+                self._icnr_init(m.weight, scale=per_step_scale)
 
     @staticmethod
     def _icnr_init(weight, scale: int = 2):
+        """ICNR: 初始化 PixelShuffle 前的卷积权重, 让 r^2 个分组初始权重相同。
+        scale 必须等于 PixelShuffle 的上采样倍率。
+        """
         out_ch = weight.shape[0]
         sub_ch = out_ch // (scale * scale)
         sub_kernel = torch.empty(sub_ch, *weight.shape[1:])

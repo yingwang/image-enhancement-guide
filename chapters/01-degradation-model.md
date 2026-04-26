@@ -361,9 +361,9 @@ def poisson_gaussian_noise(
 
 但真实数据贵且稀少，工程上的妥协是用**精确的合成噪声模型**，再用少量真实数据微调。
 
-## 1.8 完整的 Degradation 类
+## 1.8 简化的 Degradation 类（不含 JPEG）
 
-最后把这一章的概念串成一个 Real-ESRGAN 风格的退化类。这是第 5 章的预热版（精简、可读，省略了一些工程细节）：
+最后把这一章的概念串成一个 Real-ESRGAN 风格的退化类骨架。**这是预热版**——为了保持可读性，**省略了 JPEG 步骤**（真实 JPEG 需要 `diffjpeg` 库，第 5 章详谈），只保留 blur / downsample / noise 三步。完整版本在第 5 章。
 
 ```python
 import random
@@ -428,20 +428,13 @@ class SimpleDegradation:
             photons = (x * scale).clamp(min=0)
             return (torch.poisson(photons) / scale).clamp(0, 1)
 
-    # --- 4. JPEG ---
-    def random_jpeg(self, x: torch.Tensor) -> torch.Tensor:
-        """简化:用可微 JPEG 库(diffjpeg)真实做更好。这里给个占位符。"""
-        # 实际工程: from diffjpeg import DiffJPEG
-        # quality = random.randint(40, 95)
-        # return DiffJPEG(differentiable=False)(x, quality)
-        return x  # 此处省略
+    # --- JPEG 在第 5 章用 diffjpeg 实现, 这里省略 ---
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """一次完整退化, 顺序: blur -> downsample -> noise -> jpeg。"""
+        """简化退化, 顺序: blur -> downsample -> noise (无 JPEG)。"""
         y = self.random_blur(x)
         y = self.random_downsample(y)
         y = self.random_noise(y)
-        y = self.random_jpeg(y)
         return y
 ```
 

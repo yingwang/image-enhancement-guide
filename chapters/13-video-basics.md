@@ -224,8 +224,10 @@ CMOS 传感器逐行扫描，扫描时间内物体移动会产生几何变形：
 class VideoDegradation:
     """视频退化合成 pipeline。"""
 
-    def __init__(self):
-        self.image_degrader = RealESRGANDegradation()  # 第 5 章
+    def __init__(self, image_degrader_cls):
+        # image_degrader_cls 应支持显式传入退化参数 (blur_kernel, noise_sigma, ...)
+        # 这样我们可以一段视频共享一组参数, 而不是每帧重采样
+        self.image_degrader_cls = image_degrader_cls
 
     def __call__(self, hr_video: torch.Tensor) -> torch.Tensor:
         """
@@ -234,21 +236,31 @@ class VideoDegradation:
         """
         T = hr_video.shape[0]
 
-        # 1. 时序一致的图像退化 (同一组退化参数应用到所有帧)
-        # 这点很重要: 模糊核、噪声 sigma 等参数对整段视频固定,
-        # 否则会引入时序不一致
-        with self._fix_random_state():
-            lr_video = torch.stack([
-                self.image_degrader(hr_video[t:t+1])
-                for t in range(T)
-            ], dim=0).squeeze(1)
+        # 1. 关键: 整段视频共享一组退化参数
+        # 模糊核、噪声 sigma、JPEG quality 一段视频固定, 否则模型会学到
+        # "每帧退化都不同" 的错误分布, 引入时序不一致
+        clip_params = self._sample_clip_params()
+        image_degrader = self.image_degrader_cls(**clip_params)
 
-        # 2. 视频专用退化
+        lr_video = torch.stack([
+            image_degrader(hr_video[t:t+1])
+            for t in range(T)
+        ], dim=0).squeeze(1)
+
+        # 2. 视频专用退化 (整段一起处理)
         lr_video = self._add_motion_blur(lr_video)
         lr_video = self._video_compression(lr_video)
         lr_video = self._frame_drop_jitter(lr_video)  # 偶尔丢帧/重复帧
 
         return lr_video
+
+    def _sample_clip_params(self):
+        """采样一组退化参数, 整段视频共享。"""
+        return {
+            'blur_sigma': random.uniform(0.5, 3.0),
+            'noise_sigma': random.uniform(0.005, 0.05),
+            'jpeg_quality': random.randint(40, 95),
+        }
 
     def _video_compression(self, video):
         """模拟 H.264/H.265 压缩。

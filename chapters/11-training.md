@@ -358,7 +358,7 @@ loss 突然变 NaN
 控制 D 的 Lipschitz 常数，让 D 不会任意陡峭。
 
 ```python
-import torch.nn.utils.spectral_norm as spectral_norm
+from torch.nn.utils import spectral_norm
 
 class StableDiscriminator(nn.Module):
     def __init__(self, in_ch=3):
