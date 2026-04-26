@@ -86,6 +86,7 @@ extra_css:
   - stylesheets/extra.css
 
 extra_javascript:
+  - javascripts/mathjax.js
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 plugins:
@@ -96,21 +97,20 @@ plugins:
 
 nav:
   - 首页: README.md
-  - Part I · 基础:
-    - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
-    - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
-    - 第 3 章 — 损失函数全景: chapters/03-losses.md
-    - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
-    - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
-  - Part II · 架构:
-    - 第 6 章 — CNN 时代: chapters/06-cnn.md
-    - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
-    - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
-    - 第 9 章 — 扩散的条件控制: chapters/09-control.md
-    - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
-  - Part III · 训练与评估:
-    - 第 11 章 — 训练稳定性: chapters/11-training.md
-    - 第 12 章 — 评估方法论: chapters/12-evaluation.md
+  - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
+  - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
+  - 第 3 章 — 损失函数全景: chapters/03-losses.md
+  - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
+  - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
+  - 第 6 章 — CNN 时代: chapters/06-cnn.md
+  - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
+  - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
+  - 第 9 章 — 扩散的条件控制: chapters/09-control.md
+  - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
+  - 第 11 章 — 训练稳定性: chapters/11-training.md
+  - 第 12 章 — 评估方法论: chapters/12-evaluation.md
+  - 第 13 章 — 视频不只是图像加时间: chapters/13-video-basics.md
+  - 第 14 章 — VSR / 帧插值 / 视频修复: chapters/14-video-models.md
 
 copyright: |
   Copyright &copy; 2026 Ying Wang —
