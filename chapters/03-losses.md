@@ -285,7 +285,11 @@ def relativistic_d_loss(d_real: torch.Tensor, d_fake: torch.Tensor) -> torch.Ten
 
 
 def relativistic_g_loss(d_real: torch.Tensor, d_fake: torch.Tensor) -> torch.Tensor:
-    """RaGAN 生成器损失。"""
+    """RaGAN 生成器损失。
+    注意: 调用前 d_real 和 d_fake 应当是 D 在 G 输出和真值上的当前 logits,
+    且**反传时 D 的参数应该被冻结** (在 G step 里 set_requires_grad(D, False)),
+    避免 G 的损失意外更新到 D 上。
+    """
     real_logits = d_real - d_fake.mean()
     fake_logits = d_fake - d_real.mean()
     return (F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))

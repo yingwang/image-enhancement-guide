@@ -66,12 +66,13 @@ HR Image (创意丰富)
 
 ### 当前位置
 
-2024-2026 年扩散派 SR 的事实标杆。后续工作（DiffBIR、SeeSR、ResShift）都是对这条线的优化。
+2024 年扩散派 SR 的代表标杆。2025-2026 年方向往**单步 / 蒸馏**走——TSD-SR、AdcSR 等**一步出图**的工作把扩散派从 50 步推理降到 1-4 步，质量逼近 SUPIR 但速度提升一两个数量级。生产环境如果开始一个新项目，应该先看这些蒸馏后续，而不是直接上完整的 SUPIR。
 
 ### 论文与代码
 
 - 论文：Yu et al. "SUPIR: Scaling Up Image Super-Resolution" (CVPR 2024)
 - 代码：[github.com/Fanghua-Yu/SUPIR](https://github.com/Fanghua-Yu/SUPIR)
+- 后续蒸馏方向：TSD-SR、AdcSR、OSEDiff 等（2025 起）
 
 ## 18.3 Real-ESRGAN：真实退化建模派
 
@@ -135,13 +136,13 @@ HR Image (创意丰富)
 
 ### 关键数字
 
-- HAT-L 在 Set5 4× 上 33.4 dB（其他模型在 32.9 以下）
+- HAT-L 在 Set5 4× 上 **约 33.0–33.4 dB**（视训练设置/是否 ImageNet 预训练）
 - 参数量 ~40M
 - 推理：单张 256×256 在 A100 ~80ms
 
 ### 当前位置
 
-学术 benchmark SOTA 的代表。但生产环境用得不多——这个领域的"工程上限"和"benchmark 上限"是两回事。
+PSNR-导向 Transformer SR 的代表 baseline。**不是当前唯一 SOTA**——2024-2025 年 DRCT、Hi-IR 等模型在多个 benchmark 上与 HAT 互有胜负。但 HAT 仍是教学/蒸馏教师/对比基准的好选择。生产环境用得不多——这个领域的"工程上限"和"benchmark 上限"是两回事。
 
 ### 论文与代码
 

@@ -290,8 +290,10 @@ fid_metric = pyiqa.create_metric('fid')
 - **NIQE**（2013）：基于自然图像统计的距离
 - **BRISQUE**（2012）：基于 spatial 特征的分类器评分
 - **MUSIQ**（2021）：Vision Transformer 学的图像质量评分
-- **MANIQA**（2022）：注意力 + 多尺度，目前 NR-IQA 的 SOTA
+- **MANIQA**（2022）：注意力 + 多尺度，是 NR-IQA 的强 baseline
 - **CLIPIQA**（2023）：用 CLIP 评估"美感 / 真实感"
+
+> 何为"NR-IQA SOTA"高度依赖 benchmark（PIPAL、LIVE、KonIQ-10k 等），且 2024-2026 涌现了多个基于 MLLM/CLIP 的新方法。生产环境**多个 NR 指标一起报**，不要只盯一个。
 
 ```python
 import pyiqa

@@ -283,7 +283,7 @@ Apple 的推理框架，能跑在：
 
 - **CPU**（兼容所有设备）
 - **GPU**（M 系列芯片、iPhone GPU）
-- **Apple Neural Engine (ANE)**（M 系列芯片专用，超低功耗）
+- **Apple Neural Engine (ANE)**（M 系列 Mac + A 系列 iPhone/iPad，超低功耗）
 
 ### 工作流
 

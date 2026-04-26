@@ -133,6 +133,7 @@ Real-ESRGAN 的 pipeline 由两个关键设计组成：
 - 第一阶 blur 偏大（模拟实际相机/传输模糊）
 - 第二阶 blur 偏小（避免训练数据糊到不能学）
 - 第二阶有可能加 **sinc 滤波**——模拟过度锐化导致的振铃伪影（这是 LCD 显示器/某些图像处理软件特有的伪影）
+- 二阶最后阶段的 **resize / sinc / JPEG 顺序**在官方代码里是**随机化**的（每次训练 step 随机选一种顺序），不是固定的——这让模型见到更多组合
 
 ### 一个简化版的 Real-ESRGAN pipeline
 
@@ -307,7 +308,11 @@ $$
 k(u, v) \propto \exp\left(-\left(\frac{u^2}{\sigma_x^2} + \frac{v^2}{\sigma_y^2}\right)^\beta\right)
 $$
 
-多一个形状参数 $\beta$：$\beta < 1$ 像 plateau 模糊（中心平坦边缘陡峭），$\beta = 1$ 是标准高斯，$\beta > 1$ 边缘更尖。
+多一个形状参数 $\beta$：$\beta = 1$ 是标准高斯，$\beta > 1$ 边缘更尖（更接近 box）、$\beta < 1$ 边缘更软。
+
+### Plateau-shaped 核
+
+Real-ESRGAN 还使用一族 **plateau 核**——中心是一个平坦的"平台"区域、边缘陡降。它和广义高斯是**两个独立的家族**，不是简单的"$\beta < 1$ 等于 plateau"。Real-ESRGAN 在采样训练核时会按概率混合这几族（各向同性高斯、各向异性高斯、广义高斯、plateau）。
 
 ### 运动模糊核
 

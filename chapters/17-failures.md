@@ -464,7 +464,7 @@ CUDA 核 / cuDNN 的非确定性：
 
 ### 应对
 
-1. **推理时固定 batch size**：训练用什么 batch size，推理就用什么
+1. **推理时固定 batch size**：生产推理 batch size 选定后不要随业务负载抖动；与训练 batch size 是否相同**不是关键**——关键是在生产里**保持稳定**
 2. **设置 cuDNN deterministic**：
 
 ```python

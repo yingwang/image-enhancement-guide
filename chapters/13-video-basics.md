@@ -70,17 +70,25 @@ $$
 
 ```python
 # 用 RAFT 估计光流 (推荐用 torchvision 的预训练版本)
-from torchvision.models.optical_flow import raft_large
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
-model = raft_large(weights='C_T_SKHT_V2', progress=False).eval().cuda()
+weights = Raft_Large_Weights.C_T_SKHT_V2
+preprocess = weights.transforms()
+model = raft_large(weights=weights, progress=False).eval().cuda()
+
 
 def estimate_flow(frame_a: torch.Tensor, frame_b: torch.Tensor) -> torch.Tensor:
     """
-    frame_a, frame_b: (B, 3, H, W) in [-1, 1]
+    frame_a, frame_b: (B, 3, H, W) RGB in [0, 1]
     返回: (B, 2, H, W) flow from a to b (u, v)
+
+    注意:
+    - RAFT 要求 H 和 W 都能被 8 整除, 否则需要 pad 到 8 的倍数再 crop 回来
+    - preprocess 会做归一化, 不要重复归一化
     """
+    a, b = preprocess(frame_a, frame_b)
     with torch.no_grad():
-        flow_list = model(frame_a, frame_b)
+        flow_list = model(a, b)
     return flow_list[-1]   # 最终迭代结果
 ```
 
@@ -418,14 +426,20 @@ EDVR 等模型用 **DCN (Deformable Convolution Network)** 学习对齐：
 - **tLP (temporal LPIPS)**：相邻帧的 LPIPS 距离
 
 ```python
-def temporal_lpips(frames: torch.Tensor, lpips_fn) -> float:
+def temporal_lpips_warped(frames: torch.Tensor, flows: list,
+                          lpips_fn) -> float:
     """
-    frames: (T, C, H, W)
-    返回: 相邻帧之间的平均 LPIPS。越小越一致。
+    frames: (T, C, H, W) — 已增强后的视频帧
+    flows: 长度 T-1, 每个是 (1, 2, H, W) 的前向光流 t -> t+1
+    返回: 相邻帧 (运动补偿后) 之间的平均 LPIPS。越小越一致。
+
+    重要: 不能直接 LPIPS(frame[t], frame[t+1]),
+    那样真实运动也会被算作 "时序不一致"。必须先用光流 warp 对齐。
     """
     losses = []
     for t in range(frames.shape[0] - 1):
-        losses.append(lpips_fn(frames[t:t+1], frames[t+1:t+2]).item())
+        warped = warp_with_flow(frames[t+1:t+2], flows[t])
+        losses.append(lpips_fn(frames[t:t+1], warped).item())
     return sum(losses) / len(losses)
 ```
 
