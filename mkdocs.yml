@@ -13,12 +13,13 @@ theme:
   name: material
   language: zh
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.top
     - navigation.indexes
     - navigation.tracking
     - navigation.instant
     - navigation.instant.progress
-    - navigation.expand
     - toc.follow
     - search.highlight
     - search.share
