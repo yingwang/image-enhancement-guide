@@ -158,7 +158,7 @@ Zhang & Agrawala (2023) proposed ControlNet, the **de facto standard** for diffu
 The main UNet is left untouched (its pretrained weights preserved); ControlNet is an **add-on**. The advantages of this design:
 
 1. **Preserves pretrained knowledge**: all the abilities of the main UNet (including the semantic understanding of text-to-image) are unchanged
-2. **Training cost is relatively manageable**: only ControlNet (about 1.4× the size of the main UNet) is trained, the main UNet is not touched
+2. **Trainable parameter count is smaller than full fine-tuning**: ControlNet copies the encoder + mid block of the main UNet, so trainable params are about 0.4–0.5× the main UNet (on SD 1.5: ControlNet ≈ 360M vs. main UNet ≈ 860M). But **memory cost is not modest** — the forward pass still runs the full main UNet to produce skip features, and only the ControlNet portion sees gradients in the backward pass. Training an SDXL ControlNet on a single GPU still requires 40GB+; this is not a "LoRA-cheap" setup
 3. **Stackable**: multiple ControlNets can act simultaneously (one for LR, one for an edge map, one for a depth map)
 
 ### The specific structure of ControlNet

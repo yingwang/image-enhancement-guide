@@ -8,7 +8,7 @@
 
 ## 17.1 Why we need this chapter
 
-Section 12.10 introduced "failure case suite" as an evaluation method. This chapter is the content version—**a systematic catalog of failure modes that recur in the field**.
+Section 12.15 introduced "failure case suite" as an evaluation method. This chapter is the content version—**a systematic catalog of failure modes that recur in the field**.
 
 Rule of thumb:
 
@@ -204,7 +204,7 @@ Tiles are processed independently:
 
 ### Mitigation
 
-1. **Overlap + blend** (Section 15.8): mandatory, not optional
+1. **Overlap + blend** (Section 15.9): mandatory, not optional
 2. **Larger overlap**: 256-pixel overlap looks better than 64 pixels (but is slower)
 3. **Mirror padding at edges**: edge tiles use reflect padding instead of constant padding
 4. **Shared noise (diffusion)**: all tiles share the same noise seed for structural continuity

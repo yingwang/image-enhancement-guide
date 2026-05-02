@@ -549,7 +549,9 @@ def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
 
 ## 8.13 一个增强任务的扩散训练流程
 
-把上面的概念串成一个增强任务的训练循环。这是 SUPIR/StableSR 的简化版：
+把上面的概念串成一个增强任务的训练循环。下面用的是**最简单的 latent concat 方案**——把 LR 上采样到 HR 尺寸后过 VAE，得到的 lr_latent 与 hr_latent 同 spatial 大小，直接 concat 进 UNet 输入通道。这个路线接近 LDM 论文里 LDSR 的做法，理解扩散增强训练的最小骨架够用。
+
+需要说明：**SUPIR / StableSR 不是这么做的**。它们都用 ControlNet / 时序 feature injection 把 LR 信号加到主 UNet 的 skip 上（StableSR 用 time-aware encoder，SUPIR 用 ZeroSFT + ControlNet），主 UNet 权重大部分不动。input concat 这条路最大的弱点是 fidelity 偏弱、对 LR 输入分布敏感；生产上做扩散 SR 推荐看第 9 章的 ControlNet 路线。
 
 ```python
 def train_diffusion_enhancement(

@@ -158,7 +158,7 @@ Zhang & Agrawala (2023) 的 ControlNet 是扩散控制的**事实标准**。它�
 主 UNet 完全不动（保留预训练权重），ControlNet 是一个**外挂**。这种设计的优势：
 
 1. **保留预训练知识**：主 UNet 的所有能力（包括 text-to-image 的语义理解）不变
-2. **训练成本相对可控**：只训 ControlNet（约 1.4× 主 UNet 大小），不动主 UNet
+2. **训练参数比全量微调小**：ControlNet 复制主 UNet 的 encoder + mid block，可训练参数约为主 UNet 的 0.4–0.5×（SD 1.5 上 ControlNet ≈ 360M vs 主 UNet ≈ 860M）。但**显存开销不可控**——前向时主 UNet 仍要全量参与算 skip features，反向只有 ControlNet 那部分有梯度。SDXL 上单卡训 ControlNet 实测仍要 40GB+，不是 LoRA 那种"小成本"
 3. **可以堆叠**：多个 ControlNet 同时作用（一个管 LR、一个管 edge map、一个管 depth map）
 
 ### ControlNet 的具体结构

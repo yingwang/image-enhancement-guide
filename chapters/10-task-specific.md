@@ -432,7 +432,104 @@ class UnrolledMRIRecon(nn.Module):
 
 通用 SR 模型完全不适用——它们没有衍射极限的概念。
 
-## 10.11 视频增强里的任务特化（预热）
+## 10.11 参考引导增强（Reference-based）
+
+到这里讲的所有任务特化都是**单图输入**（single-image / blind）——只有 LR，靠先验补 HR 信息。还有一类被工业界用得很多但学术中文资料几乎没系统讲过的范式：**参考引导**（reference-based / Ref-based），简称 **RefSR / RefIR**。
+
+### 范式
+
+输入除了 LR 还有一张或多张**参考图**（reference image, $\text{Ref}$）：
+
+$$
+\hat{x} = f(y, \text{Ref})
+$$
+
+参考图不是 HR 真值（那叫 paired training），而是**和 LR 内容相关但不完全一致**的高质量图：
+
+- 同场景不同时间拍的 HR
+- 同一物体的另一个角度的 HR
+- 用户相册里同一个人的高清照片
+- 双摄手机的另一颗摄像头同时拍的同场景 HR
+
+模型的工作变成：**从 Ref 里找和 LR 局部对应的 patch，把 Ref 的纹理迁移过去**。
+
+### 代表方法
+
+- **MASA-SR**（CVPR 2021）：cross-attention 在 LR 与 Ref 之间做 patch matching，对错位有鲁棒性
+- **C2-Matching**（CVPR 2021）：把 matching 拆成两步——粗对齐 + 精细 correspondence learning
+- **DATSR**（ECCV 2022）：deformable attention，处理 Ref 与 LR 的几何变形
+- **AccelIR / RefSR-Lite**：移动端蒸馏版本
+
+核心模块都是 **cross-attention between LR feature and Ref feature**——和第 7 章 Transformer 在低层视觉的注意力一脉相承，只是 Q 来自 LR、K/V 来自 Ref。
+
+### 关键工程问题
+
+参考引导**不是"用 Ref 监督训练"**，而是**推理时也要传 Ref 进来**。这带来一系列工程问题：
+
+1. **Ref 的几何对齐**：Ref 与 LR 视角、缩放、光照可能不同。模型必须 robust 到 misalignment——这是 MASA / DATSR 的核心研究点
+2. **Ref 缺失的退化 fallback**：用户没传 Ref 怎么办？必须有 single-image fallback 模式（典型做法：训练时随机用 LR 自身上采样图当 fake Ref）
+3. **Ref 选择**：多个候选 Ref 时选哪张？经验是按 CLIP image embedding 相似度选 top-k
+4. **Ref 偏置风险**：如果 Ref 是错的（比如同名不同人），模型会把错误纹理迁移过来——**比无 Ref 时崩得更难看**
+
+### 工业场景
+
+RefSR 在产品里的实际位置远比论文显示的重要：
+
+**双摄/多摄手机**：
+
+- 主摄 + 长焦同时曝光：长焦帧分辨率高但视场窄，主摄视场宽但中心区域分辨率低 → 用长焦帧作为主摄中心区的 Ref
+- 主摄 + 微距：微距高分辨率，可作为主摄局部细节 Ref
+- iPhone Pro、Pixel Pro、华为/小米旗舰的"长焦增强"路线本质都是这个
+
+**智能相册**：
+
+- 用户拍了 100 张同一个人的照片，其中几张高清几张糊
+- 修复糊的那几张时，**用相册里同人脸的高清照作为 Ref**
+- Google Photos / 腾讯相册的"人物修复"功能背后是这条线
+- 注意：这是 blind face restoration（CodeFormer）的工程互补——CodeFormer 用通用人脸先验，RefSR 用**这个人**的先验
+
+**多帧 burst 摄影**：
+
+- 连拍 8 帧，每帧都有不同的运动模糊和噪声
+- 选最清晰的几帧作为 Ref，对齐后融合到主帧
+- Google HDR+、Apple Deep Fusion 是这条线的工业实现（虽然他们不叫 RefSR，但本质相同）
+
+**视频帧间引导**：
+
+- 长视频 SR 时，**关键帧（I-frame）**用大模型高质量增强，**P/B 帧**用 RefSR 引导（参考关键帧）
+- 推理代价从"每帧大模型"降到"每 GOP 一次大模型 + N 次 RefSR"
+- 这条路线在 4K 直播 / 视频会议增强里很有用
+
+### 与 blind 范式的关系
+
+RefSR 不是 blind/non-blind 的第三种——它是**多输入 blind**：依然不知道 $D$，但有额外信息 Ref 帮你"猜" $x$。这个额外信号在工程上极有价值：
+
+| 范式 | 输入 | 难度 | 质量上限 |
+|------|------|------|---------|
+| Non-blind 单图 | $y, D$ | 低 | 高（如果 $D$ 准） |
+| Blind 单图 | $y$ | 高 | 中（依赖先验） |
+| **Blind 多图（RefSR）** | $y, \text{Ref}$ | 中 | **更高**（Ref 给真实纹理） |
+
+这就是为什么手机厂商把 RefSR 当作旗舰功能——同样的算力预算下，**Ref 提供的信息比任何单图先验都强**。
+
+### 该不该用 RefSR
+
+工程决策：
+
+- **能拿到 Ref 就用**——质量上限明显高于纯 single-image
+- **Ref 必须做几何对齐预处理**（光流 / SIFT / cross-attention 自己学）
+- **必须有 single-image fallback**——不能强依赖
+- **要做 Ref 偏置检测**——CLIP 相似度太低就不用 Ref，回退到 single-image
+
+学术 benchmark 上 RefSR 看起来比 single-image 好得有限（CUFED5 / WR-SR 这些标准 benchmark 的 Ref 信号本身有限），但**真实多摄手机场景下提升能到 1-2 dB**——这个差距是工业界长期愿意投入这条线的原因。
+
+### 论文与代码
+
+- MASA-SR：[github.com/dvlab-research/MASA-SR](https://github.com/dvlab-research/MASA-SR)
+- C2-Matching：[github.com/yumingj/C2-Matching](https://github.com/yumingj/C2-Matching)
+- DATSR：[github.com/caojiezhang/DATSR](https://github.com/caojiezhang/DATSR)
+
+## 10.12 视频增强里的任务特化（预热）
 
 视频增强也有任务特化的需求，第 13-14 章会展开：
 
@@ -443,7 +540,7 @@ class UnrolledMRIRecon(nn.Module):
 
 这些任务都有自己的归纳偏置和约束。
 
-## 10.12 任务特化模型的设计方法论
+## 10.13 任务特化模型的设计方法论
 
 如果你要为一个新任务设计特化模型，按这个流程：
 
@@ -490,7 +587,7 @@ class UnrolledMRIRecon(nn.Module):
 - 文字：手写、印章、低对比度
 - 医疗：罕见病灶、伪影、运动模糊
 
-## 10.13 小结
+## 10.14 小结
 
 1. **通用模型在某些领域必然失败**——人脸、文字、医疗、遥感、显微，各有不同的归纳偏置
 2. **人脸增强**是最成熟的子领域：StyleGAN 先验 + 身份保留 + 对齐

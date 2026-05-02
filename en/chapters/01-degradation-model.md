@@ -218,7 +218,63 @@ Video compression (H.264/H.265/AV1) is similar but more complex—plus motion co
 
 White-balance drift, color attenuation, color-temperature shifts caused by low light. Mathematically this kind of degradation is not a spatial-dimension problem but a non-linear transformation in value space.
 
-## 1.6 Real-World Degradation and Train-Test Mismatch
+## 1.6 Blind vs non-blind: is D known or unknown?
+
+Back to the central equation $y = D(x) + n$. A question commonly conflated in tutorials: **at inference time, is $D$ actually known or unknown?** The two settings have radically different engineering implications. The rest of this book defaults to the blind setting, but the paradigm needs naming first.
+
+### Non-blind: D known
+
+Classical image processing assumes $D$ is known in many contexts:
+
+- **Motion deblur**: the camera logged IMU during exposure → blur kernel $k$ is analytically recoverable
+- **Medical CT reconstruction**: scanner geometry + projection geometry → system matrix $A$ known
+- **Demoiré on screen captures**: known screen resolution → sampling-aliasing model known
+- **Sensor denoising**: sensor model + ISO + exposure → noise PDF parameters (Gaussian + Poisson + dark current) known
+
+Non-blind settings can take the classical inverse-problem route: Wiener filter, Richardson-Lucy, iterative regularization (TV / sparse / plug-and-play). Deep learning can also be non-blind — feed the parameters of $D$ (blur kernel, noise level) as side input to the network (DnCNN-Blind, KernelGAN, etc.).
+
+### Blind: D unknown
+
+In real-world enhancement, $D$ is almost never known:
+
+- A user drops a photo from their phone gallery — who knows what it's been through
+- An image downloaded from the web has been compressed several times
+- Old-photo degradation is a physico-chemical process with no closed-form model
+- A screenshot stacks rendering, rescaling, and JPEG
+
+In the blind setting you **can't pin down $D$ exactly** — you only have two options:
+
+1. **Train the model on as broad a $D$ distribution as possible** (Real-ESRGAN's second-order degradation pipeline does exactly this; see Chapter 5)
+2. **Have the model implicitly estimate $D$ at runtime** (KernelGAN's kernel estimation, SRMD's degradation parameters as conditions, the diffusion school's LLaVA-generated prompts)
+
+### Why this distinction matters
+
+Where every SOTA model in this book sits on the blind / non-blind axis:
+
+| Model | Paradigm | $D$ handling |
+|-------|----------|--------------|
+| Real-ESRGAN | **Blind SR** | Trained on hundreds of synthetic $D$ |
+| CodeFormer | **Blind face restoration** | Codebook prior bypasses $D$ estimation |
+| BSRGAN | **Blind SR** | Contemporaneous with Real-ESRGAN, degradation-synthesis route |
+| MANIQA / CLIP-IQA / Q-Align | **Blind IQA** (NR-IQA) | No reference, scores directly |
+| SUPIR | **Blind** (with LLaVA prompt) | Text condition implicitly supplies semantic $D$ |
+| Restormer | **Either** | Training data decides; architecture independent of $D$ |
+| OSEDiff / TSD-SR | **Blind SR** | Same as SUPIR |
+
+Engineering takeaway: **products that face "user-uploaded images" can almost only be blind**. Any algorithm that requires $D$ known (no matter how strong on benchmarks) needs a "$D$ estimation" front-end in production — and estimation is itself an ill-posed problem; mis-estimation crashes the system.
+
+The book's promise of "look at a bad image and immediately judge what to do" is the colloquial form of the blind paradigm — what readers train is **how to pick priors when $D$ is unknown**. This thread runs through the entire book.
+
+### Blind IQA: the evaluation-side counterpart
+
+Chapter 4 covers this in depth, but briefly. **Evaluation metrics also split into full-reference (FR) and no-reference (NR)**:
+
+- **FR-IQA**: PSNR / SSIM / LPIPS / DISTS — require an HR ground truth
+- **NR-IQA** (also called blind IQA): NIQE / MANIQA / CLIP-IQA / Q-Align — only see the output
+
+In production **ground truth doesn't exist** (the bad images users upload have no "matching HD version"), so **online quality monitoring can only rely on NR-IQA**. This is the necessary corollary of the blind paradigm propagating from training to evaluation.
+
+## 1.7 Real-World Degradation and Train-Test Mismatch
 
 Putting all the components from 1.5 together, a picture you take at night roughly goes through:
 
@@ -277,7 +333,7 @@ Remember this:
 
 Chapter 5 will lay out the engineering details of degradation synthesis in full.
 
-## 1.7 Noise Deep-Dive: Why It Isn't Gaussian
+## 1.8 Noise Deep-Dive: Why It Isn't Gaussian
 
 90% of papers add Gaussian noise at training time:
 
@@ -361,7 +417,7 @@ This detail motivated the appearance of "real noise datasets" like SIDD and DND.
 
 But real data is expensive and scarce, so the engineering compromise is to use **accurate synthetic noise models**, then fine-tune with a small amount of real data.
 
-## 1.8 A Simplified Degradation Class (no JPEG)
+## 1.9 A Simplified Degradation Class (no JPEG)
 
 To wrap up, let's stitch the concepts of this chapter into a Real-ESRGAN-style degradation class skeleton. **This is a warm-up version**—for readability, **the JPEG step is omitted** (real JPEG requires the `diffjpeg` library, covered in Chapter 5), keeping only blur / downsample / noise. The full version is in Chapter 5.
 
@@ -447,7 +503,7 @@ In actual engineering you also need:
 
 Chapter 5 will fill all of these in.
 
-## 1.9 Chapter Summary
+## 1.10 Chapter Summary
 
 Compress this chapter into a few points:
 

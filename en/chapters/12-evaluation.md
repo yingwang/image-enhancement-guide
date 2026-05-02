@@ -208,7 +208,214 @@ Required no matter the platform:
 3. **Time check**: remove raters who score too quickly (< 5 sec/image)
 4. **Multiple raters per item**: a single rater cannot determine ground truth
 
-## 12.6 Statistical significance
+## 12.6 Inter-rater reliability
+
+Sample size, catch trials — all done. One independent question remains: **do raters actually agree with one another?** If five raters score the same image anywhere from 1 to 5, no amount of averaging makes that result trustworthy — either the image is at a genuine quality boundary (legitimate disagreement) or rater quality is the problem (noisy scoring).
+
+In practice you must compute an agreement statistic as a precondition to trusting the user study at all.
+
+### Cohen's κ (two raters, categorical)
+
+Simplest case: two raters classify items into categories (e.g., "A wins / B wins / tie"). $\kappa$ measures their agreement above chance:
+
+$$
+\kappa = \frac{p_o - p_e}{1 - p_e}
+$$
+
+$p_o$ is the observed agreement rate, $p_e$ the expected chance agreement. $\kappa = 1$ is perfect, $0$ is chance, $< 0$ is inverse.
+
+Empirical thresholds (Landis & Koch):
+
+- $\kappa < 0.4$: poor
+- $0.4–0.6$: moderate
+- $0.6–0.8$: good
+- $> 0.8$: very good
+
+```python
+from sklearn.metrics import cohen_kappa_score
+kappa = cohen_kappa_score(rater1_labels, rater2_labels)
+```
+
+### Krippendorff's α (multiple raters, multiple data types)
+
+More general: supports any number of raters, missing values, and ordinal / interval / ratio data. **Use ordinal α for MOS, nominal α for 2AFC**.
+
+Empirical thresholds (Krippendorff's own, stricter than κ):
+
+- $\alpha > 0.8$: high agreement, publishable
+- $0.67–0.8$: acceptable for preliminary conclusions
+- $< 0.67$: data is unreliable, conclusions don't hold
+
+```python
+import krippendorff
+import numpy as np
+
+# Rows = raters, columns = items, NaN = rater didn't score that item
+ratings = np.array([
+    [4, 3, 5, np.nan, 2],
+    [4, 4, 5, 3, np.nan],
+    [3, 3, 4, 3, 2],
+])
+alpha = krippendorff.alpha(reliability_data=ratings, level_of_measurement='ordinal')
+```
+
+Practical experience: image-enhancement MOS data typically lands at α between 0.5 and 0.75 — **most public IQA datasets do not reach 0.8**. This means:
+
+- Don't chase α > 0.8 — there is legitimate perceptual disagreement in this domain
+- But α < 0.5 should raise alarms: either the task is poorly defined or rater quality is poor
+
+### ICC (Intraclass Correlation)
+
+When MOS is continuous / ordinal, papers often prefer ICC over Krippendorff α. ICC(2,k) is the most commonly reported variant:
+
+```python
+import pingouin as pg
+
+# df has three columns: rater, item, score (long format)
+icc = pg.intraclass_corr(data=df, targets='item', raters='rater',
+                          ratings='score', nan_policy='omit')
+print(icc[icc['Type'] == 'ICC2k'])
+```
+
+ICC > 0.75 is considered good, > 0.9 excellent (Koo & Li, 2016).
+
+### Outlier rater detection: BT.500-14 Annex V
+
+ITU-R BT.500-14 (the de-facto standard for video / image subjective assessment) gives a **β2 outlier detection** procedure in Annex V — raters whose scores have kurtosis far from normal are flagged:
+
+```
+For each rater i:
+1. Take their z-scored ratings across all images
+2. Compute β2 (kurtosis estimate) for that distribution
+3. If |β2| > 2, mark as suspicious
+4. Then check their deviation from the group mean: if > ±2σ on more than 5% of items, drop them
+```
+
+ITU's filtering procedure is more systematic than simply "drop people who failed catch trials" and **should be used for serious paper / product evaluations**.
+
+Engineering: see [Netflix's SUREAL library](https://github.com/Netflix/sureal), `bt500.py` for an implementation.
+
+## 12.7 SUREAL: modern MOS estimation
+
+The naive "take the mean across raters per image" assumes all raters are equally trustworthy. Netflix proposed **SUREAL** (Subjective REcovery Algorithm with Latent classes) in 2018, modeling MOS as:
+
+$$
+s_{ij} = q_j + b_i + v_i \cdot \epsilon_{ij}
+$$
+
+- $s_{ij}$: rater $i$'s score on image $j$
+- $q_j$: true quality of image $j$ (the thing to estimate)
+- $b_i$: rater $i$'s bias ("strict" or "lenient")
+- $v_i$: rater $i$'s inconsistency (high $v$ = noisy)
+
+EM iteration jointly estimates $(q, b, v)$ and **simultaneously identifies unreliable raters** (high $v_i$).
+
+### Difference from z-score normalization
+
+- **z-score**: each rater normalized independently, assumes each sees a similar distribution
+- **SUREAL**: joint estimation, identifies outlier raters in small samples
+
+In practice: **SUREAL significantly outperforms z-score when each rater scores < 30 images**. Production scenarios (each rater scores only a few dozen items) should use SUREAL.
+
+```python
+# Netflix's official implementation
+# pip install sureal
+from sureal.dataset_reader import RawDatasetReader
+from sureal.subjective_model import MosModel, MaximumLikelihoodEstimationModel
+
+# MLE model = SUREAL
+model = MaximumLikelihoodEstimationModel(dataset_reader)
+result = model.run_modeling()
+print(result['quality_scores'])     # Estimated true quality per image
+print(result['observer_bias'])      # Bias per rater
+print(result['observer_inconsistency'])  # v per rater
+```
+
+Citing SUREAL instead of raw mean / z-score in user-study sections has become standard in video quality literature post-2020.
+
+## 12.8 ITU-R BT.500: the bible of subjective video / image evaluation
+
+For serious subjective evaluation, **ITU-R BT.500-14** (latest 2023 revision) is unavoidable. It defines:
+
+### Evaluation methods
+
+- **DSCQS** (Double-Stimulus Continuous Quality Scale): reference + test shown together
+- **DSIS** (Double-Stimulus Impairment Scale): focus on impairment severity
+- **SS** (Single Stimulus): single-stimulus, similar to MOS
+- **SSCQE** (Single Stimulus Continuous Quality Evaluation): for video, raters score continuously
+- **PC** (Pair Comparison): = 2AFC
+
+### Physical environment standards
+
+- **Viewing distance**: 3–4× screen height (PVD: preferred viewing distance)
+- **Ambient light**: < 20 lux (avoid reflection interference)
+- **Display calibration**: D65 white point, 100–200 cd/m² luminance, contrast per BT.1886 EOTF
+- **Background**: neutral gray (15% reflectance)
+
+Academic papers must report these parameters. AMT / Prolific and other remote crowdsourcing platforms **cannot meet these requirements** — which is why serious papers run both lab and crowdsourcing rounds, calibrating the latter against the former.
+
+### Anchors and training
+
+- A **training session** is required before the experiment (5–10 anchor images covering worst to best) so raters calibrate their scale
+- Training data **does not count toward formal scores**
+
+### Trial randomization
+
+- Image presentation order is independently randomized per rater
+- Left/right order in pair comparisons is randomized
+- Repeated catch-trial images are scattered across positions
+
+The methods in 12.2–12.5 are a simplified form of the BT.500 framework — sufficient for product iteration. **For academic publication, report parameters per BT.500.**
+
+## 12.9 IRB / informed consent / ethics
+
+User studies involve human subjects. **Both academic publication and corporate GDPR compliance require ethics review**, but this is typically glossed over in image-enhancement papers — yet the risk is real.
+
+### Academic: IRB approval
+
+Since 2024, NeurIPS / CVPR / ICCV submission templates require an ethics statement covering:
+
+- Subject recruitment source, sample size, compensation
+- Whether the study went through institutional IRB / Ethics Committee
+- Data retention period and deletion policy
+- Additional protections for NSFW / violent content / images of real people
+
+Cross-border collaborations: EU subjects are protected under GDPR; **US IRB approval does not automatically cover them**.
+
+### Industry: consumer data
+
+When deploying user-study platforms inside companies:
+
+- If employee-rated images are real user data → run PII review
+- Rating-platform log retention: ≤ 30 days post task completion (unless required for compliance)
+- Informed consent: explicitly disclose task nature, payment, sensitive content, right of withdrawal
+
+### Crowdsourcing-platform ethics traps
+
+- AMT pay-rate problem: since 2023, multiple academic IRBs require pay rates ≥ minimum wage in the rater's jurisdiction. $0.01/task + 20s/task = $1.80/hour, which **fails most IRB review boards**.
+- Prolific defaults to $8/hour (UK minimum), saving IRB headaches.
+- Task disclosure: prominently disclose NSFW or real-person content **upfront** so raters can opt in.
+
+Engineering bottom line: budget ≥ $8/hour and obtain institutional IRB approval — the compliance floor since 2024.
+
+## 12.10 Cross-cultural and demographic bias
+
+The last commonly underestimated source of variance: **raters are not homogeneous**.
+
+- **Aesthetic differences**: East Asian raters tend to rate "over-sharpened + high contrast" as "good quality"; Western raters lean toward "natural + low artifacts" — same image's MOS can differ by 0.5
+- **Document / text content**: rater's native language affects judgment of text SR
+- **Devices**: phone-screen raters and desktop raters perceive the same image differently
+- **Professional vs lay**: photographers / designers are more sensitive to color tone, regular users to structure
+
+Engineering practice:
+
+- **Record demographic features**: region, age bracket, device — for post-hoc segmentation analysis
+- **Match the target market**: Asian-market product → Asian panel; cross-region products → at least 2–3 region samples
+- **Disclose in reporting**: paper user-study sections should give a demographic overview
+
+Papers that omit this dimension face challenges to generalizability — a common reviewer complaint in IQA since 2024.
+
+## 12.11 Statistical significance
 
 Before claiming "model A is better than B" you must run a significance test.
 
@@ -252,7 +459,7 @@ print(f"A win rate 54%, p = {result.pvalue:.4f}")
 
 If you are comparing 5 models (10 pairs), p-values must be Bonferroni-corrected: $\alpha_{\text{corrected}} = 0.05 / 10 = 0.005$.
 
-## 12.7 Correlation between automatic metrics and MOS
+## 12.12 Correlation between automatic metrics and MOS
 
 Correlation between different metrics and human perception (statistics from multiple IQA benchmarks):
 
@@ -278,7 +485,7 @@ Engineering practice:
 - For papers/reports, beyond PSNR + LPIPS also do subjective evaluation
 - For production deployment, watch MANIQA + user behavior
 
-## 12.8 Real-world: downstream task evaluation
+## 12.13 Real-world: downstream task evaluation
 
 The most convincing evaluation: **does the enhanced image make a downstream task perform better?**
 
@@ -332,7 +539,7 @@ Inapplicable scenarios:
 - Art restoration (no "task")
 - Beauty filters (user-preference driven)
 
-## 12.9 A/B testing in production
+## 12.14 A/B testing in production
 
 Deploy the new model to a fraction of users, compare against the old model, observe user-behavior changes.
 
@@ -374,7 +581,7 @@ Engineering implementation: use mature frameworks such as Vowpal Wabbit, Adobe S
 4. **Multiple testing**: simultaneously testing several variants requires Bonferroni correction
 5. **Segmented analysis**: different devices/regions/user segments may react differently
 
-## 12.10 Failure case bank
+## 12.15 Failure case bank
 
 A model with good average metrics may completely break in **specific scenarios**. **Specifically maintain a failure case bank**—collect known broken inputs and run every new model against this set.
 
@@ -406,7 +613,7 @@ Beyond the average, also look at:
 
 Engineering practice: every new model version must be run on the failure bank, results archived. **Long-term maintenance** of this set is far more important than benchmark grinding.
 
-## 12.11 Benchmark design
+## 12.16 Benchmark design
 
 Chapter 4, Section 4.9 covered the bias of academic benchmarks. Here we discuss how to design **your own** benchmark.
 
@@ -446,7 +653,7 @@ If you tweaked hyperparameters in order to grind the test set, the test set is a
 
 Engineering practice: **keep one "sealed" test set** to be run only once before final release.
 
-## 12.12 Eval pipeline engineering
+## 12.17 Eval pipeline engineering
 
 In real engineering, eval should be automated.
 
@@ -498,7 +705,7 @@ Engineering essentials:
 - **Comparable**: able to diff eval results across commits
 - **Visualized**: automatically generate comparison images and tables
 
-## 12.13 Standards for paper experimental reporting
+## 12.18 Standards for paper experimental reporting
 
 When writing a paper / technical report, the eval section should include:
 
@@ -513,7 +720,7 @@ When writing a paper / technical report, the eval section should include:
 
 Many papers skip 4, 5, 6, and the result is reviewer skepticism or failed reproductions.
 
-## 12.14 Common evaluation antipatterns
+## 12.19 Common evaluation antipatterns
 
 A few to avoid in engineering:
 
@@ -537,18 +744,23 @@ Inadvertently including images similar to the test set in training.
 
 Each eval is different, with no traceability to why this number was chosen.
 
-## 12.15 Summary
+## 12.20 Summary
 
 1. **Three layers of evaluation**: automatic metrics + subjective evaluation + downstream tasks, validating each other
 2. **MOS is simple but noisy**, 2AFC's forced comparison has higher SNR, **prefer 2AFC**
 3. **Sample size requires power analysis**: 1000+ pairs is the lower bound for a serious experiment
 4. **Rater quality control**: catch trial, test-retest, time check
-5. **Statistical significance**: t-test/Wilcoxon for continuous metrics, binomial test for 2AFC, Bonferroni for multiple comparisons
-6. **Correlation between automatic metrics and MOS**: LPIPS/DISTS/MANIQA ~0.75, PSNR only 0.4-0.55
-7. **Downstream task evaluation is the most convincing**: OCR accuracy, face recognition rate, detection mAP
-8. **A/B testing is the de facto standard in production**: monitor user behavior metrics
-9. **Failure case bank**: maintained long-term, more important than average metrics
-10. **Benchmarks must not be used for hyperparameter tuning**: keep a sealed test set
+5. **Inter-rater reliability**: Krippendorff α / ICC are the precondition for trusting a user study; BT.500-14 Annex V β2 outlier detection drops anomalous raters
+6. **Estimate MOS via SUREAL** (Netflix's MLE method) instead of raw mean / z-score — significantly more stable for small samples
+7. **For serious subjective evaluation, follow ITU-R BT.500-14**: DSIS/DSCQS/PC, viewing distance, ambient light, display calibration, anchor training — all parameters reported per standard
+8. **IRB / informed consent is the compliance floor**: NeurIPS/CVPR have required ethics statements since 2024; crowdsourcing pay rate ≥ $8/h
+9. **Cross-cultural and demographic bias is a real variance source**: report rater demographics; match the target market
+10. **Statistical significance**: t-test/Wilcoxon for continuous metrics, binomial test for 2AFC, Bonferroni for multiple comparisons
+11. **Correlation between automatic metrics and MOS**: LPIPS/DISTS/MANIQA ~0.75, PSNR only 0.4-0.55
+12. **Downstream task evaluation is the most convincing**: OCR accuracy, face recognition rate, detection mAP
+13. **A/B testing is the de facto standard in production**: monitor user behavior metrics
+14. **Failure case bank**: maintained long-term, more important than average metrics
+15. **Benchmarks must not be used for hyperparameter tuning**: keep a sealed test set
 
 That completes Part III's training and evaluation chapters. Part IV moves into video—video is not just "images plus time"; temporal consistency is an independent problem.
 

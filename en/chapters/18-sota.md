@@ -1,16 +1,18 @@
 # Chapter 18 · SOTA models
 
-> This chapter is the book's "quick reference"—7 SOTA models worth remembering plus a selection decision tree.
+> This chapter is the book's "quick reference"—9 SOTA models worth remembering plus a selection decision tree.
 >
 > The models themselves will go out of date; **the ideas will not**—so for each model we cover: core idea, when to use, when not to use, and who succeeds it.
 
 ## 18.1 Selection overview
 
 ```
-General enhancement SOTA (3)
-  ┌─ SUPIR        — diffusion-based / creative upscaling
-  ├─ Real-ESRGAN  — real-degradation-modeling school
-  └─ HAT          — Transformer non-diffusion school
+General enhancement SOTA (5)
+  ┌─ SUPIR              — diffusion / creative upscaling (full 50 steps)
+  ├─ OSEDiff / TSD-SR   — diffusion / one-step distillation (production real-time)
+  ├─ Real-ESRGAN        — real-degradation-modeling school
+  ├─ HAT                — Transformer non-diffusion school
+  └─ Restormer          — denoise / deblur / derain general backbone
 
 Task-specific (4)
   ┌─ CodeFormer   — face restoration
@@ -19,7 +21,7 @@ Task-specific (4)
   └─ Retinexformer — low-light enhancement
 ```
 
-Seven models, each representing a school of thought.
+Nine models, each representing a school of thought. SUPIR and OSEDiff/TSD-SR are two engineering positions of the same diffusion school — the former chases peak quality at 50 steps, the latter pushes one-step inference for product deployment.
 
 ## 18.2 SUPIR: diffusion-based creative upscaling
 
@@ -149,7 +151,115 @@ The representative baseline for PSNR-oriented Transformer SR. **Not the only cur
 - Paper: Chen et al. "Activating More Pixels in Image Super-Resolution Transformer" (CVPR 2023)
 - Code: [github.com/XPixelGroup/HAT](https://github.com/XPixelGroup/HAT)
 
-## 18.5 CodeFormer: face restoration
+## 18.5 Restormer: denoise / deblur / derain U-Net Transformer
+
+### Core idea
+
+Chapter 7.5 covered MDTA (Multi-Dconv Head Transposed Attention) — moving self-attention from the spatial dimension to the channel dimension drops complexity from $O(N^2)$ to $O(C^2)$, friendly for large images. Combined with GDFN (Gated-Dconv Feed-Forward Network), the overall architecture is a 4-level U-Net:
+
+```
+Input
+  ↓ Encoder (4 levels of MDTA + GDFN)
+  ↓ Latent (deep MDTA + GDFN)
+  ↓ Decoder (4 levels, with skip connections)
+Output
+```
+
+The same architecture serves multiple tasks; only the training data changes: Gaussian / real-noise denoising, motion deblurring, defocus deblurring, deraining.
+
+### One-line takeaway
+
+"Channel-wise attention + multi-task general U-Net backbone — the de-facto baseline for **everything except SR** in low-level vision."
+
+### When to use
+
+- **Denoising** (Gaussian, real sensor, synthetic noise)
+- **Deblurring** (motion, defocus)
+- **Deraining / dehazing / demoiré**
+- **Large-image inference** (MDTA is memory-friendly; a 1080P image fits whole through the model)
+- **Single-frame baseline for video low-level tasks** (paired with BasicVSR++ comparisons)
+
+### When not to use
+
+- **Pure SR** (HAT / SwinIR / DRCT win on SR benchmarks; Restormer was not designed for upsampling)
+- **Extreme lightweight on-device** (inference is on the slower side, ~26M params, distillation needed)
+- **Tasks that include upscaling** — either modify Restormer with a sub-pixel head, or pick an SR-school model directly
+
+### Key numbers
+
+- GoPro deblur: 32.92 dB / 0.961 SSIM
+- SIDD real denoising: 40.02 dB / 0.960 SSIM
+- ~26M parameters
+- A100 256×256 inference ~50ms
+
+### Where it stands now
+
+From 2022 through 2026, Restormer is **the de-facto baseline for denoise / deblur / derain** — any low-level vision paper working on these tasks must compare against it. The MDTA module itself has been adopted in many follow-up works (including some video and diffusion-school implementations). **HAT represents the SR school; Restormer represents the restoration school** — the two positions don't conflict, and engineering teams often deploy them together (one for deblur/denoise, one for upsample).
+
+Follow-up work like GRL, X-Restormer, and PromptIR slightly outperforms Restormer on some benchmarks, but none has fully replaced it.
+
+### Paper and code
+
+- Paper: Zamir et al., "Restormer: Efficient Transformer for High-Resolution Image Restoration" (CVPR 2022)
+- Code: [github.com/swz30/Restormer](https://github.com/swz30/Restormer)
+
+## 18.6 OSEDiff / TSD-SR: one-step diffusion SR
+
+### Core idea
+
+Full diffusion SR (e.g. SUPIR) takes 50 steps and 5–10 seconds per image — **the biggest barrier to production deployment is latency**. The 2024–2025 wave of single-step diffusion distillation broke this barrier:
+
+```
+LR Image
+  ↓ VAE encode (once)
+  ↓ Pre-trained UNet (LoRA fine-tuned for SR)
+  ↓ One forward pass, no iterative denoising
+  ↓ VAE decode
+HR Image
+```
+
+Distillation target: train a student network to predict clean $x_0$ in **one step** from any noise level. Combined with score distillation / variational score distillation / target score distillation losses.
+
+### Representative methods
+
+- **OSEDiff** (NeurIPS 2024): variational score distillation, single-step sampling, VAE-LR as initialization
+- **TSD-SR** (2024): target score distillation, distribution correction tailored to SR
+- **SinSR** (CVPR 2024): single-step distillation built on top of ResShift
+- **AdcSR** (2025): adversarial distillation of diffusion into a single-step generator, quality close to SUPIR
+
+### One-line takeaway
+
+"Diffusion school from 50 steps to 1 — finally letting the SUPIR route into production environments."
+
+### When to use
+
+- **Production diffusion SR** — the default since 2025
+- **Real-time / near-real-time enhancement** (< 1s per image)
+- Scenarios that **like SUPIR's visual quality but can't accept its latency**
+
+### When not to use
+
+- **Extreme degradation + creativity priority** (full SUPIR still has a marginal quality edge in some cases; industry can keep it as an offline option)
+- **Strict fidelity** (the diffusion school's "guessing" nature hasn't changed — only become faster — still unsuitable for forensics / surveillance)
+
+### Key numbers
+
+- Inference: A100 single image ~0.3–0.8s (vs SUPIR 50 steps 5–10s)
+- Quality: DIV2K val LPIPS within ±2% of SUPIR; MANIQA on par or slightly better
+- Model size: ≈ SDXL UNet + small LoRA, ~3GB after on-device 8-bit quantization
+
+### Where it stands now
+
+**The engineering mainstream of diffusion SR in 2025–2026.** SUPIR remains the "full version" benchmark for research and teaching, but new projects should **default to starting from a one-step distilled route, not SUPIR**. The under-appreciated engineering value of this line: the diffusion school for the first time has the latency to plausibly replace Real-ESRGAN in general enhancement workflows.
+
+### Papers and code
+
+- OSEDiff: Wu et al. "One-Step Effective Diffusion Network for Real-World Image Super-Resolution" (NeurIPS 2024) — [github.com/cswry/OSEDiff](https://github.com/cswry/OSEDiff)
+- TSD-SR: Dong et al. "TSD-SR: One-Step Diffusion with Target Score Distillation" (2024)
+- SinSR: Wang et al. "SinSR: Diffusion-Based Image Super-Resolution in a Single Step" (CVPR 2024)
+- AdcSR: 2025-onward adversarial distillation direction (AdcSR and others)
+
+## 18.7 CodeFormer: face restoration
 
 ### Core idea
 
@@ -200,7 +310,7 @@ The engineering standard for face restoration. GFPGAN is still in use, but CodeF
 - Paper: Zhou et al. "Towards Robust Blind Face Restoration with Codebook Lookup Transformer" (NeurIPS 2022)
 - Code: [github.com/sczhou/CodeFormer](https://github.com/sczhou/CodeFormer)
 
-## 18.6 BasicVSR++: video super-resolution
+## 18.8 BasicVSR++: video super-resolution
 
 ### Core idea
 
@@ -244,7 +354,7 @@ The engineering standard for VSR from 2022 to 2026. RVRT/VRT score higher PSNR b
 - Paper: Chan et al. "BasicVSR++: Improving Video Super-Resolution with Enhanced Propagation and Alignment" (CVPR 2022)
 - Code: [github.com/open-mmlab/mmagic](https://github.com/open-mmlab/mmagic) (inside MMEditing)
 
-## 18.7 RIFE: frame interpolation
+## 18.9 RIFE: frame interpolation
 
 ### Core idea
 
@@ -294,7 +404,7 @@ The de facto frame-interpolation standard. Successors (FILM, AMT) each have stre
 - Paper: Huang et al. "Real-Time Intermediate Flow Estimation for Video Frame Interpolation" (ECCV 2022)
 - Code: [github.com/megvii-research/ECCV2022-RIFE](https://github.com/megvii-research/ECCV2022-RIFE)
 
-## 18.8 Retinexformer: low-light enhancement
+## 18.10 Retinexformer: low-light enhancement
 
 ### Core idea
 
@@ -335,18 +445,21 @@ A representative low-light enhancement model. Other choices:
 - Paper: Cai et al. "Retinexformer: One-stage Retinex-based Transformer for Low-light Image Enhancement" (ICCV 2023)
 - Code: [github.com/caiyuanhao1998/Retinexformer](https://github.com/caiyuanhao1998/Retinexformer)
 
-## 18.9 Selection decision tree
+## 18.11 Selection decision tree
 
 Recommendations by scenario:
 
 ```
 What's the task?
   │
-  ├─ General SR / denoise / deblur
+  ├─ General SR
   │   │
-  │   ├─ Heavy degradation + creativity-first → SUPIR
-  │   ├─ Real-world scenarios + engineering stability → Real-ESRGAN  ←─ default
+  │   ├─ Offline + peak quality + no latency limit → SUPIR (50 steps)
+  │   ├─ Real-time diffusion (default since 2025) → OSEDiff / TSD-SR (1 step)
+  │   ├─ Real-world + engineering stability (CNN/GAN school) → Real-ESRGAN
   │   └─ Academic benchmark / PSNR competition → HAT
+  │
+  ├─ Denoise / deblur / derain (no upscaling) → Restormer  ←─ default
   │
   ├─ Face enhancement → CodeFormer (user-tunable fidelity)
   │
@@ -365,11 +478,11 @@ What's the task?
   └─ On-device real-time → distilled NAFNet + CoreML/TensorRT FP16
 ```
 
-## 18.10 Academic SOTA vs. engineering SOTA
+## 18.12 Academic SOTA vs. engineering SOTA
 
 A theme that recurs throughout the book:
 
-> The 7 models in this chapter are not "the highest-scoring".
+> The 9 models in this chapter are not "the highest-scoring".
 >
 > They are **the most worth deploying**—balancing quality, speed, stability, and maintainability.
 
@@ -386,9 +499,9 @@ Engineering cares about:
 - **Deployability** (can be exported to ONNX, quantized, tiled)
 - **Maintainability** (official code, ongoing maintenance, community)
 
-These 7 models lead their categories on these dimensions.
+These 9 models lead their categories on these dimensions.
 
-## 18.11 SOTAs not on this list
+## 18.13 SOTAs not on this list
 
 Worth knowing but not given a dedicated section (by category):
 
@@ -396,8 +509,9 @@ Worth knowing but not given a dedicated section (by category):
 
 - **DiffBIR**: diffusion-based, predates SUPIR, CLIP image cross-attention idea
 - **SeeSR**: diffusion-based + semantic prior, more controllable
-- **ResShift**: efficient sampling for diffusion-based
-- **DRCT**: representative pure-CNN entrant in recent years
+- **ResShift**: efficient sampling for diffusion-based (distilled into single-step by SinSR)
+- **AdcSR / SinSR**: same-generation single-step diffusion competitors (same direction as Section 18.6)
+- **DRCT / Hi-IR / ATD**: HAT-era and follow-up PSNR-school Transformer SR
 - **BSRGAN**: contemporaneous with Real-ESRGAN
 
 ### Faces
@@ -410,7 +524,7 @@ Worth knowing but not given a dedicated section (by category):
 
 - **VRT / RVRT**: Transformer-based VSR
 - **EDVR**: classic sliding-window approach
-- **PropPainter**: representative video inpainting
+- **ProPainter**: representative video inpainting
 
 ### Frame interpolation
 
@@ -431,7 +545,7 @@ Worth knowing but not given a dedicated section (by category):
 
 Each subfield has 5–10 models worth tracking. This chapter selected the **most representative and most engineering-friendly** ones.
 
-## 18.12 When to switch SOTA
+## 18.14 When to switch SOTA
 
 New models come out every month. **When should you swap your production model?**
 
@@ -449,7 +563,7 @@ Most paper SOTAs do not satisfy these 5—so **be conservative about switching m
 >
 > A stable old SOTA usually beats an unstable new SOTA.
 
-## 18.13 Closing
+## 18.15 Closing
 
 The book has covered:
 

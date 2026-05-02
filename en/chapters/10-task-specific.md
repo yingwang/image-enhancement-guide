@@ -433,7 +433,104 @@ Mainstream methods:
 
 General-purpose SR models do not apply at all — they have no notion of the diffraction limit.
 
-## 10.11 Task specialization in video enhancement (preview)
+## 10.11 Reference-based enhancement
+
+Every task specialization so far has assumed **single-image input** (single-image / blind) — given only LR, lean on priors to fill in HR information. There is another paradigm widely used in industry but barely covered in Chinese-language academic material: **reference-based** (Ref-based) enhancement, abbreviated **RefSR / RefIR**.
+
+### The paradigm
+
+Input is LR plus one or more **reference images** ($\text{Ref}$):
+
+$$
+\hat{x} = f(y, \text{Ref})
+$$
+
+The reference is not the HR ground truth (that would be paired training); it's a **content-related but not identical** high-quality image:
+
+- An HR shot of the same scene at a different time
+- An HR shot of the same object from a different angle
+- A clear photo of the same person from the user's gallery
+- Another camera's HR frame from the same instant on a multi-camera phone
+
+The model's job becomes: **find LR-corresponding patches in Ref and transfer Ref's textures**.
+
+### Representative methods
+
+- **MASA-SR** (CVPR 2021): cross-attention for patch matching between LR and Ref, robust to misalignment
+- **C2-Matching** (CVPR 2021): split matching into coarse alignment + fine correspondence learning
+- **DATSR** (ECCV 2022): deformable attention to handle geometric warps between Ref and LR
+- **AccelIR / RefSR-Lite**: distilled mobile versions
+
+The core module in all of them is **cross-attention between LR features and Ref features** — same family as the low-level-vision attention covered in Chapter 7, except Q comes from LR and K/V from Ref.
+
+### Key engineering issues
+
+Reference-based **does not mean "use Ref to supervise training"** — Ref must also be passed in **at inference time**. This causes a chain of engineering problems:
+
+1. **Geometric alignment of Ref**: Ref and LR may differ in viewpoint, scale, lighting. The model must be robust to misalignment — the central research focus of MASA / DATSR.
+2. **Fallback when Ref is missing**: what if the user provides no Ref? You need a single-image fallback (typical trick: during training, randomly use the LR's own upsampled version as a fake Ref).
+3. **Ref selection**: which Ref to pick when multiple candidates exist? A common heuristic is top-k by CLIP image-embedding similarity.
+4. **Ref-bias risk**: if the Ref is wrong (e.g., same name, different person), the model migrates the wrong textures — **and it crashes uglier than no-Ref at all**.
+
+### Industrial scenarios
+
+RefSR's actual product position is far more important than its paper presence suggests:
+
+**Multi-camera phones**:
+
+- Main + telephoto exposed simultaneously: the tele frame is high-res but narrow FOV; the main is wide FOV but lower-res in the center → use tele as Ref for the main's center region
+- Main + macro: macro is high-res, can serve as a local-detail Ref for main
+- iPhone Pro / Pixel Pro / Huawei / Xiaomi flagships' "telephoto enhancement" routes are all this pattern
+
+**Smart photo libraries**:
+
+- A user took 100 photos of the same person; some sharp, some blurry
+- When restoring the blurry ones, **use the sharp ones of the same face as Ref**
+- Google Photos / Tencent Albums' "person restoration" feature is built on this
+- Note: this complements blind face restoration (CodeFormer) — CodeFormer uses a generic face prior; RefSR uses a prior **of this person**
+
+**Burst photography**:
+
+- 8 frames in rapid burst, each with different motion blur and noise
+- Pick the sharpest few as Ref, align, fuse into the main frame
+- Google HDR+ and Apple Deep Fusion are industrial implementations of this line (they don't call it RefSR, but the essence is identical)
+
+**Inter-frame guidance for video**:
+
+- When SR-ing a long video, **enhance keyframes (I-frames)** with a heavy model and **enhance P/B frames via RefSR** (with the keyframe as Ref)
+- Inference cost goes from "heavy model per frame" to "heavy model per GOP + N RefSR runs"
+- This pattern is useful in 4K live streaming / video conferencing enhancement
+
+### Relationship to the blind paradigm
+
+RefSR is not a third option beyond blind / non-blind — it's **multi-input blind**: $D$ is still unknown, but extra information (Ref) helps the model "guess" $x$. The extra signal is engineering gold:
+
+| Paradigm | Inputs | Difficulty | Quality ceiling |
+|----------|--------|------------|-----------------|
+| Non-blind single-image | $y, D$ | Low | High (if $D$ is accurate) |
+| Blind single-image | $y$ | High | Medium (depends on prior) |
+| **Blind multi-image (RefSR)** | $y, \text{Ref}$ | Medium | **Higher** (Ref provides real textures) |
+
+This is why phone manufacturers treat RefSR as a flagship feature — at the same compute budget, **the information from a Ref beats any single-image prior**.
+
+### Should you use RefSR?
+
+Engineering decisions:
+
+- **If you can get a Ref, use it** — quality ceiling is clearly higher than single-image
+- **Ref must be geometrically pre-aligned** (optical flow / SIFT / let cross-attention learn it)
+- **Must have a single-image fallback** — never hard-depend on Ref
+- **Detect Ref bias** — if CLIP similarity is too low, ignore the Ref and fall back to single-image
+
+Academic benchmarks make RefSR look only marginally better than single-image (CUFED5 / WR-SR have weak Ref signals by construction), but **on real multi-camera phone scenarios the gap reaches 1–2 dB** — which is why industry has invested in this line for years.
+
+### Papers and code
+
+- MASA-SR: [github.com/dvlab-research/MASA-SR](https://github.com/dvlab-research/MASA-SR)
+- C2-Matching: [github.com/yumingj/C2-Matching](https://github.com/yumingj/C2-Matching)
+- DATSR: [github.com/caojiezhang/DATSR](https://github.com/caojiezhang/DATSR)
+
+## 10.12 Task specialization in video enhancement (preview)
 
 Video enhancement also has task-specific needs, which Chapters 13-14 will expand on:
 
@@ -444,7 +541,7 @@ Video enhancement also has task-specific needs, which Chapters 13-14 will expand
 
 These tasks each have their own inductive biases and constraints.
 
-## 10.12 A methodology for designing task-specific models
+## 10.13 A methodology for designing task-specific models
 
 If you want to design a task-specific model for a new task, follow this process:
 
@@ -491,7 +588,7 @@ General-purpose enhancement failure cases (covered in detail in Chapter 17) + ta
 - Text: handwriting, stamps, low contrast
 - Medical: rare lesions, artifacts, motion blur
 
-## 10.13 Summary
+## 10.14 Summary
 
 1. **General-purpose models will inevitably fail in certain domains** — face, text, medical, remote sensing, microscopy each have different inductive biases
 2. **Face enhancement** is the most mature sub-field: StyleGAN prior + identity preservation + alignment

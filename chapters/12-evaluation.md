@@ -208,7 +208,214 @@ $$
 3. **Time check**：评分太快（< 5 秒/张）的剔除
 4. **Multiple raters per item**：单一评分人不能决定 ground truth
 
-## 12.6 统计显著性
+## 12.6 评分人间一致性（Inter-rater Reliability）
+
+样本量、catch trial 都做了，剩下一个独立问题：**评分人之间到底有没有共识？** 如果 5 个评分人对同一张图给的分散到 1-5 分都有，平均出来再漂亮也不可信——这时候要么是图本身质量边界（合理分歧），要么是评分人质量出了问题（噪声评分）。
+
+工程上必须算一致性指标，作为 user study 是否可信的前置门槛。
+
+### Cohen's κ（两个评分人，分类）
+
+最简单：两个评分人对一组样本各自分类（比如"A 胜 / B 胜 / 平"），$\kappa$ 衡量他们的一致性超过随机的程度。
+
+$$
+\kappa = \frac{p_o - p_e}{1 - p_e}
+$$
+
+$p_o$ 是观察到的一致率，$p_e$ 是期望随机一致率。$\kappa = 1$ 完美一致，$0$ 等于随机，$<0$ 反向。
+
+经验阈值（Landis & Koch）：
+
+- $\kappa < 0.4$：差
+- $0.4-0.6$：中等
+- $0.6-0.8$：好
+- $> 0.8$：非常好
+
+```python
+from sklearn.metrics import cohen_kappa_score
+kappa = cohen_kappa_score(rater1_labels, rater2_labels)
+```
+
+### Krippendorff's α（多评分人，多种数据类型）
+
+更通用：支持任意数量评分人、缺失值、序数/区间/比率数据。**MOS 用 ordinal α，2AFC 用 nominal α**。
+
+经验阈值（Krippendorff 自己给的，比 κ 严）：
+
+- $\alpha > 0.8$：可发表的高一致性
+- $0.67-0.8$：可接受用于初步结论
+- $< 0.67$：数据不可靠，结论不能成立
+
+```python
+import krippendorff
+import numpy as np
+
+# 行 = rater, 列 = item, NaN = 该 rater 没评这一项
+ratings = np.array([
+    [4, 3, 5, np.nan, 2],
+    [4, 4, 5, 3, np.nan],
+    [3, 3, 4, 3, 2],
+])
+alpha = krippendorff.alpha(reliability_data=ratings, level_of_measurement='ordinal')
+```
+
+实操经验：影像增强 MOS 数据 α 通常在 0.5-0.75 之间——**绝大多数公开 IQA 数据集做不到 0.8**。这意味着：
+
+- 不要追求 α > 0.8——这个领域感知本身有合理分歧
+- 但 α < 0.5 必须警惕：要么任务定义模糊，要么评分人质量差
+
+### ICC（Intraclass Correlation）
+
+MOS 是连续/序数评分时，ICC 比 Krippendorff α 更常被论文采用。ICC(2,k) 是几个变体里最常用的：
+
+```python
+import pingouin as pg
+
+# df 三列: rater, item, score (long format)
+icc = pg.intraclass_corr(data=df, targets='item', raters='rater',
+                          ratings='score', nan_policy='omit')
+print(icc[icc['Type'] == 'ICC2k'])
+```
+
+ICC > 0.75 视为良好、> 0.9 视为优秀（Koo & Li, 2016）。
+
+### 异常评分人检测：BT.500-14 附录 V
+
+ITU-R BT.500-14（视频/影像主观评测的事实标准）在附录 V 里给了**β2 异常检测**——评分人某一组分数的 kurtosis 偏离正态太多就剔除：
+
+```
+对每个评分人 i：
+1. 取他对每张图的 z-score
+2. 算这组 z 的 β2（kurtosis 估计）
+3. 如果 |β2| > 2，标记为可疑
+4. 再看他与组内 mean 的偏差，超过 ±2σ 的次数 / 总次数 > 5%，剔除
+```
+
+ITU 这套筛人方法比简单"剔除 catch trial 没过的"更系统，**正经发表论文/做产品评测应该用**。
+
+工程实现：参考 [VQEG 的 SUREAL 库](https://github.com/Netflix/sureal) 里 `bt500.py` 的算法实现。
+
+## 12.7 SUREAL：现代 MOS 估计
+
+简单的"对每张图取所有评分人的均值"假设了所有评分人同等可信。Netflix 在 2018 提出 **SUREAL**（Subjective REcovery Algorithm with Latent classes），把 MOS 建模为：
+
+$$
+s_{ij} = q_j + b_i + v_i \cdot \epsilon_{ij}
+$$
+
+- $s_{ij}$：评分人 $i$ 对图 $j$ 的分
+- $q_j$：图 $j$ 的真实质量（要估的）
+- $b_i$：评分人 $i$ 的偏差（"严格"或"宽松"）
+- $v_i$：评分人 $i$ 的不一致性（高 $v$ = 噪声大）
+
+用 EM 迭代估 $(q, b, v)$，**同时识别不可靠评分人**（高 $v_i$）。
+
+### 与 z-score 归一化的差别
+
+- **z-score**：每个评分人独立归一化，假设每人样本同分布
+- **SUREAL**：联合估计，能在小样本下识别离群评分人
+
+实测：**< 30 张图 / 评分人**时 SUREAL 显著优于 z-score。生产场景（每个评分人只评几十张）应该用 SUREAL。
+
+```python
+# Netflix 官方实现
+# pip install sureal
+from sureal.dataset_reader import RawDatasetReader
+from sureal.subjective_model import MosModel, MaximumLikelihoodEstimationModel
+
+# MLE 模型 = SUREAL
+model = MaximumLikelihoodEstimationModel(dataset_reader)
+result = model.run_modeling()
+print(result['quality_scores'])     # 每张图的估计真值
+print(result['observer_bias'])      # 每个 rater 的 bias
+print(result['observer_inconsistency'])  # 每个 rater 的 v
+```
+
+学术论文写 user study 时引用 SUREAL 而不是 raw mean / z-score，已经是 2020 年后视频质量评测领域的主流做法。
+
+## 12.8 ITU-R BT.500：视频/影像主观评测的圣经
+
+如果做严肃的主观评测，**绕不开 ITU-R BT.500-14**（最新 2023 修订）。它定义了：
+
+### 评测方法
+
+- **DSCQS**（Double-Stimulus Continuous Quality Scale）：双刺激连续质量量表，参考 + 测试同时显示
+- **DSIS**（Double-Stimulus Impairment Scale）：双刺激损伤量表，重点看损伤程度
+- **SS**（Single Stimulus）：单刺激，类似 MOS
+- **SSCQE**（Single Stimulus Continuous Quality Evaluation）：用于视频，评分人滚动给分
+- **PC**（Pair Comparison）：=2AFC
+
+### 物理环境标准
+
+- **视距**：屏幕高度 H × 3-4 倍（PVD：preferred viewing distance）
+- **环境光**：< 20 lux（避免反射干扰）
+- **显示校准**：白点 D65、亮度 100-200 cd/m²、对比度按 BT.1886 EOTF
+- **背景**：中灰（15% 反射率）
+
+学术论文必须报告这些参数。AMT/Prolific 这些远程众包平台**做不到**——这是为什么严肃论文同时跑实验室 + 众包两轮，用前者标定后者。
+
+### Anchor 与 Training
+
+- 实验前必须有 **training session**（5-10 张 anchor 图，覆盖最差到最好），让评分人校准尺度
+- Training 数据**不计入正式分数**
+
+### 试次随机化
+
+- 每个评分人看到的图顺序独立随机
+- 同一对图的左右顺序随机
+- 同一张图（重复 catch trial）穿插在不同位置
+
+第 12.2-12.5 节讲的方法是 BT.500 这套体系的简化版——做产品迭代足够，**做学术发表应该按 BT.500 报参数**。
+
+## 12.9 IRB / 知情同意 / 伦理
+
+User study 涉及人类受试者。**学术发表 + 公司 GDPR 合规都要求伦理审查**，这块在影像增强论文里普遍写得很轻甚至跳过——但这是真实风险。
+
+### 学术：IRB approval
+
+NeurIPS / CVPR / ICCV 自 2024 起在投稿模板里加了 ethics statement，要求：
+
+- 受试者招募来源、样本量、报酬
+- 是否走过本机构 IRB / Ethics Committee
+- 数据保存期限、删除政策
+- 含 NSFW / 暴力 / 真人图像时的额外保护
+
+跨国合作要注意：欧盟受试者受 GDPR 保护，**美国 IRB 不自动覆盖**。
+
+### 工业：消费者数据
+
+公司内部部署 user study 平台时：
+
+- 雇员评分图像如果是真实用户数据 → 走 PII review
+- 评分平台日志保留：不超过任务完成后 30 天（除非有合规需要）
+- 知情同意：明确披露任务性质、payment、是否含敏感内容、退出权利
+
+### 众包平台的伦理坑
+
+- AMT 的时薪问题：2023 起多家学术机构 IRB 要求支付率 ≥ 评分人所在地区最低工资。$0.01/任务 + 20 秒/任务 = 时薪 $1.8，**这个数字在大多数 IRB 通不过**。
+- Prolific 默认时薪 $8/小时（达到英国最低），更省 IRB 麻烦。
+- 任务披露：在任务介绍里**前置**披露是否含 NSFW、是否含真人脸——之后才能给评分人 opt-in。
+
+工程结论：写论文/做产品的 user study，**预算时薪 ≥ $8/小时 + 走过本机构 IRB**，是 2024 之后的合规底线。
+
+## 12.10 跨文化与人口偏差
+
+最后一个被普遍低估的方差源：**评分人不是同质的**。
+
+- **审美差异**：东亚评分人更倾向认为"过度锐化 + 高对比"是"好画质"，欧美评分人更倾向"自然 + 低伪影"——同一张图 MOS 能差 0.5 分
+- **文档/文字内容**：评分人母语影响他们对文字 SR 的判读
+- **设备**：手机端评分人和台式机评分人对同一张图的感知不同
+- **专业 vs 非专业**：摄影师/设计师对色调更敏感，普通用户对结构更敏感
+
+工程实践：
+
+- **记录人口学特征**：地区、年龄段、设备类型，事后做分群分析
+- **目标场景匹配**：做亚洲市场产品就用亚洲面板，跨地区产品至少 2-3 个地区抽样
+- **报告时披露**：论文 user study section 应给出 rater 的人口学概览
+
+学术论文不报告这些维度，结论的 generalizability 受质疑——这是 2024 起 IQA 领域审稿的常见质询点。
+
+## 12.11 统计显著性
 
 得出 "模型 A 比 B 好" 之前，必须做显著性检验。
 
@@ -252,7 +459,7 @@ print(f"A 胜率 54%, p = {result.pvalue:.4f}")
 
 如果你比较 5 个模型（10 对），p 值要做 Bonferroni 修正：$\alpha_{\text{corrected}} = 0.05 / 10 = 0.005$。
 
-## 12.7 自动指标 vs MOS 的相关性
+## 12.12 自动指标 vs MOS 的相关性
 
 不同指标和人眼感知的相关性（来自多个 IQA benchmark 的统计）：
 
@@ -278,7 +485,7 @@ print(f"A 胜率 54%, p = {result.pvalue:.4f}")
 - 论文/报告除了 PSNR + LPIPS 还要做主观评测
 - 真实场景部署时盯 MANIQA + 用户行为
 
-## 12.8 真实场景：下游任务评估
+## 12.13 真实场景：下游任务评估
 
 最有说服力的评估：**增强后的图能不能让下游任务做得更好？**
 
@@ -332,7 +539,7 @@ mAP_enhanced = detection_eval(model_output(...), annotations)   # 0.62
 - 艺术修复（没有"任务"）
 - 美颜滤镜（用户喜好导向）
 
-## 12.9 A/B 测试在生产环境
+## 12.14 A/B 测试在生产环境
 
 把新模型部署给一部分用户，对照旧模型，看用户行为变化。
 
@@ -374,7 +581,7 @@ def compute_ab_metrics(control_users, treatment_users):
 4. **多重测试**：同时测多个变体要做 Bonferroni 修正
 5. **段化分析**：不同设备/地区/用户群可能反应不同
 
-## 12.10 失败案例集（Failure Case Bank）
+## 12.15 失败案例集（Failure Case Bank）
 
 平均指标好的模型可能在**特定场景**完全崩坏。**专门维护一个失败案例集**——把已知崩坏的输入收集起来，每次新模型都跑一遍这个集合。
 
@@ -406,7 +613,7 @@ def compute_ab_metrics(control_users, treatment_users):
 
 工程实践：每个新模型版本必须跑失败集合，结果存档。**长期维护**这个集合比刷 benchmark 重要得多。
 
-## 12.11 Benchmark 设计
+## 12.16 Benchmark 设计
 
 第 4 章 4.9 节讲了学术 benchmark 的偏差。这里讲怎么设计**自己**的 benchmark。
 
@@ -446,7 +653,7 @@ def compute_ab_metrics(control_users, treatment_users):
 
 工程实践：**保留一个"密封"测试集**，只在最终发布前跑一次。
 
-## 12.12 Eval pipeline 工程
+## 12.17 Eval pipeline 工程
 
 实际工程里 eval 应该自动化。
 
@@ -498,7 +705,7 @@ class EvalPipeline:
 - **对比**：能 diff 不同 commit 的 eval 结果
 - **可视化**：自动生成对比图、表格
 
-## 12.13 论文实验报告标准
+## 12.18 论文实验报告标准
 
 写论文/技术报告时，eval 部分应包括：
 
@@ -513,7 +720,7 @@ class EvalPipeline:
 
 很多论文跳过 4、5、6，结果是审稿质疑或者复现失败。
 
-## 12.14 评估的常见反模式
+## 12.19 评估的常见反模式
 
 工程中要避免的几种：
 
@@ -537,18 +744,23 @@ class EvalPipeline:
 
 每次 eval 不一样，追溯不到当初为什么这个数。
 
-## 12.15 小结
+## 12.20 小结
 
 1. **评估三层级**：自动指标 + 主观评测 + 下游任务，三者互相验证
 2. **MOS 简单但噪声大**，2AFC 强制对比信噪比高，**优先用 2AFC**
 3. **样本量要做 power analysis**：1000+ pairs 是常见正经实验的下限
 4. **评分人质量控制**：catch trial、test-retest、time check
-5. **统计显著性**：t-test/Wilcoxon for 连续指标，binomial test for 2AFC，多重比较做 Bonferroni
-6. **自动指标 vs MOS 相关性**：LPIPS/DISTS/MANIQA ~0.75，PSNR 只 0.4-0.55
-7. **下游任务评估最有说服力**：OCR 准确率、人脸识别率、检测 mAP
-8. **A/B 测试是生产环境的事实标准**：监控用户行为指标
-9. **失败案例集**：长期维护，比平均指标重要
-10. **Benchmark 不能用来调超参**：保留密封 test set
+5. **评分人间一致性**：Krippendorff α / ICC 是 user study 是否可信的前置门槛；BT.500-14 附录 V 的 β2 异常检测剔除离群评分人
+6. **MOS 估计用 SUREAL**（Netflix MLE 方法），而不是 raw mean / z-score——小样本下显著更稳
+7. **严肃主观评测按 ITU-R BT.500-14**：DSIS/DSCQS/PC、视距、环境光、显示校准、anchor training 全部要按标准报参数
+8. **IRB / 知情同意是合规底线**：2024 起 NeurIPS/CVPR 都要 ethics statement，众包时薪 ≥ $8/h
+9. **跨文化与人口偏差是真实方差源**：报告 rater 人口学维度，目标场景匹配
+10. **统计显著性**：t-test/Wilcoxon for 连续指标，binomial test for 2AFC，多重比较做 Bonferroni
+11. **自动指标 vs MOS 相关性**：LPIPS/DISTS/MANIQA ~0.75，PSNR 只 0.4-0.55
+12. **下游任务评估最有说服力**：OCR 准确率、人脸识别率、检测 mAP
+13. **A/B 测试是生产环境的事实标准**：监控用户行为指标
+14. **失败案例集**：长期维护，比平均指标重要
+15. **Benchmark 不能用来调超参**：保留密封 test set
 
 到这里 Part III 训练与评估两章完成。Part IV 进入视频——视频不只是"图像加时间"，时序一致性是一个独立的问题。
 

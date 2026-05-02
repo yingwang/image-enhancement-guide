@@ -7,10 +7,12 @@
 ## 18.1 选型概览
 
 ```
-通用增强 SOTA (3)
-  ┌─ SUPIR        — 扩散派 / 创意放大
-  ├─ Real-ESRGAN  — 真实退化建模派
-  └─ HAT          — Transformer 非扩散派
+通用增强 SOTA (5)
+  ┌─ SUPIR              — 扩散派 / 创意放大（完整 50 步）
+  ├─ OSEDiff / TSD-SR   — 扩散派 / 单步蒸馏（生产实时）
+  ├─ Real-ESRGAN        — 真实退化建模派
+  ├─ HAT                — Transformer 非扩散派
+  └─ Restormer          — 去噪 / 去模糊 / 去雨通用 backbone
 
 任务特化 (4)
   ┌─ CodeFormer   — 人脸修复
@@ -19,7 +21,7 @@
   └─ Retinexformer — 低光增强
 ```
 
-7 个，每个代表一种思路。
+9 个模型，每个代表一种思路。其中 SUPIR 与 OSEDiff/TSD-SR 是同一扩散派的两个工程位面——前者 50 步追极致质量，后者 1 步推产品落地。
 
 ## 18.2 SUPIR：扩散派创意放大
 
@@ -149,7 +151,115 @@ PSNR-导向 Transformer SR 的代表 baseline。**不是当前唯一 SOTA**—�
 - 论文：Chen et al. "Activating More Pixels in Image Super-Resolution Transformer" (CVPR 2023)
 - 代码：[github.com/XPixelGroup/HAT](https://github.com/XPixelGroup/HAT)
 
-## 18.5 CodeFormer：人脸修复
+## 18.5 Restormer：去噪 / 去模糊 / 去雨的 U-Net Transformer
+
+### 核心思路
+
+第 7 章 7.5 节讲过 MDTA（Multi-Dconv Head Transposed Attention）——把 self-attention 从空间维搬到通道维，复杂度从 $O(N^2)$ 降到 $O(C^2)$，对大图友好。配上 GDFN（Gated-Dconv Feed-Forward Network），整体是 4 层 U-Net 结构：
+
+```
+Input
+  ↓ Encoder (4 levels of MDTA + GDFN)
+  ↓ Latent (深层 MDTA + GDFN)
+  ↓ Decoder (4 levels, with skip connections)
+Output
+```
+
+不同任务用同一架构，只换训练数据：高斯/真实噪声去噪、运动去模糊、失焦去模糊、去雨。
+
+### 一句话记住
+
+"通道维 attention + 多任务通用 U-Net backbone，**SR 之外**所有底层视觉的事实标准 baseline"。
+
+### 何时用
+
+- **去噪**（高斯、真实传感器、合成噪声）
+- **去模糊**（运动、失焦）
+- **去雨 / 去雾 / 去摩尔纹**
+- **大图推理**（MDTA 显存友好，1080P 单张可整图过模型）
+- **视频底层任务的单帧 baseline**（接 BasicVSR++ 的对比）
+
+### 何时别用
+
+- **纯 SR**（HAT / SwinIR / DRCT 在 SR benchmark 上更强；Restormer 不是为 upsampling 设计的）
+- **极轻量端侧**（推理偏慢，参数 ~26M，需要蒸馏）
+- **任务里包含放大**（要么改成 Restormer + sub-pixel head，要么直接选 SR 派）
+
+### 关键数字
+
+- GoPro 去模糊：32.92 dB / 0.961 SSIM
+- SIDD 真实去噪：40.02 dB / 0.960 SSIM
+- 参数量 ~26M
+- A100 上 256×256 推理 ~50ms
+
+### 当前位置
+
+2022 至 2026 年**去噪/去模糊/去雨的事实标准 baseline**——任何一篇底层视觉论文做这三个任务必须和 Restormer 比。MDTA 模块本身被后续大量工作沿用（包括视频派和扩散派的部分实现）。**HAT 是 SR 派代表，Restormer 是 restoration 派代表**——两者的位置不冲突，工程上常常同时部署（一个管 deblur/denoise，一个管 upsample）。
+
+后续工作如 GRL、X-Restormer、PromptIR 在某些 benchmark 上略胜，但没有一个把 Restormer 完全替掉。
+
+### 论文与代码
+
+- 论文：Zamir et al. "Restormer: Efficient Transformer for High-Resolution Image Restoration" (CVPR 2022)
+- 代码：[github.com/swz30/Restormer](https://github.com/swz30/Restormer)
+
+## 18.6 OSEDiff / TSD-SR：单步扩散 SR
+
+### 核心思路
+
+完整扩散 SR（如 SUPIR）50 步推理 5-10 秒/张，**生产落地的最大障碍是延迟**。2024-2025 年单步扩散蒸馏把这条路打通：
+
+```
+LR Image
+  ↓ VAE encode（一次）
+  ↓ Pre-trained UNet (LoRA finetuned for SR)
+  ↓ One forward pass, no iterative denoising
+  ↓ VAE decode
+HR Image
+```
+
+蒸馏目标：让学生网络在任意噪声水平下，**一步**预测干净的 $x_0$。配合 score distillation / variational score distillation / target score distillation 等损失。
+
+### 代表方法
+
+- **OSEDiff**（NeurIPS 2024）：variational score distillation，单步采样，VAE-LR 当 init
+- **TSD-SR**（2024）：target score distillation，针对 SR 任务的目标分布修正
+- **SinSR**（CVPR 2024）：在 ResShift 基础上做单步蒸馏
+- **AdcSR**（2025）：把扩散模型蒸馏成对抗性单步生成器，质量与 SUPIR 接近
+
+### 一句话记住
+
+"扩散派从 50 步到 1 步，让 SUPIR 路线第一次能进生产环境"。
+
+### 何时用
+
+- **生产环境扩散派 SR**——2025 年起的默认选择
+- **实时 / 准实时增强**（< 1 秒/张）
+- **对 SUPIR 视觉质量满意但延迟不能接受**的场景
+
+### 何时别用
+
+- **极端退化 + 创意优先**（完整 SUPIR 仍偶有微弱质量优势，工业仍可保留作为离线处理选项）
+- **严格保真**（扩散派的"猜"本质没变，只是更快了——不适合法医/监控）
+
+### 关键数字
+
+- 推理速度：A100 上单张 ~0.3-0.8s（vs SUPIR 50 步 5-10s）
+- 质量：DIV2K val LPIPS 与 SUPIR 持平 ±2%；MANIQA 持平或略胜
+- 模型大小：≈ SDXL UNet + 小 LoRA，端侧 8-bit 量化后 ~3GB
+
+### 当前位置
+
+**2025-2026 年扩散 SR 工程主流**。SUPIR 仍是研究/教学的"完整版"标杆，但开新项目应当**默认从单步蒸馏路线开始**。这条线被低估的工程价值：扩散派第一次具备了取代 Real-ESRGAN 在通用增强工作流中的延迟条件。
+
+### 论文与代码
+
+- OSEDiff：Wu et al. "One-Step Effective Diffusion Network for Real-World Image Super-Resolution" (NeurIPS 2024) — [github.com/cswry/OSEDiff](https://github.com/cswry/OSEDiff)
+- TSD-SR：Dong et al. "TSD-SR: One-Step Diffusion with Target Score Distillation" (2024)
+- SinSR：Wang et al. "SinSR: Diffusion-Based Image Super-Resolution in a Single Step" (CVPR 2024)
+- AdcSR：2025 年起的 adversarial distillation 方向（AdcSR 等）
+
+## 18.7 CodeFormer：人脸修复
 
 ### 核心思路
 
@@ -200,7 +310,7 @@ HR Face
 - 论文：Zhou et al. "Towards Robust Blind Face Restoration with Codebook Lookup Transformer" (NeurIPS 2022)
 - 代码：[github.com/sczhou/CodeFormer](https://github.com/sczhou/CodeFormer)
 
-## 18.6 BasicVSR++：视频超分
+## 18.8 BasicVSR++：视频超分
 
 ### 核心思路
 
@@ -244,7 +354,7 @@ HR 视频
 - 论文：Chan et al. "BasicVSR++: Improving Video Super-Resolution with Enhanced Propagation and Alignment" (CVPR 2022)
 - 代码：[github.com/open-mmlab/mmagic](https://github.com/open-mmlab/mmagic) (MMEditing 内)
 
-## 18.7 RIFE：帧插值
+## 18.9 RIFE：帧插值
 
 ### 核心思路
 
@@ -294,7 +404,7 @@ F_{t+0.5}
 - 论文：Huang et al. "Real-Time Intermediate Flow Estimation for Video Frame Interpolation" (ECCV 2022)
 - 代码：[github.com/megvii-research/ECCV2022-RIFE](https://github.com/megvii-research/ECCV2022-RIFE)
 
-## 18.8 Retinexformer：低光增强
+## 18.10 Retinexformer：低光增强
 
 ### 核心思路
 
@@ -335,18 +445,21 @@ Enhanced image
 - 论文：Cai et al. "Retinexformer: One-stage Retinex-based Transformer for Low-light Image Enhancement" (ICCV 2023)
 - 代码：[github.com/caiyuanhao1998/Retinexformer](https://github.com/caiyuanhao1998/Retinexformer)
 
-## 18.9 选型决策树
+## 18.11 选型决策树
 
 按场景给推荐：
 
 ```
 任务是什么?
   │
-  ├─ 通用 SR / 去噪 / 去模糊
+  ├─ 通用 SR
   │   │
-  │   ├─ 严重退化 + 创意优先 → SUPIR
-  │   ├─ 真实场景 + 工程稳定 → Real-ESRGAN  ←─ 默认
+  │   ├─ 离线 + 极致质量 + 不限延迟 → SUPIR（50 步）
+  │   ├─ 实时扩散派（默认 2025 起）→ OSEDiff / TSD-SR（1 步）
+  │   ├─ 真实场景 + 工程稳定（CNN/GAN 派）→ Real-ESRGAN
   │   └─ 学术 benchmark / PSNR 比赛 → HAT
+  │
+  ├─ 去噪 / 去模糊 / 去雨（不放大）→ Restormer  ←─ 默认
   │
   ├─ 人脸增强 → CodeFormer (fidelity 用户可调)
   │
@@ -365,11 +478,11 @@ Enhanced image
   └─ 端侧实时 → 蒸馏版 NAFNet + CoreML/TensorRT FP16
 ```
 
-## 18.10 学术 SOTA vs 工程 SOTA
+## 18.12 学术 SOTA vs 工程 SOTA
 
 最后强调一个反复出现的主题：
 
-> 这一章列的 7 个模型不是"刷分最高的"。
+> 这一章列的 9 个模型不是"刷分最高的"。
 >
 > 它们是**工程上最值得部署**的——平衡了效果、速度、稳定性、可维护性。
 
@@ -386,9 +499,9 @@ Enhanced image
 - **可部署性**（能转 ONNX、能量化、能 tile）
 - **可维护性**（有官方代码、有持续维护、有社区）
 
-这 7 个模型在这些维度上都是同类最好。
+这 9 个模型在这些维度上都是同类最好。
 
-## 18.11 哪些 SOTA 没列
+## 18.13 哪些 SOTA 没列
 
 值得知道但本章没单独列的（按类别）：
 
@@ -396,8 +509,9 @@ Enhanced image
 
 - **DiffBIR**：扩散派，比 SUPIR 早，CLIP image cross-attention 思路
 - **SeeSR**：扩散派 + 语义先验，更注重控制
-- **ResShift**：扩散派的高效采样
-- **DRCT**：纯 CNN 派近年代表
+- **ResShift**：扩散派的高效采样（被 SinSR 蒸馏到单步）
+- **AdcSR / SinSR**：单步扩散派同代竞品（与本章 18.6 同方向）
+- **DRCT / Hi-IR / ATD**：HAT 同期/后续 PSNR 派 Transformer SR
 - **BSRGAN**：Real-ESRGAN 的同期工作
 
 ### 人脸
@@ -410,7 +524,7 @@ Enhanced image
 
 - **VRT / RVRT**：Transformer 派 VSR
 - **EDVR**：滑动窗口经典
-- **PropPainter**：视频 inpainting 代表
+- **ProPainter**：视频 inpainting 代表
 
 ### 帧插值
 
@@ -431,7 +545,7 @@ Enhanced image
 
 每个领域都有 5-10 个值得关注的模型。本章选的是**最具代表性、最工程友好**的那些。
 
-## 18.12 何时该换 SOTA
+## 18.14 何时该换 SOTA
 
 新模型每月都在出。**什么时候应该把生产模型换掉？**
 
@@ -449,7 +563,7 @@ Enhanced image
 >
 > 一个稳定的旧 SOTA 通常胜过一个不稳定的新 SOTA。
 
-## 18.13 最后
+## 18.15 最后
 
 这本书走过：
 

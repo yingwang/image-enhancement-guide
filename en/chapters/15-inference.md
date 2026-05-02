@@ -351,7 +351,139 @@ mlmodel_quantized = cto.palettize_weights(mlmodel, config)
 
 Measured: model size 50 MB → 12 MB, quality loss < 0.3 dB.
 
-## 15.5 Android / embedded: TFLite + NNAPI
+## 15.5 NPU practice: from "it runs" to "it's actually fast"
+
+Section 15.4 gave the ANE op whitelist, but **90% of real-world latency problems are not "this op isn't supported" — they're fallback latency cliffs from partial-fallback subgraphs, the wrong quantization granularity, and tensor-layout-induced implicit reshapes**. This section covers the highest-frequency real traps in on-device NPU deployment.
+
+### 15.5.1 Per-channel vs per-tensor quantization: low-level vision must use per-channel
+
+INT8 quantization maps FP32/FP16 tensors to INT8. The mapping "resolution" (scale) comes in two granularities:
+
+- **Per-tensor**: one (scale, zero_point) for the entire weight tensor. Simple; older mobile NPUs (Qualcomm HTP, early Huawei NPU SDK) default to this.
+- **Per-channel**: one scale per output channel — significantly higher weight quantization precision. Activations are usually still per-tensor (per-channel activation has poor hardware support).
+
+**Why low-level vision must use per-channel weights:**
+
+Conv weights in low-level vision have **much larger inter-channel magnitude variation than classification tasks** — some channels learn texture (small magnitude), others learn structure (large magnitude). Under per-tensor with a single shared scale, small-magnitude channels are quantized to just a few INT8 levels, suffering severe precision loss — which **manifests visually as grid / color-banding artifacts**.
+
+Measured comparison (Real-ESRGAN, DIV2K val):
+
+| Quantization scheme | PSNR (dB) | Visual artifacts |
+|--------------------|-----------|------------------|
+| FP16 | 28.45 | None |
+| Per-channel weight INT8 + per-tensor act INT8 | 28.30 (-0.15) | Barely perceptible |
+| Per-tensor weight INT8 + per-tensor act INT8 | 27.10 (-1.35) | Obvious grid / banding |
+
+Engineering takeaway: **on-device INT8 quantization must use per-channel weight quant**. If a chip's SDK only supports per-tensor weight quant, either fall back to FP16 or pick another chip.
+
+```python
+# Per-channel quantization in CoreML (iOS 16+)
+import coremltools.optimize.coreml as cto
+
+cto.linear_quantize_weights(
+    mlmodel,
+    config=cto.OptimizationConfig(
+        cto.OpLinearQuantizerConfig(
+            mode="linear_symmetric",
+            granularity="per_channel",     # The key parameter
+            weight_threshold=2048,
+        )
+    ),
+)
+```
+
+### 15.5.2 ANE → CPU fallback latency cliff
+
+ANE op latencies are typically **a few hundred μs** (sub-millisecond). The moment an unsupported op shows up, CoreML falls back that subgraph to GPU or CPU, and **per-op latency jumps to ms-scale** — a 10× to 100× cliff.
+
+Worse, fallback is not just per-op: **switching tensors between ANE and CPU/GPU has milliseconds of overhead by itself** (data must be copied between memory pools). A 30-layer network with three fallback ops can cause six ANE↔CPU switches at a few ms each — total latency jumps from 30ms to 100ms+.
+
+**What you must do:**
+
+1. **Dump compute_unit assignment immediately after export**:
+
+```python
+import coremltools as ct
+
+mlmodel = ct.models.MLModel("model.mlpackage")
+spec = mlmodel.get_spec()
+
+# After running an inference, use Xcode Instruments' Core ML template to see per-op compute unit
+# Or use ct.models.utils.evaluate_classifier / generic helpers
+```
+
+The standard practice is to profile one inference with Xcode Instruments → Core ML template, which color-codes each op as ANE / GPU / CPU. **Goal: 100% ANE on the network body, zero switching.**
+
+2. **Force ANE-only validation**:
+
+```python
+# Restrict to ANE only — any unsupported op errors out immediately
+mlmodel = ct.convert(traced, ..., compute_units=ct.ComputeUnit.CPU_AND_NE)
+# Switch back to ALL for actual deployment
+```
+
+3. **PixelShuffle is a high-frequency SR trap**: iOS 16 ANE doesn't support PixelShuffle, causing fallback. iOS 17+ supports it partially with size constraints (input channels must be ≤ 256). For iOS 16 compatibility, **use transposed conv or nearest+conv instead of PixelShuffle**.
+
+4. **LayerNorm with dynamic shapes falls back on ANE**: LayerNorm with fixed spatial size is OK; dynamic input sizes may fall back. If your SR model needs to support dynamic resolution, **use GroupNorm (ANE-friendly) instead of LayerNorm**.
+
+### 15.5.3 Implicit layout transformations from reshape / permute
+
+ANE has internal preferred tensor layouts (NCHW vs internal proprietary), and certain reshape / permute ops trigger **a full memory rearrangement of the tensor** — single-op latency jumps from μs to ms. Common triggers:
+
+- `tensor.permute(0, 2, 3, 1)` converting NCHW → NHWC (common in style transfer etc.)
+- `tensor.view(B, -1, H, W)` when channel count is not a multiple of 8/16
+- Transpose on large spatial sizes (4K+)
+
+Engineering practice:
+
+- **Use ANE-friendly channel counts during training** (multiples of 4/8/16/32)
+- **Avoid permute on 4K inputs** — when unavoidable, tile first then permute
+- **Use `coremltools.compression.experimental.ane_optimize`** (iOS 18+) to let the converter automatically reorder ops to reduce layout switches
+
+### 15.5.4 The realities of Qualcomm SNPE / MediaTek NeuroPilot
+
+Android-side NPU compatibility is **even more fragmented than ANE** — the same ONNX model can vary by orders of magnitude across different chips.
+
+**Qualcomm SNPE (Snapdragon NPU)**:
+
+- HTP backend (Hexagon Tensor Processor) runs INT8 extremely fast (5× faster than GPU on flagship SoCs)
+- **Op whitelist is even narrower than ANE** — SNPE 8.x still doesn't support GroupNorm directly (must decompose into reshape + LN), PixelShuffle, complex attention
+- INT8 quantization is sensitive to SDK version: PTQ flow from SNPE 1.x was rewritten in 2.x; old scripts incompatible
+- **Required tool**: after `snpe-onnx-to-dlc` conversion, use `--debug 3` to inspect per-layer backend assignment, similar to ANE dump
+
+**MediaTek NeuroPilot (Dimensity APU)**:
+
+- APU performance approaches SDM 8 Gen 3 HTP on Dimensity 9300+/9400 flagships; mid-range chips show large gaps
+- **Op compatibility is more fragmented than SNPE** — the same model behaves differently on Dimensity 8000-series vs 9000-series
+- Conversion tool: `neuropilot-converter`; quantization calibration data should be 200+ representative images
+
+**Engineering takeaway**: Android releases must **profile on 3–4 representative SoCs** (SDM 8 Gen 3 / Dimensity 9300 / Exynos 2400 / mid-range like SDM 7s Gen 2) before launch — flagship-only profiling is not enough.
+
+### 15.5.5 The on-device deployment profiling flow
+
+Putting all of the above together into an engineering flow:
+
+```
+1. Make NPU-friendly choices during training (GroupNorm not LayerNorm, PixelShuffle alternatives, channel counts in 8/16 multiples)
+   ↓
+2. Export ONNX, convert to CoreML / TFLite / DLC
+   ↓
+3. Use respective tools to dump op → backend assignment
+   ↓
+4. Fix fallbacks: either change the model or swap op implementations
+   ↓
+5. Quantize (per-channel weights)
+   ↓
+6. Calibration data: 200+ representative images (don't just use DIV2K, include business data)
+   ↓
+7. Profile on target SoCs: latency p50/p90/p99, power, thermal
+   ↓
+8. Failure case bank regression tests
+```
+
+Without this flow, "real-time on-device enhancement" is basically a demo — production launches will crash.
+
+## 15.6 Android / embedded: TFLite + NNAPI
 
 The de facto standard for Android devices:
 
@@ -380,7 +512,7 @@ NNAPI (Android 8+) can route TFLite models to the device NPU, but compatibility 
 
 In practice: **on Android, vendor-specific SDKs are common**—Qualcomm's SNPE, MediaTek's NeuroPilot, Huawei's HiAI.
 
-## 15.6 Model distillation: ultra-lightweight
+## 15.7 Model distillation: ultra-lightweight
 
 Pretrained model too large? Train a **student model** (small) to imitate the teacher's (large) outputs.
 
@@ -412,7 +544,7 @@ Representative projects:
 - **Real-ESRGAN-Mini**: 1.5M-parameter distilled version, ~70% of ESRGAN's performance
 - **SwinIR-Lite**: distill a Swin Transformer into a pure CNN
 
-## 15.7 LCM / Turbo distillation (diffusion-specific)
+## 15.8 LCM / Turbo distillation (diffusion-general)
 
 Diffusion models are too slow at 50 steps. **Latent Consistency Models (LCM)** distill them down to 4–8 steps:
 
@@ -445,7 +577,25 @@ Measured:
 - LCM-LoRA, 4 steps: 2 s
 - Quality loss: FID rises slightly, LPIPS rises slightly, visually nearly indistinguishable (in 4× enhancement scenarios)
 
-## 15.8 Tile inference: handling large images
+### Single-step diffusion SR: pushing the SUPIR route into production
+
+LCM-LoRA is a **general-purpose** diffusion accelerator. Single-step diffusion SR purpose-trained for SR (OSEDiff / TSD-SR / AdcSR / SinSR; see Section 18.6) goes further — directly training a student that samples in **1 step**:
+
+| Route | Steps | Latency per image (A100) | Quality vs SUPIR |
+|-------|-------|---------------------------|------------------|
+| Vanilla SUPIR | 50 | 5–10 s | 100% (baseline) |
+| LCM-LoRA + SUPIR | 4–8 | 1–2 s | LPIPS +1–3% |
+| OSEDiff / TSD-SR | **1** | **0.3–0.8 s** | LPIPS ±2% |
+
+**Why this matters**: 50-step diffusion SR is unusable on-device, in live streams, or in interactive editing. 1-step diffusion SR is the first time "diffusion-school quality" and "real-time latency" coexist in the same system — this is the underlying reason SUPIR has been gradually replaced in production since 2025.
+
+Engineering notes:
+
+- LCM-LoRA is the **lowest-cost** diffusion accelerator (just train a LoRA), but 4-step quality on SR tasks is still weaker than purpose-distilled 1-step models
+- New "diffusion-school SR" projects should **default to OSEDiff / TSD-SR rather than starting with SUPIR**
+- On-device deployment of this route (running OSEDiff on a phone NPU) is still on the edge — even one-step SDXL UNet is 2–3 GB, requiring further compression of the UNet (distill to a smaller backbone)
+
+## 15.9 Tile inference: handling large images
 
 Section 9.9 discussed tiles for diffusion; here we extend it to all models.
 
@@ -533,7 +683,7 @@ Engineering experience:
 - Tight VRAM: tile_size = 512, overlap = 64
 - Extremely tight: tile_size = 256, overlap = 32
 
-## 15.9 Streaming video processing
+## 15.10 Streaming video processing
 
 Video processing cannot wait for the whole clip to load—it must be **streaming**, processing and emitting frame by frame.
 
@@ -571,7 +721,133 @@ class StreamingVideoEnhancer:
 
 Engineering practice: state-of-the-art real-time video enhancement is mostly causal—looking only at history, never the future.
 
-## 15.10 Multi-model pipeline optimization
+## 15.11 Real-time video enhancement engineering
+
+Section 15.10 covered streaming as an architecture concept. But **"streaming" and "real-time" are different things** — streaming is a data-flow shape, real-time is a latency constraint. This section covers the concrete engineering issues for real-time video enhancement (live streaming / video conferencing / short-video real-time filters / VR pass-through enhancement) — issues that are absent from papers but unavoidable in production.
+
+### 15.11.1 Latency budgets
+
+The hard constraint on real-time enhancement is end-to-end latency. Budgets vary wildly across scenarios:
+
+| Scenario | Frame rate | End-to-end budget | Enhancement budget |
+|----------|-----------|-------------------|--------------------|
+| Live streaming (push) | 30 fps | 33 ms / frame | < 20 ms (rest goes to encoding / network) |
+| Video conferencing | 30 fps | 16 ms / frame (RTT 64 ms) | < 10 ms |
+| Short-video filter | 30 fps | 33 ms / frame | < 25 ms |
+| VR / AR pass-through | 90 fps | 11 ms / frame | < 5 ms |
+| "Looks real-time" offline | 30 fps | 100 ms / frame (3-frame buffer) | < 80 ms |
+
+Engineering takeaway: **video conferencing and VR effectively rule out any diffusion model** — single-step diffusion SR on A100 is 0.3–0.8 s, 1–2 orders of magnitude over budget. These scenarios belong to NAFNet / distilled BasicVSR / quantized Restormer territory.
+
+### 15.11.2 Inter-frame stability vs latency
+
+Chapter 13 discussed temporal consistency. **In real-time settings, bidirectional sliding windows (BasicVSR++ uses future frames) cannot get those future frames** — every SOTA VSR paper's metrics drop 0.5–1 dB under causal constraints.
+
+Engineering compromises:
+
+- **Small latency buffer** (3–5 frames): trade 1 dB of quality but users perceive "lag"
+- **Pure causal models**: lower quality ceiling, lowest latency
+- **Hybrid**: causal main path + one-frame future as oracle hint (effectively impossible in VR; viable in live streaming / conferencing)
+
+Practical experience: **video conferencing → pure causal; live streaming → 1–2 frame buffer**. Audiences don't notice a fixed 33–66 ms buffer, but they clearly notice temporal flicker.
+
+### 15.11.3 Scene-cut detection: RNN hidden-state reset
+
+Recurrent models (BasicVSR / distilled variants) suffer **hidden-state pollution across scene cuts**: features from the previous scene linger in the RNN, producing "ghost" artifacts in the first few frames of the new scene.
+
+```python
+def detect_scene_cut(prev_frame, curr_frame, threshold=0.4):
+    """Simple scene cut detector: histogram difference."""
+    prev_hist = torch.histc(prev_frame.float(), bins=64, min=0, max=1)
+    curr_hist = torch.histc(curr_frame.float(), bins=64, min=0, max=1)
+    chi_sq = ((prev_hist - curr_hist) ** 2 / (prev_hist + curr_hist + 1e-8)).sum()
+    return chi_sq > threshold
+
+# Usage
+if detect_scene_cut(prev, curr):
+    rnn_state = rnn_state.zero_()        # reset hidden state
+```
+
+A more robust approach: detect with CLIP image-embedding distance — but adds 2–5 ms latency, **infeasible when streaming / conferencing budgets are tight**. Production typically uses histogram / frame-diff + IoU.
+
+### 15.11.4 GOP-aware: aligning with the encoder
+
+Live streaming / video flows go through H.264/H.265/AV1 encoders, **organized into GOPs (Group of Pictures)**:
+
+```
+I P P P P P P P I P P P P P P P I ...
+└─── GOP 1 ───┘ └─── GOP 2 ───┘
+```
+
+I-frames (keyframes) decode independently; P/B frames depend on neighbors. The enhancement pipeline's hidden-state reset should **align with I-frame boundaries** rather than fire on detected scene cuts, because:
+
+1. Encoders typically insert I-frames at scene cuts already
+2. Aligning resets with I-frames keeps downstream decoder and enhancer in sync
+3. P/B frames across an I-frame boundary may carry decoder artifacts; resetting prevents the enhancer from amplifying them
+
+Engineering: read frame type from the NAL unit header; force RNN reset when an I-frame arrives.
+
+### 15.11.5 Frame-dropping policy and thermal limits
+
+Real-time systems **always overload eventually** — at some point the CPU/GPU/NPU misses the latency target. Mitigations:
+
+- **Quick degradation**: when latency exceeds budget → switch to a smaller model / drop frames / lower resolution
+- **Drop policy**: which frame to drop? Prefer P-frames (B-frames are reference targets and can't drop; I-frames can't drop because P/B depend on them)
+- **Thermal throttling**: phones running for 30+ minutes hit thermal limits; CPU/GPU is forced to ≤50% frequency. The enhancement model must be **thermal-aware** — switch to a lighter branch above a temperature threshold
+
+```python
+class ThermalAwareEnhancer:
+    def __init__(self, full_model, lite_model):
+        self.full = full_model
+        self.lite = lite_model
+
+    def process(self, frame, thermal_state):
+        # iOS: ProcessInfo.thermalState; Android: PowerManager
+        if thermal_state in ('critical', 'serious'):
+            return self.lite(frame)
+        return self.full(frame)
+```
+
+Thermal-aware switching is mandatory in video conferencing products — without it, users see lag after a 20-minute call as their phones overheat, and bad reviews spike.
+
+### 15.11.6 A/V sync
+
+The latency added by enhancement must align with audio — humans are sensitive to lipsync errors at ±40 ms. Two principles:
+
+1. **Tell the audio pipeline the fixed latency** the enhancer adds, so it delays audio by the same amount
+2. **Don't let enhancement latency jitter** — if model inference jumps between 15–25 ms, lipsync "drifts". p99 latency must be < p50 + 5 ms; otherwise more aggressive scheduling is needed
+
+WebRTC / RTSP SDKs all expose audio-delay-buffer interfaces; register the enhancer's end-to-end latency (including buffer) there.
+
+### 15.11.7 Encoder-aware enhancement
+
+The last commonly overlooked optimization: **the enhanced image will be re-compressed by the encoder**. If the enhancer adds high-frequency detail, the encoder may treat it as noise and crush it — wasted work.
+
+Engineering responses:
+
+- **Add the target encoder's degradation to the training pipeline**: enhancer output → H.264 encode → decode → loss against HR. The model learns "which details the encoder eats; don't bother learning them"
+- **Bitrate-aware enhancement**: at low bitrate (< 2 Mbps), reduce high-frequency strength to avoid banding; at high bitrate (> 8 Mbps), turn it on fully
+- **Avoid checkerboard / blocking artifacts**: H.264 is especially sensitive to block-boundary artifacts and will further mangle them
+
+Often overlooked — under a pure-PSNR view, sharper enhancement always looks better, but post-encoding PSNR can actually drop. **Live streaming / video conferencing A/B tests must measure post-encoding metrics, not the model's direct output.**
+
+### Summary: a real-time video enhancement engineering checklist
+
+```
+[ ] Latency budget: per-frame total budget, model's share
+[ ] Causality: pure causal or small future buffer
+[ ] Scene-cut detection: histogram / frame-diff / GOP I-frame
+[ ] GOP-aware: reset RNN in sync with the encoder
+[ ] Drop policy: drop P-frames, not I/B
+[ ] Thermal awareness: thermal_state → switch to lighter branch
+[ ] A/V sync: fixed latency + bounded jitter
+[ ] Encoder-aware: include target encode in training pipeline
+[ ] Failure-case bank: include scene cuts, low bitrate, thermal limits
+```
+
+None of these items appear in BasicVSR++ / RIFE papers, but **missing any one of them keeps your real-time video enhancement product off the shelf**.
+
+## 15.12 Multi-model pipeline optimization
 
 Real products are often combinations of multiple models (denoise → SR → colorization → frame interpolation). Optimization angles:
 
@@ -605,7 +881,7 @@ img2 = vae.decode(model_sr(latent_sr))
 img2 = vae.decode(model_sr(latent_denoise))
 ```
 
-## 15.11 Inference monitoring
+## 15.13 Inference monitoring
 
 Production needs monitoring for:
 
@@ -652,7 +928,7 @@ class InferenceMonitor:
         }
 ```
 
-## 15.12 Cost estimation
+## 15.14 Cost estimation
 
 Engineering decisions need cost data. Some reference values (April 2026):
 
@@ -677,7 +953,7 @@ Throughput: 0.42× real-time
 Cost: A100 ($1.5/h) × (1/0.42) = $3.6 per hour of video
 ```
 
-## 15.13 Deployment checklist
+## 15.15 Deployment checklist
 
 Checklist before pushing a model to production:
 
@@ -694,7 +970,7 @@ Checklist before pushing a model to production:
 - [ ] Monitoring instrumentation
 - [ ] Rollback plan
 
-## 15.14 Summary
+## 15.16 Summary
 
 1. **Different platforms have different optimization stacks**: A100 uses TensorRT, Apple uses CoreML, Android uses TFLite + vendor SDK
 2. **ONNX is the de facto intermediate format**—accepted by most inference engines
@@ -703,10 +979,13 @@ Checklist before pushing a model to production:
 5. **INT8 quantization** is sensitive in low-level vision—use cautiously
 6. **TensorRT FP16 + INT8 give 4–6× speedup**, the de facto standard for NVIDIA deployment
 7. **CoreML on ANE is extremely power-efficient** but operator-restricted
-8. **Distillation (including LCM/Turbo) is key for on-device deployment**
-9. **Tile inference handles large images**: tile_size + overlap + blend mask
-10. **Streaming video** uses causal models to avoid latency
-11. **Production monitoring**: latency distribution, failure rate, quality metrics
+8. **Three core NPU practice traps**: per-channel weight quant is mandatory; ANE → CPU fallback is a 100× latency cliff; reshape/permute can trigger layout rearrangement
+9. **Android NPU compatibility is fragmented**: profile on multiple representative SoCs (SDM / Dimensity / Exynos) before release
+10. **Distillation (LCM/Turbo + single-step diffusion SR) is the key to diffusion-school deployment**: OSEDiff / TSD-SR drop 50 steps to 1
+11. **Tile inference handles large images**: tile_size + overlap + blend mask
+12. **Streaming video** uses causal models to avoid latency
+13. **Real-time video enhancement engineering**: latency budget, GOP-aware reset, thermal-aware degradation, A/V sync, encoder-aware training — missing any one keeps your product off the shelf
+14. **Production monitoring**: latency distribution, failure rate, quality metrics
 
 The next chapter covers real-world cases—applying everything from previous chapters to concrete product scenarios.
 

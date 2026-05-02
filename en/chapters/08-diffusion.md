@@ -549,7 +549,9 @@ def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
 
 ## 8.13 A diffusion training pipeline for an enhancement task
 
-Putting the above concepts together into a training loop for an enhancement task. This is a simplified version of SUPIR/StableSR:
+Putting the above concepts together into a training loop for an enhancement task. The recipe below uses **the simplest latent-concat scheme**: upsample LR to HR resolution, run it through the VAE so the resulting `lr_latent` matches `hr_latent` in spatial size, then concat into the UNet input channels. This is closest to the LDSR setup from the LDM paper — enough to understand the minimal skeleton of diffusion-based enhancement training.
+
+Worth being explicit: **SUPIR and StableSR do not work this way**. Both inject the LR signal into the main UNet's skip connections via ControlNet / time-aware feature injection (StableSR uses a time-aware encoder; SUPIR uses ZeroSFT + ControlNet), keeping most of the main UNet weights frozen. Plain input-concat has weaker fidelity and is more sensitive to the LR input distribution; for production diffusion SR, prefer the ControlNet-style routes covered in Chapter 9.
 
 ```python
 def train_diffusion_enhancement(
