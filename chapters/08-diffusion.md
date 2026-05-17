@@ -7,6 +7,30 @@
 >
 > 这个差别在 ill-posed 严重的场景下是质变的。
 
+## 8.0 阅读须知
+
+这一章是 Part II 的转折点。读到这里之前，所有模型都是"输入一张图、输出一张图"的判别式管线，先验隐式藏在权重里。从这一章开始，模型本身就是一个完整的概率生成器，可以独立于具体的输入条件去描述"自然图像分布长什么样"，再在采样时把退化图 $y$ 当作约束加进来。换言之，前面章节的模型在学 $f_\theta(y) \approx x$，这一章及之后的模型在学 $p_\theta(x)$ 或 $p_\theta(x \mid y)$。
+
+为了让后续公式不至于一字一句都要翻字典，下面把这一章会反复出现的缩写先列一遍。已经被第 1 章介绍过的（DDPM 等）这里简短复述：
+
+- **DDPM**（Denoising Diffusion Probabilistic Model，去噪扩散概率模型）：第 1 章已经提过，是 Ho et al. 2020 提出的扩散模型基础范式，前向加噪固定、反向去噪学习
+- **DDIM**（Denoising Diffusion Implicit Model，去噪扩散隐式模型）：Song et al. 2021 提出的确定性反向采样器，可以跳步，把 1000 步压到几十步
+- **DPM-Solver**（Diffusion Probabilistic Model Solver，扩散模型 ODE 求解器）：Lu et al. 2022 提出的高阶数值求解器系列，用 ODE 视角加速采样
+- **UniPC**（Unified Predictor-Corrector，统一预测-校正采样器）：进一步整合预测器与校正器的高阶求解方法
+- **LCM**（Latent Consistency Model，潜空间一致性模型）：基于一致性蒸馏，把多步采样压到 2-4 步
+- **SDE / ODE**（Stochastic / Ordinary Differential Equation，随机/常微分方程）：扩散反向过程可以等价写成 SDE 或 ODE，前者带噪声项、后者确定性
+- **VLB / ELBO**（Variational Lower Bound / Evidence Lower Bound，变分下界 / 证据下界）：训练扩散模型时优化的对数似然下界，DDPM 损失最终被简化成 ELBO 的一个加权 MSE
+- **CFG**（Classifier-Free Guidance，无分类器引导）：训练时随机丢弃条件、推理时用条件与无条件预测的差做加权外推，控制生成贴合条件的程度
+- **LDM**（Latent Diffusion Model，潜空间扩散模型）：Rombach et al. 2022 把扩散从像素空间挪到 VAE 潜空间，Stable Diffusion 是其代表实现
+- **SD / SDXL**（Stable Diffusion / Stable Diffusion XL）：LDM 的两代具体实现，UNet 参数量分别约 860M / 2.6B
+- **VAE**（Variational Autoencoder，变分自编码器）：LDM 里负责像素与潜空间互转的前后处理网络
+- **CLIP**（Contrastive Language-Image Pretraining，图文对比预训练模型）：常作为扩散模型的文本/图像编码器
+- **SDS**（Score Distillation Sampling，得分蒸馏采样，Poole et al. 2022 的 DreamFusion 提出）：把扩散模型当成"先验梯度提供者"，用 score 在外部参数（比如 NeRF / 另一张图）上做梯度下降。增强领域里它偶尔被用作"用扩散模型给一张确定图像打分并优化"的工具
+- **LoRA**（Low-Rank Adaptation，低秩适配）：把权重更新分解成两个低秩矩阵 $W + AB^\top$ 的微调技术，扩散 fine-tune 的标配
+- **SUPIR / StableSR / DiffBIR**：本章末尾会反复出现的三个基于扩散的真实场景超分模型，详细结构留到第 9 章展开
+
+预设的背景仍然是第 1 章 1.0 节列的那一套：熟悉张量与基本损失函数，看得懂 PyTorch，听说过扩散模型但不一定亲手训过。本章会把 DDPM 的前向、反向、训练目标、采样器、潜空间化、UNet 内部结构、条件注入范式全部走一遍，目的是为第 9 章的条件控制和第 10 章之后的任务特化模型铺好底。
+
 ## 8.1 为什么扩散在影像增强里重要
 
 回到第 4 章 4.8 节的 perception-distortion trade-off：
@@ -35,54 +59,56 @@
 
 > **学一个去噪过程**——从纯噪声开始，一步步去除噪声，最后得到一张图。
 
-具体过程：
+为了让这件事更直观，下面把前向加噪与反向去噪两条链画出来。前向是一个固定的随机过程（没有可学的参数，只是按一个事先定好的 noise schedule 不断给图像加高斯噪声），反向才是神经网络要学的部分。
 
-```
-前向 (固定, 不学习):
-  x_0 (干净图)
-    ↓ 加一点噪声
-  x_1
-    ↓ 加一点噪声
-  x_2
-    ↓ ...
-  x_T (纯噪声, T = 1000)
+```mermaid
+graph LR
+    X0[x_0<br/>干净图] -->|+ε_1| X1[x_1]
+    X1 -->|+ε_2| X2[x_2]
+    X2 -->|...| XT_1[x_{T-1}]
+    XT_1 -->|+ε_T| XT[x_T<br/>≈ 纯高斯噪声]
+    XT -. 反向 .-> RT_1[x_{T-1}]
+    RT_1 -. 反向 .-> R2[x_2]
+    R2 -. 反向 .-> R1[x_1]
+    R1 -. 反向 .-> R0[x̂_0<br/>采样得到的图]
 
-反向 (神经网络学习):
-  x_T (纯噪声)
-    ↓ 去一点噪声 (用神经网络预测)
-  x_{T-1}
-    ↓ 去一点噪声
-  x_{T-2}
-    ↓ ...
-  x_0 (干净图)
+    style X0 fill:#e8f5e9
+    style XT fill:#ffebee
+    style R0 fill:#fff3e0
 ```
 
-训练目标：**给定任意时间步的加噪图 $x_t$，预测加进去的噪声**。
+实线箭头表示固定的前向加噪过程，每一步都按调度 $\beta_t$ 给图像加一点点高斯噪声；虚线箭头表示由神经网络驱动的反向去噪过程，每一步根据当前的 $x_t$ 估计应该去掉多少噪声，然后回到 $x_{t-1}$。当 $T$ 足够大（比如 1000）时，$x_T$ 的分布近似一个各分量独立的标准高斯。反向走完整条链就得到一张新图 $\hat{x}_0$。
 
-这看起来很怪——为什么这样能生成图？关键在两点：
+训练目标其实非常简单：**给定任意时间步的加噪图 $x_t$，预测加进去的噪声**。
 
-1. **任意 $t$ 的加噪图可以一步采样**——不需要从 $x_0$ 一步步加 $T$ 次，有解析公式
-2. **学会了预测噪声 = 学会了 $p(x_0)$ 的 score function**——可以从噪声反推回图
+第一眼看这个目标会觉得奇怪：预测噪声怎么会等于学会生成图像？关键在两点：
 
-下面把数学讲清。
+1. **任意 $t$ 的加噪图可以一步采样**——不需要从 $x_0$ 一步步加 $T$ 次，前向过程有一条解析公式让你直接跳到任意 $t$，这一点让训练在计算上可行
+2. **学会了预测噪声 = 学会了 $p(x_0)$ 的 score function**——score 是 $\nabla_x \log p(x)$，是分布对自变量的梯度场，知道每个点的 score 等价于知道分布的几何结构，从而可以用 Langevin 动力学或反向 SDE 从噪声采样出符合 $p(x)$ 的样本
+
+下面把这两点对应的数学讲清。
 
 ## 8.3 前向过程的数学
 
-定义噪声调度 $\beta_1, \beta_2, \dots, \beta_T$（$T = 1000$, $\beta_t$ 从 $10^{-4}$ 线性增到 $0.02$）。
+定义一个 **noise schedule**（噪声调度）$\beta_1, \beta_2, \dots, \beta_T$。常见配置是 $T = 1000$，$\beta_t$ 从 $10^{-4}$ 线性增到 $0.02$；更后期的实践会改成 cosine schedule（Nichol & Dhariwal 2021），让早期信号衰减更平缓，对生成质量有可测量的提升。这里先用线性版讲清楚机制，cosine 是同一框架下的另一组参数选择。
 
-每一步加噪：
+每一步加噪定义为：
 
 $$
 q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} \cdot x_{t-1}, \beta_t \mathbf{I})
 $$
 
-含义：$x_t$ 是 $x_{t-1}$ 缩小一点（乘 $\sqrt{1-\beta_t}$）再加一点高斯噪声（方差 $\beta_t$）。
+含义：$x_t$ 是 $x_{t-1}$ 缩小一点（乘 $\sqrt{1-\beta_t}$）再加一点高斯噪声（方差 $\beta_t$）。乘 $\sqrt{1-\beta_t}$ 是为了让方差守恒——如果只加噪不缩小，$x_t$ 的二阶矩会一直涨，最终远超 $x_0$ 的尺度；先把信号缩小再加上等量的方差，整体二阶矩保持在 $O(1)$，数值上更稳定。
 
-定义 $\alpha_t = 1 - \beta_t$，$\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$。**关键性质**：
+为了简化记号，定义 $\alpha_t = 1 - \beta_t$，再定义累积量 $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$。这个 $\bar{\alpha}_t$ 是后面所有公式里反复出现的核心量，几何意义是从 $x_0$ 到 $x_t$ 累积下来的"信号保留比例"。当 $t$ 接近 0 时 $\bar{\alpha}_t \approx 1$（几乎没加噪），当 $t$ 接近 $T$ 时 $\bar{\alpha}_t \approx 0$（信号几乎全淹没）。
+
+**关键性质**：用归纳法把 $q(x_t \mid x_{t-1})$ 链式展开，可以证明从 $x_0$ 到任意 $x_t$ 的边缘分布仍然是一个高斯：
 
 $$
 q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t} \cdot x_0, (1 - \bar{\alpha}_t) \mathbf{I})
 $$
+
+直观推导：第一步 $x_1 = \sqrt{\alpha_1} x_0 + \sqrt{1-\alpha_1} \epsilon_1$；第二步 $x_2 = \sqrt{\alpha_2} x_1 + \sqrt{1-\alpha_2}\epsilon_2 = \sqrt{\alpha_2 \alpha_1} x_0 + (\sqrt{\alpha_2(1-\alpha_1)} \epsilon_1 + \sqrt{1-\alpha_2}\epsilon_2)$。把后一项里两个独立高斯叠加，新方差是两项方差之和 $\alpha_2(1-\alpha_1) + (1-\alpha_2) = 1 - \alpha_2 \alpha_1$。一直递推下去就得到 $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1-\bar{\alpha}_t} \epsilon$。
 
 这意味着**给定 $x_0$，可以一步采样到任意 $x_t$**：
 
@@ -90,7 +116,7 @@ $$
 x_t = \sqrt{\bar{\alpha}_t} \cdot x_0 + \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I})
 $$
 
-这是训练能高效进行的关键——不需要真的一步步加 1000 次噪声。
+这是训练能高效进行的关键——不需要真的一步步加 1000 次噪声。训练循环里只要随机采一个 $t$，按上式直接构造 $x_t$ 和对应的 $\epsilon$，就能拿来做监督。如果没有这条解析路径，每一步训练都要先模拟 $t$ 次加噪，扩散模型的训练成本会高到完全不可行。
 
 ```python
 import torch
@@ -126,27 +152,50 @@ class NoiseScheduler:
         return x_t, noise
 ```
 
+### Noise schedule 的工程选择
+
+线性 schedule $\beta_t \in [10^{-4}, 0.02]$ 是 DDPM 论文的初始选择，但在高分辨率训练上不够好。它在 $t \to T$ 那一段衰减得太快，让早期信号几乎瞬间被噪声淹没，模型在那一区段拿不到多少梯度信号。Nichol & Dhariwal 2021 提出 **cosine schedule**：
+
+$$
+\bar{\alpha}_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos\left(\frac{t/T + s}{1 + s} \cdot \frac{\pi}{2}\right)^2
+$$
+
+其中 $s \approx 0.008$ 是一个小偏移，避免 $t = 0$ 时分母奇异。cosine 的 $\bar{\alpha}_t$ 在两端慢、中间快，让训练在"中间噪声水平"那一段花更多采样，匹配了人眼对 mid-frequency 细节的敏感度。SDXL、Imagen 都默认 cosine。
+
+更进一步，**SNR-based schedule** 直接按信噪比 $\text{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$ 定义 schedule，让 $\log \text{SNR}(t)$ 在 $t$ 上线性下降。这是 EDM (Karras et al. 2022) 的核心贡献之一，让"什么时间步"和"什么噪声水平"解耦：同一个噪声水平在不同 schedule 下对应的 $t$ 不一样，但在 SNR 视角下完全等价。EDM 的整套训练 / 采样代码都基于 SNR 参数化重写，性能在 FID 上比 DDPM 原版 schedule 提升一个台阶。
+
+工程实践：
+
+- 学术复现 DDPM 用线性
+- 训新模型默认 cosine
+- 追求 SOTA 生成质量用 EDM SNR 参数化
+- 增强任务里 schedule 影响相对小，主要是中等 $t$ 区域的 loss 权重决定结果质量
+
 ## 8.4 反向过程：训练目标
 
-理论上反向过程是 $p(x_{t-1} | x_t)$，要学的是这个条件分布。但 DDPM 论文证明了一个简化的等价目标：
+理论上反向过程是 $p(x_{t-1} | x_t)$，要学的是这个条件分布。完整的训练目标其实是数据对数似然 $\log p_\theta(x_0)$ 的变分下界（VLB / ELBO）。把每一步反向都建模成高斯 $p_\theta(x_{t-1} \mid x_t) = \mathcal{N}(\mu_\theta(x_t, t), \Sigma_\theta(x_t, t))$，再把 $\log p(x_0)$ 拆成 $T$ 项 KL 散度之和，每一项衡量"模型反向高斯"与"真实后验高斯 $q(x_{t-1} \mid x_t, x_0)$"的距离。这是 DDPM 论文里出现的那一长串项。
+
+DDPM 论文最有价值的工程贡献，是证明了在适当的方差选择下，这一长串目标可以被**简化**成一个权重为 1 的 MSE：
 
 **直接训一个网络 $\epsilon_\theta(x_t, t)$ 预测加进去的噪声 $\epsilon$**。
 
 训练损失：
 
 $$
-\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \|^2 \right]
+\mathcal{L}_{\text{simple}} = \mathbb{E}_{t, x_0, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \|^2 \right]
 $$
 
-这就是第 3 章 3.6 节讲的 simple loss。
+这就是第 3 章 3.6 节讲的 simple loss。虽然丢掉了 ELBO 里的精确权重，实测在样本质量上反而更好（高 $t$ 的项权重被"非正式地"加重了，让模型更专注于难的中间到高噪段）。
+
+注意训练过程里有三件事是被随机抽样的：每次 batch 取一些 $x_0$，对每个样本独立采一个时间步 $t \sim \text{Uniform}\{1, \dots, T\}$，再独立采一个 $\epsilon$。这个三重期望的蒙特卡洛估计就是损失。
 
 ### 三种等价预测目标
 
-模型可以预测三种量之一，互相等价：
+模型可以预测三种量之一，它们之间通过 $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1-\bar{\alpha}_t} \epsilon$ 这一条线性关系互相确定，**信息等价**，区别只是 loss surface 的形状不同：
 
-- **$\epsilon$-prediction**：预测加进去的噪声（DDPM 标准）
-- **$x_0$-prediction**：预测原图
-- **$v$-prediction**：$v_t = \alpha_t \epsilon - \sigma_t x_0$（更稳定）
+- **$\epsilon$-prediction**：预测加进去的噪声（DDPM 标准）。在 $t$ 大（$\bar{\alpha}_t$ 小）时，$x_0$ 几乎被噪声淹没，预测 $\epsilon$ 信号噪比相对更好
+- **$x_0$-prediction**：直接预测原图。在 $t$ 小（$\bar{\alpha}_t$ 接近 1）时，$x_t$ 几乎就是 $x_0$ 加一点点扰动，预测 $x_0$ 等价于做轻度去噪，损失尺度更稳
+- **$v$-prediction**（Salimans & Ho 2022）：定义 $v_t = \sqrt{\bar{\alpha}_t} \epsilon - \sqrt{1-\bar{\alpha}_t} x_0$，相当于在 $(\epsilon, x_0)$ 平面上沿着一个旋转方向预测。它的好处是 loss 在所有 $t$ 上量级一致，对高分辨率训练特别有用
 
 它们之间的转换：
 
@@ -179,6 +228,24 @@ def x0_to_eps(x_t, x0_pred, alpha_cumprod_t):
 - **$\epsilon$-pred**：通用文生图标配（SD 1.x）
 - **$v$-pred**：高分辨率训练更稳（SD 2.x, SDXL refiner）
 - **$x_0$-pred**：增强/恢复任务直观，关心的就是 $x_0$ 质量
+
+把三种目标的关系画成一个小图，便于对照：
+
+```mermaid
+graph LR
+    XT[x_t<br/>已知, 网络输入] --> P{网络<br/>预测哪一个?}
+    P -->|"ε-pred"| EP[ε_θ x_t,t]
+    P -->|"x_0-pred"| X0P[x̂_0 x_t,t]
+    P -->|"v-pred"| VP[v_θ x_t,t]
+    EP -.->|"x̂_0 = x_t - √(1-ᾱ)ε / √ᾱ"| X0P
+    VP -.->|"x̂_0 = √ᾱ x_t - √(1-ᾱ) v"| X0P
+    X0P -.->|"ε = x_t - √ᾱ x_0 / √(1-ᾱ)"| EP
+
+    style XT fill:#e3f2fd
+    style X0P fill:#e8f5e9
+```
+
+三种预测之间只是同一个仿射变换的不同投影，训练时改的是 loss 的角度，推理时再用对应公式还原成 $\hat{x}_0$ 用于下一步采样。
 
 ## 8.5 一个最小的 DDPM 训练循环
 
@@ -227,6 +294,26 @@ def train_ddpm(model, train_loader, scheduler, epochs=100,
 
 ## 8.6 采样：DDPM, DDIM, DPM-Solver
 
+训练完之后，UNet 已经学到了"任意 $x_t$ 应该往哪个方向去噪"。采样阶段做的事情是把这个一步去噪的能力组织成一条从 $x_T$ 走回 $x_0$ 的多步过程。不同采样器的差异就在于"如何用更少的步数走完这条路"。下面这张图把 DDPM、DDIM、DPM-Solver 三类在同一个反向链上的位置画出来：
+
+```mermaid
+graph TD
+    Train[训练好的 ε_θ x_t,t<br/>每一步都能预测噪声] --> Choice{选择采样器}
+    Choice --> DDPM[DDPM<br/>1000 步, 随机]
+    Choice --> DDIM[DDIM<br/>20-50 步, 确定性]
+    Choice --> Solver[DPM-Solver / UniPC<br/>10-30 步, 高阶 ODE]
+    Choice --> LCM[LCM 蒸馏<br/>2-4 步, 一致性模型]
+    DDPM --> Out[x̂_0]
+    DDIM --> Out
+    Solver --> Out
+    LCM --> Out
+
+    style Train fill:#e3f2fd
+    style Out fill:#e8f5e9
+```
+
+注意所有这些采样器共用同一组训练好的权重，**不需要重训**（LCM 例外，需要做一致性蒸馏）。所以生产实践里完全可以训一次 DDPM，然后在推理时根据 SLA 选不同的采样器。
+
 训练完后怎么从噪声生成图？
 
 ### DDPM 采样
@@ -237,29 +324,29 @@ $$
 x_{t-1} = \frac{1}{\sqrt{\alpha_t}} \left( x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}} \epsilon_\theta(x_t, t) \right) + \sigma_t z
 $$
 
-其中 $z \sim \mathcal{N}(0, \mathbf{I})$，$\sigma_t$ 是噪声项。
+其中 $z \sim \mathcal{N}(0, \mathbf{I})$ 是每一步独立采的高斯，$\sigma_t$ 是 DDPM 选定的噪声方差。这个公式的形式是从真实后验 $q(x_{t-1} \mid x_t, x_0)$ 推出来的，再把里面的 $x_0$ 用预测的 $\hat{x}_0 = (x_t - \sqrt{1-\bar{\alpha}_t}\epsilon_\theta) / \sqrt{\bar{\alpha}_t}$ 代入。整条链上的随机性来自这一连串 $z$ 的采样——同样一个起始噪声 $x_T$ 走两遍 DDPM 会得到不同的样本。
 
-**问题**：要走 1000 步，每步一次 UNet 前向，**慢**。
+**问题**：要走 1000 步，每步一次 UNet 前向，**慢**。SD 1.5 在 A100 上单步前向约 30ms，跑满 1000 步是 30 秒，单张图。生产环境完全不可接受。
 
 ### DDIM 采样
 
-Song et al. 发现可以用确定性反向：
+Song et al. 2021 发现可以用确定性反向：
 
 $$
 x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_{t-1}} \cdot \epsilon_\theta(x_t, t)
 $$
 
-其中 $\hat{x}_0$ 是从 $x_t$ 和预测噪声反推的 $x_0$。这个采样**可以跳步**——不需要走完 1000 步，可以挑 50 个时间步采样。
+其中 $\hat{x}_0$ 是从 $x_t$ 和预测噪声反推的 $x_0$（用上节的 `eps_to_x0`）。注意公式里没有显式的随机项 $z$——同一个起始噪声经过 DDIM 总是给出同一张图，这是 DDIM 的"确定性"含义。这个采样**可以跳步**：DDIM 把"从 $t$ 到 $t-1$ 的一步"重写成了"从 $t$ 到任意更小的 $t'$ 的一步"，因此推理时可以只挑 50 个时间步（比如均匀地从 1000 里取 20 个间隔）走完整个反向链。
 
-DDIM 50 步 ≈ DDPM 1000 步质量，**20× 加速**。
+DDIM 50 步 ≈ DDPM 1000 步质量，**20× 加速**。确定性这件事在编辑任务上还有一个额外好处：可以做 DDIM inversion，从已有图像反推它对应的潜噪声 $x_T$，然后修改条件再正向采样回去。
 
 ### DPM-Solver 系列
 
-把反向过程看作 ODE，用高阶数值方法求解。
+把反向过程看作 ODE，用高阶数值方法求解。Song et al. 2021 证明扩散反向过程严格等价于一条概率流 ODE（Probability Flow ODE），形式为 $dx/dt = f(x, t) - \frac{1}{2} g(t)^2 \nabla_x \log p_t(x)$，里面的 score 由训练好的 $\epsilon_\theta$ 给出。一旦写成 ODE，过去几十年所有数值积分技巧都能拿来用。
 
-- **DPM-Solver-2**：二阶，约 20 步达到 DDIM 100 步质量
-- **DPM-Solver++**：处理 SDE 形式
-- **UniPC**：进一步优化的统一预测-校正方法
+- **DPM-Solver-2**（Lu et al. 2022）：二阶 Taylor 展开求解 ODE，约 20 步达到 DDIM 100 步质量
+- **DPM-Solver++**：把 SDE 形式（带噪声项）也纳入同一框架，对条件生成更稳
+- **UniPC**（Unified Predictor-Corrector）：进一步整合预测器与校正器，把多步残差信息也利用起来，是 2024 年的常见默认
 
 ```python
 # 调用 diffusers 的采样器
@@ -282,7 +369,7 @@ scheduler.set_timesteps(num_inference_steps=20)
 
 ## 8.7 LDM：扩散搬到潜空间
 
-第 2 章 2.4 节已经介绍过。这里补充工程细节。
+第 2 章 2.4 节已经从"表征空间"的角度介绍过 LDM。这里从扩散的角度补一遍：为什么把扩散搬到潜空间是改变这个领域的工程节点。
 
 LDM (Rombach et al. 2022) 的关键观察：
 
@@ -310,7 +397,28 @@ UNet 是大头，VAE 相对小。这就是为什么 SD finetune 主要训 UNet�
 
 ## 8.8 SD UNet 内部结构
 
-UNet 是扩散模型的"主网络"。它的结构对增强任务很重要——后面 ControlNet 等扩展都建立在这个结构上。
+UNet 是扩散模型的"主网络"。它的结构对增强任务很重要——后面 ControlNet 等扩展都建立在这个结构上。为了把"UNet 在去噪步里的位置"放回大图，先用一张数据流图把单步采样画出来：
+
+```mermaid
+graph LR
+    XT[x_t<br/>潜空间噪声<br/>B,4,h,w] --> UNet
+    T[时间步 t] --> TEmb[时间嵌入<br/>sinusoidal + MLP]
+    Cond[条件 c<br/>文本/图像 token] --> CtxEmb[CLIP encoder]
+    TEmb --> UNet
+    CtxEmb --> UNet
+    UNet[UNet ε_θ<br/>encoder + mid + decoder<br/>cross-attention 接 c] --> Eps[ε̂ 或 v̂<br/>B,4,h,w]
+    Eps --> Step[采样器一步<br/>DDIM / DPM-Solver]
+    XT --> Step
+    Step --> XTm1[x_{t-1}<br/>下一步输入]
+
+    style XT fill:#e3f2fd
+    style UNet fill:#fff3e0
+    style XTm1 fill:#e8f5e9
+```
+
+每一个采样步都重复这条数据流，区别只是 $t$ 减小、$x_t$ 噪声含量减少。条件 $c$（文本或图像 embedding）在所有时间步都是同一个，只在 cross-attention 里反复消费。
+
+UNet 的整体宏观结构如下：
 
 ```
 Input (B, 4, 64, 64) latent
@@ -406,9 +514,9 @@ cross-attention 是文生图的关键——文本通过 cross-attention 影响�
 
 ## 8.9 增强任务里的扩散用法
 
-Text-to-image 是从纯噪声 + 文本条件采样到图。**增强任务**是从纯噪声 + 退化图 $y$ 条件采样到 $\hat{x}$。
+Text-to-image 是从纯噪声 + 文本条件采样到图。**增强任务**是从纯噪声 + 退化图 $y$ 条件采样到 $\hat{x}$。差别只是条件 $c$ 从一段文本变成了一张图（或图加一段描述），UNet 与采样链条本身不变。
 
-几种条件注入范式：
+几种条件注入范式（详细工程实现留到第 9 章展开，这里先列名字让读者知道全景）：
 
 ### 范式一：concat 到输入（最简单）
 
@@ -430,6 +538,10 @@ def prepare_input(noisy_latent, lr_latent):
 复制一份 UNet encoder，专门处理条件输入，输出加到主 UNet 的对应层。代表：StableSR 的 ControlNet 变体、SUPIR。
 
 第 9 章会详谈。
+
+### 一个常见的误解
+
+很多第一次接触扩散增强的工程师以为 LR 的"注入位置"决定了模型上限，于是花大量时间调架构。实测上，**真正决定生成质量的是 (1) 训练数据是否反映真实退化，(2) 条件控制强度的可调性**。架构选择（concat vs ControlNet）影响的是 fidelity-creativity 的曲线偏向哪一端，但只要训练数据合理、有可调的 conditioning scale，几种范式都能做到产品级。这也是为什么本书把第 5 章（数据合成）放在第 9 章（条件控制）之前——数据上限决定下限。
 
 ## 8.10 扩散为什么能"无中生有"
 
@@ -467,6 +579,23 @@ $$
 扩散模型不是在"逼近真值"，而是在"沿着自然图像分布的几何结构走 T 步"。每一步都被分布的几何引导，每一步都有随机扰动让生成结果不重复。
 
 最终输出是分布上的一个点——具体的、合理的、随机的。
+
+## 8.10b 一个扩展用法：SDS（Score Distillation Sampling）
+
+DreamFusion (Poole et al. 2022) 提出的 SDS 是把扩散模型"换一种用法"的代表。原本扩散是"从噪声出发反向采样到图"，SDS 把它当成一个**梯度源**：给定任意可参数化的目标 $\theta$（可以是另一张图、一个 NeRF、一个 3D mesh 的纹理），用扩散模型在它的渲染图 $x(\theta)$ 上提供"应该往哪个方向更新 $\theta$ 才能更像自然图像"的梯度：
+
+$$
+\nabla_\theta \mathcal{L}_{\text{SDS}}(\theta) = \mathbb{E}_{t, \epsilon}\left[w(t) (\epsilon_\theta(x_t, t, c) - \epsilon) \cdot \frac{\partial x}{\partial \theta}\right]
+$$
+
+其中 $x_t = \sqrt{\bar{\alpha}_t} x(\theta) + \sqrt{1-\bar{\alpha}_t}\epsilon$。把扩散模型预测的噪声残差 $\epsilon_\theta - \epsilon$ 通过链式法则推到 $\theta$ 上。这相当于"扩散模型告诉 $x(\theta)$ 应该怎么改才更接近自然图像分布"，反向传播让 $\theta$ 沿着 score 方向走。
+
+增强领域里 SDS 偶尔被用作：
+
+- 给一个已有判别式 SR 模型的输出做"扩散先验润色"，把输出 $\hat{x}$ 当作 $\theta$ 跑几步 SDS，让它更靠近扩散学到的自然图像流形
+- 对没有配对训练数据的稀有任务（古画修复、卫星 SR 的小样本），用通用扩散模型 + SDS 在测试图上做 per-image 优化
+
+实测 SDS 直接用在 SR 上效果不稳定，容易出现 oversaturated、纹理过强等问题，社区后续提出 VSD (Variational Score Distillation)、CSD (Classifier Score Distillation) 等改进。这条线在增强任务里不是主流，但作为"扩散模型还能怎么用"的一个示例值得了解。
 
 ## 8.11 扩散派 vs 判别式 trade-off
 
@@ -528,13 +657,31 @@ class EMA:
 
 ### Classifier-Free Guidance (CFG)
 
-训练时 10% 概率丢弃条件（无条件训练 + 有条件训练混合）。推理时：
+CFG（Classifier-Free Guidance，无分类器引导）是把"分类器引导扩散"那一类方法（早期 ADM 用 ImageNet 分类器做梯度引导）替换成不依赖外部分类器的版本。Ho & Salimans 2022 的核心做法：训练时以一定概率（典型 10%）把条件 $c$ 替换成空条件 $\emptyset$，这样同一个网络同时学会了有条件和无条件预测。推理时把两次预测线性外推：
 
 $$
 \hat{\epsilon} = \epsilon_\theta(x_t, t, \emptyset) + w \cdot (\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \emptyset))
 $$
 
-$w > 1$ 让生成更靠近条件，但太大会过拟合。增强任务里 $w$ 通常 1.5-3.0。
+$w > 1$ 让生成更靠近条件，但太大会让结果 oversaturated，颜色饱和、纹理过度。增强任务里 $w$ 通常 1.5-3.0；纯文生图常用 5-9。
+
+每步推理多一次 UNet 前向（无条件那次），整体成本接近翻倍。下面这张图把 CFG 的两路前向画出来：
+
+```mermaid
+graph LR
+    XT[x_t] --> CondPath[UNet x_t,t,c]
+    XT --> UncondPath[UNet x_t,t,∅]
+    Cond[条件 c<br/>LR latent / text] --> CondPath
+    Null[空条件 ∅] --> UncondPath
+    CondPath --> EC[ε_cond]
+    UncondPath --> EU[ε_uncond]
+    EC --> Mix[ε̂ = ε_uncond + w · ε_cond - ε_uncond]
+    EU --> Mix
+    Mix --> Next[采样器一步]
+
+    style XT fill:#e3f2fd
+    style Mix fill:#fff3e0
+```
 
 ```python
 def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
@@ -546,6 +693,8 @@ def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
     # 加权
     return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 ```
+
+工程实践里把这两次前向 batch 起来一起跑——拼成 $(2B, C, H, W)$ 走一次，省一次 kernel launch 开销。Diffusers 的默认实现就是这样。
 
 ## 8.13 一个增强任务的扩散训练流程
 
@@ -652,6 +801,35 @@ def diffusion_enhance(unet, vae, scheduler, lr_img,
 注意一个关键点：**LR 必须先被上采样到目标 HR 尺寸再过 VAE**——这样得到的 latent 与 hr_latent 同样大小，可以直接 concat。如果直接 `vae.encode(lr_img)`，得到的潜空间是 LR 大小（HR/8 比 LR/8 大 4×），shape 不匹配。
 
 输出分辨率由 `target_size` 决定，VAE 解码后的图就是这个尺寸。
+
+## 8.14.1 训练 vs 推理：心智模型
+
+把训练循环和推理循环并排放，会发现扩散模型与第 6-7 章的判别式模型有一个本质区别：
+
+```mermaid
+graph TD
+    subgraph Train[训练: 单步监督]
+        T1[采样 x_0] --> T2[采样 t]
+        T2 --> T3[一步加噪 → x_t, ε]
+        T3 --> T4[UNet x_t,t,c → ε̂]
+        T4 --> T5[MSE ε̂, ε]
+        T5 --> T6[反传, 更新权重]
+    end
+
+    subgraph Infer[推理: 多步采样]
+        I0[采样 x_T ~ N 0,I] --> I1[t = T]
+        I1 --> I2[UNet x_t,t,c → ε̂]
+        I2 --> I3[采样器一步 → x_{t-1}]
+        I3 --> I4{t > 1?}
+        I4 -->|是, t = t-1| I2
+        I4 -->|否| I5[VAE decode → x̂_0]
+    end
+
+    style T5 fill:#e3f2fd
+    style I5 fill:#e8f5e9
+```
+
+训练是单步监督——一个 batch 一个 forward/backward，与训普通 CNN 几乎没差别。推理却是 $T'$ 步循环（$T' \in [4, 50]$，看采样器），每一步都要跑一次 UNet。这个不对称性导致很多问题只在推理阶段暴露：训练 loss 下降得很好不等于采样质量好，必须在每个 checkpoint 上跑实际采样评估（FID、LPIPS、人评）。这是扩散模型工程的一条铁律。
 
 ## 8.15 小结
 

@@ -4,6 +4,46 @@
 >
 > 这一章讲：人脸、文档、医疗影像各自需要哪些归纳偏置，对应模型怎么设计。
 
+## 10.0 阅读须知
+
+到第 9 章为止，本书的视角始终是"一类通用模型，吃任何自然图像都尽量做好"。从这一章开始视角倒过来：**先承认通用模型在某些数据分布上必然失败**，再讨论怎么针对这些分布单独设计模型。前面九章里反复出现的"先验"在这里被进一步细化，不再是"自然图像的一般先验"，而是"人脸的先验"、"文字的先验"、"医疗成像的物理先验"、"多光谱物理意义"等。每一类都对应一组独立的工程惯例、损失设计、数据组织方式。
+
+读这一章前假设你已经熟悉：
+
+- 第 1 章退化模型与 blind / non-blind 区分
+- 第 3 章的感知损失、对抗损失、身份保留损失
+- 第 6-7 章的 CNN / Transformer 增强骨架
+- 第 8-9 章的扩散基础与 ControlNet 控制思路
+
+本章会反复出现的缩写：
+
+- **GAN inversion**（Generative Adversarial Network Inversion，生成对抗网络反演）：把一张真实图像映射到 GAN 的潜空间向量，让 GAN 能"重画"它
+- **StyleGAN**（Style-based GAN，2019 起的一系列基于风格调制的高质量生成器）：人脸领域最常用的预训练生成先验
+- **W / W+ space**：StyleGAN 把潜噪声 $z$ 映射成中间向量 $w$，每一层注入的 $w$ 可以独立调（合起来叫 W+ 空间），增强方法常在 W+ 上做 inversion
+- **PULSE**（Photo Upsampling via Latent Space Exploration，CVPR 2020）：早期把超分辨表述成 StyleGAN 潜空间搜索的代表
+- **GFPGAN**（Generative Facial Prior GAN，Wang et al. 2021）：用冻结的 StyleGAN2 generator 当先验、外加一个 encoder + CS-SFT 调制
+- **GPEN**（GAN Prior Embedded Network，Yang et al. 2021）：把 StyleGAN 直接嵌进 U-Net decoder，与 GFPGAN 同时代的另一条路线
+- **CodeFormer**（Zhou et al. 2022）：用 VQ-VAE 学到的离散 codebook 作人脸先验，Transformer 预测 code 序列
+- **VQ-VAE**（Vector-Quantized Variational Autoencoder，向量量化变分自编码器）：把连续 latent 离散化为有限 codebook 的自编码器
+- **RestoreFormer / RestoreFormer++**（Wang et al. 2022/2023）：把 cross-attention 直接接到 codebook 上，去掉 CodeFormer 多步预测
+- **ArcFace / FaceNet**：人脸识别网络，输出身份 embedding，常用于身份保留损失
+- **DnCNN**（Denoising CNN，Zhang et al. 2017）：去噪深度学习的开山之作，残差学习 + 高斯噪声
+- **N2N / Noise2Noise**（Lehtinen et al. 2018）：用两次独立采样的噪声图互相做监督，不需要干净图
+- **N2V / Noise2Void**（Krull et al. 2019）：进一步去掉对噪声配对的依赖，靠盲点网络在单张噪声图上自监督
+- **FFDNet**（Fast and Flexible Denoising Network，Zhang et al. 2018）：把噪声水平作为输入条件的可调去噪网络
+- **CBDNet / VDN / NoiseFlow**：真实噪声建模与去噪的代表
+- **OCR**（Optical Character Recognition，光学字符识别）：把文字图像变成字符串的任务
+- **CRNN**（Convolutional Recurrent Neural Network）：早期 OCR 主流架构，被 SVTR、PARSeq 等迭代
+- **PSF**（Point Spread Function，点扩散函数）：成像系统对理想点光源的响应，决定显微/望远成像的物理分辨率上限
+- **k-space**：MRI 数据的傅里叶域表示，扫描其实是在 k-space 上采样
+- **Radon 变换**：CT 投影几何对应的数学变换
+- **HSI-SR**（Hyperspectral Image Super-Resolution，高光谱超分）：多通道光谱图像的专门 SR 模型
+- **NDVI**（Normalized Difference Vegetation Index，归一化植被指数）：遥感里典型的波段比值指标
+- **RefSR / RefIR**（Reference-based Super-Resolution / Image Restoration，参考引导超分/恢复）：除 LR 外还有一张高质量参考图作输入
+- **MASA-SR / C2-Matching / DATSR**：RefSR 的代表方法
+
+这一章按"任务"切，不按"方法"切。同一种方法（比如离散 codebook、unrolled network、cross-attention）会在不同任务下多次出现，请把它当作"为任务挑工具"的视角去读，而不是"为工具找任务"。
+
 ## 10.1 为什么需要任务特化
 
 通用 SR 在自然图像上表现优秀，但放到下面这些场景会翻车：
@@ -16,15 +56,46 @@
 
 通用模型失败的共同原因：**它学到的先验是"自然图像的一般分布"，不是"这一类图像的特殊分布"**。
 
+更技术地说：通用先验在某一类图像上的概率密度是稀薄的。Real-ESRGAN 的训练集 DF2K / OST 里人脸只占很小一块，文字几乎没有，医疗影像和卫星图根本不在分布里。当输入落到这些子分布时，模型只能用最接近的自然图像先验去"硬猜"，结果就是熟悉的几种失败模式：把脸修平、把字模糊、给 X 光加纹理、把多光谱通道当 RGB 调色。
+
 任务特化的核心 = 给模型注入这个特殊分布的知识：
 
-- 人脸：身份不变（identity preservation）+ 五官几何约束
-- 文档：字符级正确性 + 直线/曲线结构
-- 医疗：物理成像模型 + 不允许"创造"
-- 遥感：多通道光谱物理 + 大尺度地物结构
-- 显微：成像理论（PSF、衍射）+ 物理重建
+- 人脸：身份不变（identity preservation）+ 五官几何约束 + StyleGAN / VQ-codebook 学到的人脸分布
+- 文档：字符级正确性 + 直线/曲线结构 + OCR 网络作监督
+- 医疗：物理成像模型（Radon / k-space / 散射） + 不允许"创造" + 数据保真硬约束
+- 遥感：多通道光谱物理 + 大尺度地物结构 + 物理波段比值约束
+- 显微：成像理论（PSF、衍射）+ 物理重建 + 荧光的泊松噪声主导
 
-这一章按任务展开，重点是**人脸**（最成熟、工程实践最丰富），其他类型概述。
+这一章按任务展开，重点是**人脸**（最成熟、工程实践最丰富），其他类型概述。完整的任务-先验-损失-评估四元组的关系可以画成下图：
+
+```mermaid
+graph TD
+    Task[任务领域] --> Face[人脸]
+    Task --> Doc[文档/文字]
+    Task --> Med[医疗影像]
+    Task --> Rs[遥感/多光谱]
+    Task --> Micro[显微]
+    Face --> FPrior[StyleGAN W+<br/>VQ codebook]
+    Face --> FLoss[L1 + perceptual + ArcFace id<br/>+ component GAN]
+    Face --> FEval[身份 cos sim + 主观]
+    Doc --> DPrior[字符离散先验<br/>OCR 网络]
+    Doc --> DLoss[L1 + OCR-guided weighted]
+    Doc --> DEval[OCR 准确率]
+    Med --> MPrior[unrolled + 物理算子 A]
+    Med --> MLoss[数据保真硬约束<br/>+ 学习去噪]
+    Med --> MEval[医生盲评 + 病灶检出率]
+    Rs --> RPrior[多通道架构<br/>波段物理]
+    Rs --> RLoss[L1 + NDVI 一致性]
+    Rs --> REval[下游任务准确率]
+    Micro --> MicPrior[PSF + 衍射极限]
+    Micro --> MicLoss[泊松似然 + 物理重建]
+    Micro --> MicEval[分辨率提升 + 物理合理性]
+
+    style Task fill:#e3f2fd
+    style Face fill:#fff3e0
+```
+
+整本书的视角到这里发生一次微妙的转变：前 9 章在问"模型架构 / 损失 / 采样器要怎么搭"，这一章在问"先把任务的归纳偏置说清楚，再去挑架构"。这个顺序很重要。架构先行常常导致工程师在某一个新任务上反复换 backbone，但效果上限其实是被"没注入对应先验"这件事卡住的。
 
 ## 10.2 人脸增强：先验最强、模型最多的子领域
 
@@ -40,6 +111,14 @@
 
 StyleGAN（2019）和 StyleGAN2/3 已经把"人脸的分布"学得非常好。任何高质量人脸都可以**反演**（GAN inversion）成 StyleGAN 潜空间的一个 W 向量。
 
+GAN inversion 这个动作可以理解成"用一个固定的生成器 $G$，找一个潜变量 $w$ 让 $G(w)$ 尽量等于目标图 $x$"。形式化：
+
+$$
+w^* = \arg\min_w \| G(w) - x \|_{\text{perceptual}}^2 + \lambda \cdot \mathcal{R}(w)
+$$
+
+其中 $\mathcal{R}(w)$ 是潜空间正则项，鼓励 $w$ 落在"自然 $w$"分布里（比如 StyleGAN 的 W 平均向量附近）。增强场景下的不同之处只是把目标 $x$ 换成退化图 $y$ 在某个度量下的近似，比如先把 $y$ 上采样到 HR 大小再算 perceptual loss，于是搜出的 $w^*$ 是"产生了和 $y$ 在低频上一致的高分辨率人脸"。
+
 关键洞察：
 
 > 人脸潜空间是低维的（StyleGAN W+ 维度与生成分辨率相关：1024px FFHQ 的 StyleGAN2 是 18×512 = 9216 维；512px 是 14×512）。
@@ -47,7 +126,7 @@ StyleGAN（2019）和 StyleGAN2/3 已经把"人脸的分布"学得非常好。�
 >
 > 增强 = 从 LR 推出最合理的 W 向量，再用 StyleGAN 解码出 HR。
 
-这是 **PULSE / GFPGAN / GPEN** 等模型的核心思路。
+这是 **PULSE / GFPGAN / GPEN** 等模型的核心思路。它们的差别只在"怎么从 LR 推出 $w$"：PULSE 在推理时做迭代搜索（慢、不需要训），GFPGAN 训一个 encoder + 调制层一次前向得到（快、需要训），GPEN 把 StyleGAN 嵌进 U-Net decoder（结构更耦合）。三条路本质上都在 StyleGAN 潜空间里找点。
 
 ### 偏置 2：身份必须保留
 
@@ -142,21 +221,38 @@ Zhou et al. 在 2022 年的 CodeFormer 用了不同思路——不依赖 StyleGA
 
 把人脸的"局部特征"离散化为 codebook 里的若干 code（比如 1024 个 code），高质量人脸 = 这些 code 的某种组合。
 
-流程：
+VQ-VAE 的训练分两阶段。第一阶段在高质量人脸数据集（典型 FFHQ）上训一个自编码器，但中间加一个"量化"步骤：encoder 输出的连续特征图 $\hat{z} \in \mathbb{R}^{h \times w \times d}$ 被替换成 codebook $\{e_k\}_{k=1}^K$ 里距离最近的离散向量，再喂给 decoder 重建图像。训练完之后 codebook 里的每个向量都对应"人脸的某种局部 patch 模式"。第二阶段冻结 codebook 和 decoder，训一个 Transformer 给定 LR 编码出的 token 序列预测**正确的 code 索引序列**。整条流水线如下：
 
+```mermaid
+graph LR
+    LR[LR 人脸<br/>B,3,512,512] --> Enc[Encoder<br/>多层卷积下采样]
+    Enc --> Feat[连续特征<br/>B,h,w,d]
+    Feat --> Quant[最近邻量化<br/>Q z = arg min_k ||z - e_k||]
+    Quant --> Idx[离散索引序列<br/>B, h*w 个整数]
+    CB[VQ Codebook<br/>K=1024 个向量 e_k<br/>FFHQ 上学到]
+    CB -.->|查表| Quant
+    Idx --> TX[Transformer<br/>修正预测<br/>code-level]
+    TX --> Idx2[修正后索引]
+    Idx2 --> Lookup[codebook lookup]
+    CB -.->|查表| Lookup
+    Lookup --> Feat2[修正后特征]
+    Feat2 --> Dec[Decoder<br/>对称上采样]
+    Dec --> HR[HR 人脸<br/>B,3,512,512]
+    Feat -. fidelity 旁路 w .-> Fuse[加权融合]
+    Feat2 -. quality 主路 1-w .-> Fuse
+    Fuse --> Dec
+
+    style LR fill:#ffebee
+    style CB fill:#fff3e0
+    style HR fill:#e8f5e9
 ```
-LR Face
-  ↓ Encoder
-  ↓ Transformer (预测 code 序列)
-  ↓ 从 codebook 查表得到对应特征
-  ↓ Decoder
-HR Face
-```
+
+图里的"fidelity 旁路"对应 CodeFormer 推理时的 $w$ 参数：$w$ 越大越走原始 encoder 特征（保留 LR 像素细节），$w$ 越小越走 Transformer 修正后的 codebook 特征（更高质量但更可能改样）。
 
 为什么离散化有用？
 
-- **离散化 = 强先验**：模型只能生成 codebook 里"见过"的特征，不会编造无意义的局部
-- **Transformer 自然适合预测离散序列**：和 LLM next-token prediction 是同一范式
+- **离散化 = 强先验**：模型只能生成 codebook 里"见过"的特征，不会编造无意义的局部。这是离散结构相对连续 W+ 的本质优势：W+ 上任何点 $w$ 都能产生输出，但 codebook 上只有 1024 种合法组合
+- **Transformer 自然适合预测离散序列**：和 LLM next-token prediction 是同一范式，可以用大量成熟的序列建模技巧
 - **可调"控制强度"**：CodeFormer 提供 $w \in [0, 1]$ 让用户在"严格遵守 LR" vs "充分利用先验"之间调节
 
 ### CodeFormer 的 fidelity 调节
@@ -321,6 +417,98 @@ HR 文档
 ```
 
 工程实践：文档增强商业产品（ABBYY、Adobe Scan）用上面这套。开源世界的 DocSR 系列、PaddleOCR 的 doc enhance 都是类似思路。
+
+## 10.7b 去噪：监督粒度决定方法
+
+去噪在第 1 章 1.8 节已经从"噪声物理模型"的角度铺垫过，这里从"任务特化"的角度补一次。它和 SR、去模糊一样都属于 $y = D(x) + n$ 这个大框架，但有一个独特的工程问题：**真实干净图 $x$ 几乎拿不到**。SR 可以用 HR 图当 ground truth，去模糊可以用清晰图当 ground truth，但去噪的 ground truth 本身是"无噪图"，这在物理上不存在（任何拍出来的图都带噪），只能通过长时间多帧平均、低 ISO 配对、或者合成噪声去近似。
+
+监督信号能拿到什么级别，直接决定能用什么模型。下面这张图把去噪派系按"训练时见到的监督"分类：
+
+```mermaid
+graph TD
+    subgraph FullSup[完全监督: 有 x_clean]
+        A1[配对数据 x_clean, y_noisy] --> A2[DnCNN<br/>残差学习 y - x]
+        A1 --> A3[FFDNet<br/>把噪声 σ 当条件输入]
+        A1 --> A4[CBDNet<br/>同时估计噪声图 σ x]
+    end
+
+    subgraph NoisePair[只有噪声配对: y1, y2 同场景两次独立采样]
+        B1[配对 y1, y2 共同 x_clean, 独立 n1, n2] --> B2[Noise2Noise<br/>用 y2 当监督训练 f y1]
+        B2 --> B3[期望意义下与 N2C 等价<br/>E n2 给出 x_clean]
+    end
+
+    subgraph Single[单张噪声图: 只有 y]
+        C1[单张 y, 无任何配对] --> C2[Noise2Void<br/>盲点网络<br/>用周围像素预测中心]
+        C2 --> C3[Self2Self<br/>Bernoulli mask 多次平均]
+    end
+
+    subgraph Real[真实数据集]
+        D1[SIDD<br/>智能手机噪声] --> A1
+        D2[DND<br/>暗光真实噪声] --> A1
+        D3[burst 摄影连拍] --> B1
+    end
+
+    style FullSup fill:#e8f5e9
+    style NoisePair fill:#fff3e0
+    style Single fill:#ffebee
+```
+
+三层方法的核心约束依次放松：
+
+- **DnCNN (Zhang et al. 2017)** 假设有干净的 $x$，训练 $f_\theta(y) \approx y - x$（残差学习而不是直接 $\hat{x}$，因为 $y - x$ 接近零均值的噪声，更好优化）。损失是 MSE。这条路在合成高斯噪声上几乎是上限，但在真实手机噪声上表现很弱，因为训练时见的噪声分布太窄
+- **FFDNet (Zhang et al. 2018)** 在 DnCNN 基础上加一个改动：把噪声水平 $\sigma$ 作为额外的 noise level map 通道喂给网络。同一个模型可以处理 $\sigma \in [0, 75]$ 的不同噪声强度，推理时用户给一个 $\sigma$ 就能调强度。这是把"非盲"特征（已知 $\sigma$）显式地暴露给模型的典型例子
+- **Noise2Noise (Lehtinen et al. 2018)** 提出一个反直觉的观察：如果用 $y_2$ 当 $y_1$ 的监督（两张噪声图同场景独立采样），最小化 $\mathbb{E}[\|f(y_1) - y_2\|^2]$ 的最优解仍然是 $\mathbb{E}[y \mid x_{\text{clean}}] = x_{\text{clean}}$。原因是 $y_2 = x_{\text{clean}} + n_2$，$n_2$ 是零均值噪声，平方损失的最优预测就是条件均值。这意味着**不需要干净图**也能训去噪
+- **Noise2Void (Krull et al. 2019)** 进一步去掉对配对的依赖。它训一个"盲点网络"：预测中心像素时输入里把中心像素挖掉，只用周围像素。如果噪声是空间独立的，那么中心像素的最佳预测就是周围像素的某种插值，而插值期望等于 $x_{\text{clean}}$。损失是 MSE 在挖掉位置上算。这条路在单张噪声图上能完成自监督训练
+- **CBDNet (Guo et al. 2019)**、**VDN (Yue et al. 2019)** 一类是真实噪声建模派：同时学一个噪声估计子网络和去噪子网络，让模型在每个像素上自适应当地的 $\sigma$
+
+工程结论：
+
+- **有 SIDD / DND 这种真实配对数据** → 直接 DnCNN / FFDNet / CBDNet
+- **只能拿到 burst 连拍** → Noise2Noise
+- **只有单张噪声图（旧照片）** → Noise2Void / Self2Self
+- **极端低光（拍夜空、显微）** → 必须建模 Poisson 噪声，纯高斯 MSE 训出来都不行
+
+DnCNN 风格的最小代码骨架：
+
+```python
+class DnCNN(nn.Module):
+    """DnCNN: 残差学习 + 17 层卷积。
+    输入: 噪声图 y
+    输出: 预测的噪声 ε̂, 通过 x̂ = y - ε̂ 得到去噪结果
+    """
+
+    def __init__(self, in_ch: int = 3, depth: int = 17, width: int = 64):
+        super().__init__()
+        layers = [nn.Conv2d(in_ch, width, 3, padding=1), nn.ReLU(inplace=True)]
+        for _ in range(depth - 2):
+            layers += [
+                nn.Conv2d(width, width, 3, padding=1, bias=False),
+                nn.BatchNorm2d(width),
+                nn.ReLU(inplace=True),
+            ]
+        layers += [nn.Conv2d(width, in_ch, 3, padding=1)]
+        self.body = nn.Sequential(*layers)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        noise = self.body(y)
+        return y - noise        # 残差: y - ε̂ = x̂
+```
+
+```python
+def train_n2n(model, paired_loader, optim, epochs):
+    """Noise2Noise 训练: 不需要干净图。
+    paired_loader 每次输出 (y1, y2) 同场景独立采样的噪声图。
+    """
+    for _ in range(epochs):
+        for y1, y2 in paired_loader:
+            pred = model(y1)
+            loss = F.mse_loss(pred, y2)     # 关键: 监督是另一张噪声图
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+```
+
+这条监督层级把"任务特化"的另一个维度展开得很清楚：不是所有任务都能拿到 ground truth，怎么在监督稀缺的情况下还能训出 useful 模型，是去噪派的核心议题。其他任务（人脸、文档、医疗）里类似的问题都存在，但去噪是这件事被研究得最深、方法最系统的子领域。
 
 ## 10.8 医疗影像增强
 

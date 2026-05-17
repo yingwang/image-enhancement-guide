@@ -2,9 +2,151 @@
 
 > 训练完一个好模型只是开始。
 >
-> 把它推到生产环境——服务器、桌面 GPU、移动端、嵌入式——是另一个完整的工程领域。
+> 把它推到生产环境 - 服务器、桌面 GPU、移动端、嵌入式 - 是另一个完整的工程领域。
 >
 > 这一章讲量化、TensorRT、CoreML、torch.compile、tile 推理、流式处理。
+
+## 15.0 本章铺垫与术语注
+
+前面 14 章把训练侧讲完了：从退化模型出发，沿着表征空间、损失函数、评估指标、数据合成、判别式与生成式架构、训练调度、视频时序、可控生成一路走下来，所有内容都假设训练机器上有充足显存、可以慢慢迭代、可以打断重跑。这一章开始切换视角。**生产环境不长这样**。线上服务的硬约束是延迟、吞吐量、显存上限、功耗、温升、码率适配、与上下游编码器的对齐；学术评测里 PSNR 高 0.3 dB 在线上几乎看不见区别，但 p99 延迟高出预算 20 ms，整个产品立刻不可用。
+
+更难的一点是：训练侧的好模型未必能进生产。一个 SwinIR-Large 在 A100 训练时 batch=8 跑得很愉快，导到端侧之后发现 PixelShuffle 算子在 iOS 16 上 fallback 到 CPU、attention 算子在高通 NPU 上不支持、INT8 量化后出现棋盘格伪影、连续推理 30 分钟后手机过热降频、视频会议场景里没有未来帧只能跑因果模式、增强后的图被 H.264 再压一次细节全被吃掉。这些问题在论文里几乎不存在，但每一个都能让"产品上线"卡住。
+
+所以本章不是一份"调用 TensorRT 的教程"，它是一份**把训练好的低层视觉模型从 PyTorch 推到真实终端**的工程清单。结构上从通用优化（导出、编译、半精度、量化）展开，然后按部署目标拆：NVIDIA GPU 上的 TensorRT、Apple 设备上的 CoreML 与 ANE、Android 与嵌入式上的 TFLite 与厂商 SDK；接着讲三类跨平台的关键技术：模型蒸馏（含扩散派的 1 步 SR）、tile 推理处理大图、流式与实时视频；最后回到 pipeline 编排、监控与 cost 估算。
+
+读这一章的时候保持一个简单的对照：**学术指标关心"模型输出与真值的距离"，生产指标关心"产品能不能交付"**。两者并不冲突，但优化路径完全不同。本章每一节都在帮你把后一种关心翻译成可以执行的代码与流程。
+
+### 缩写与首次出现的术语
+
+为了避免术语堆砌，第一次出现的缩写在这里集中给出全称与一句话定义。后文再次使用时不再展开。
+
+- **TensorRT**：NVIDIA 的推理引擎，把 ONNX / PyTorch 模型编译为针对特定 GPU 优化的二进制 plan 文件。
+- **ONNX**（Open Neural Network Exchange，开放神经网络交换格式）：跨框架的模型中间表示，绝大多数推理引擎都从 ONNX 读入。
+- **CUDA**（Compute Unified Device Architecture）：NVIDIA GPU 的通用并行计算平台与编程模型。
+- **cuDNN**（CUDA Deep Neural Network library）：NVIDIA 提供的 GPU 深度学习算子库，TensorRT 与 PyTorch 都依赖它。
+- **FP32 / FP16 / BF16**：32 位 / 16 位浮点。BF16（Brain Float 16）由 Google 提出，指数位与 FP32 相同、尾数位更少，数值范围大但精度低，在 A100 与之后的 NVIDIA GPU 上原生支持。
+- **INT8 / INT4**：8 位 / 4 位整数。量化用的低比特表示，能换取速度与显存优势，代价是精度损失。
+- **PTQ**（Post-Training Quantization，训练后量化）：训练完成后基于校准数据估计 scale 与 zero point 直接量化。
+- **QAT**（Quantization-Aware Training，量化感知训练）：在训练 loop 里插入"伪量化"算子，让模型适应量化误差。
+- **TorchScript**：PyTorch 的脚本化中间表示，可以脱离 Python 解释器在 C++ 运行时执行。
+- **torch.compile**：PyTorch 2.0 引入的 JIT 编译入口，背后调度 TorchDynamo / TorchInductor 把模型图编译成融合后的 kernel。
+- **CoreML**：Apple 的设备端推理框架，能调度到 CPU / GPU / ANE 三种计算单元。
+- **ANE**（Apple Neural Engine）：Apple 芯片里专门跑神经网络的低功耗加速器，A 系列与 M 系列芯片都集成。
+- **NPU**（Neural Processing Unit，神经网络处理器）：移动端与嵌入式上的专用神经网络加速器统称，例如高通 HTP、华为 NPU、联发科 APU、Apple ANE 都属于这一类。
+- **HTP**（Hexagon Tensor Processor）：高通 Snapdragon 芯片里的 NPU 实现，跑 INT8 极快。
+- **SNPE**（Snapdragon Neural Processing Engine）：高通提供的 NPU SDK，把 ONNX 转成 DLC 格式后下放到 HTP / GPU / CPU。
+- **DLC**（Deep Learning Container）：SNPE 的模型容器格式。
+- **NeuroPilot**：联发科为天玑芯片 APU 提供的 NPU SDK。
+- **TFLite**（TensorFlow Lite）：Google 的移动端 / 嵌入式推理框架，Android 端事实标准。
+- **NNAPI**（Neural Networks API）：Android 8+ 提供的系统层 NPU 抽象，TFLite 可以走 NNAPI 路由到设备 NPU。
+- **OpenVINO**：Intel 为自家 CPU / 集成 GPU / VPU 优化的推理工具链。
+- **DirectML**：Windows 上的硬件抽象推理 API，统一覆盖 NVIDIA / AMD / Intel GPU。
+- **VAE**（Variational Auto-Encoder，变分自编码器）：第 7 章详谈。这里反复出现因为扩散派的潜空间编解码都过 VAE，且 VAE 在低比特下极易溢出。
+- **KV cache**（Key-Value cache）：Transformer 自回归推理时把已计算过的 attention key / value 缓存下来避免重复计算的技术。低层视觉里出现在视频 Transformer 与扩散 Transformer 的因果推理路径上。
+- **Flash Attention**：把 attention 的 softmax(QK^T)V 拆成分块计算并融合到单个 CUDA kernel 的实现，省显存且更快。
+- **Tiling**：把大图切成小块分别推理再拼回。本章 15.9 节专门讲。
+- **SwinIR-Tile**：SwinIR 官方提供的 tile 推理实现，是社区参考实现之一。
+- **Boundary blending**（边界融合）：tile 拼回时在重叠区做渐变加权，避免接缝可见。
+- **DDIM**（Denoising Diffusion Implicit Models）：扩散模型的确定性采样器，可以用远少于训练步数的步数采样。
+- **DDIM steps**：DDIM 推理时的采样步数，常见 20-50 步。
+- **DPM-Solver / DPM-Solver++**：扩散 ODE 的高阶数值求解器，10-20 步就能达到 DDIM 50 步的质量。
+- **UniPC**（Unified Predictor-Corrector）：扩散采样器之一，预测-修正结构，8-15 步可用。
+- **LCM**（Latent Consistency Model，潜空间一致性模型）：把扩散模型蒸馏成 4-8 步可采样的学生模型。
+- **LoRA**（Low-Rank Adaptation，低秩适配器）：在预训练大模型权重上加一个低秩增量，训练参数量极小。
+- **OSEDiff / TSD-SR / AdcSR / SinSR**：四个走"1 步扩散 SR"路线的工作，详见第 18 章。
+- **GOP**（Group of Pictures，图像组）：视频编码里以一个 I 帧（关键帧）开头、后续 P/B 帧依赖前后帧的一组帧。
+- **I / P / B 帧**：视频帧类型。I 帧独立解码，P 帧依赖前面，B 帧依赖前后双向。
+- **NAL**（Network Abstraction Layer，网络抽象层）单元：H.264 / H.265 把编码数据切成的传输单元。
+- **A/V 同步**（Audio/Video sync）：音视频时序对齐。人耳对 lipsync 误差敏感阈值约 ±40 ms。
+- **p50 / p90 / p99 延迟**：延迟分布的中位数 / 90 分位 / 99 分位。
+- **OOM**（Out Of Memory）：显存耗尽。
+- **QPS**（Queries Per Second，每秒查询数）：吞吐量度量。
+- **GAN**（Generative Adversarial Network，生成对抗网络）：本章涉及到 ESRGAN / Real-ESRGAN 时反复出现。
+- **RRDB**（Residual-in-Residual Dense Block）：ESRGAN / Real-ESRGAN 的主干模块。
+
+后续小节首次出现新缩写仍然给出全称，但常用术语就不重复了。
+
+### 本章主线
+
+整章可以视作一张从训练产物到生产终端的"扩散图"：PyTorch 权重在中心，外圈是各种部署目标，每一条边都标了一组优化技术。下面这张全景图先给一个鸟瞰，后面每一节都在填某一条边的细节。
+
+```mermaid
+graph TB
+    subgraph Source[训练侧]
+        PT[PyTorch checkpoint<br/>.pt / .safetensors]
+    end
+
+    subgraph Common[通用优化层]
+        ONNX[ONNX<br/>跨平台 IR]
+        TS[TorchScript<br/>PyTorch 原生]
+        COMP[torch.compile<br/>JIT 编译]
+        FUSE[算子融合<br/>Conv+BN / Conv+ReLU]
+        HALF[FP16 / BF16<br/>半精度]
+    end
+
+    subgraph Compress[压缩与蒸馏]
+        PTQ[PTQ<br/>训练后量化]
+        QAT[QAT<br/>量化感知训练]
+        DIST[蒸馏<br/>学生-教师]
+        LCM[LCM / 1-step SR<br/>扩散蒸馏]
+        PRUNE[模型剪枝<br/>稀疏化]
+    end
+
+    subgraph GPU[NVIDIA GPU]
+        TRT[TensorRT<br/>plan 二进制]
+    end
+
+    subgraph Apple[Apple 设备]
+        CML[CoreML<br/>mlpackage]
+        ANE[ANE 算子白名单<br/>Conv / PixelShuffle...]
+    end
+
+    subgraph Android[Android / 嵌入式]
+        TFL[TFLite]
+        SNPE[SNPE / DLC<br/>高通 HTP]
+        NEU[NeuroPilot<br/>联发科 APU]
+    end
+
+    subgraph Runtime[运行时技术]
+        TILE[Tile 推理<br/>boundary blend]
+        STREAM[流式 / 因果<br/>RNN 状态管理]
+        PIPE[多模型 pipeline<br/>latent 直传]
+        THERM[热感知降级]
+    end
+
+    PT --> ONNX
+    PT --> TS
+    PT --> COMP
+    COMP --> FUSE
+    ONNX --> HALF
+    ONNX --> PTQ
+    PT --> QAT
+    PT --> DIST
+    PT --> LCM
+    PT --> PRUNE
+    ONNX --> TRT
+    PT --> CML
+    CML --> ANE
+    ONNX --> TFL
+    ONNX --> SNPE
+    ONNX --> NEU
+    TRT --> TILE
+    CML --> TILE
+    TFL --> TILE
+    TRT --> STREAM
+    CML --> STREAM
+    TILE --> PIPE
+    STREAM --> PIPE
+    PIPE --> THERM
+
+    style PT fill:#e8f5e9
+    style TRT fill:#fff3e0
+    style CML fill:#e3f2fd
+    style TFL fill:#fce4ec
+    style LCM fill:#f3e5f5
+```
+
+这张图回答的问题是"我手里这个 PyTorch checkpoint，要进哪个生产场景，应该走哪条边？"。例如：服务器侧 4K 直播增强 → ONNX → TensorRT FP16 + Tile + 多模型 pipeline；iPhone 端实时滤镜 → CoreML + ANE 算子白名单 + per-channel INT8 + 因果流式；扩散派 SR 上线 → LCM 或 1-step SR 蒸馏 + TensorRT FP16 + Tile。后面每一节都在解释这些路径上的具体决策。
 
 ## 15.1 推理优化的部署目标
 
@@ -123,10 +265,27 @@ output = model(input.half())
 
 ### 15.2.5 量化（INT8 / INT4）
 
-把权重和激活从 FP16 降到 INT8 甚至 INT4：
+量化的核心是把高精度浮点张量映射到低比特整数，再在推理时把整数解回近似的浮点值。最常用的对称线性量化公式是：
 
-- **PTQ（Post-Training Quantization）**：训练后量化，简单但精度损失
-- **QAT（Quantization-Aware Training）**：训练时考虑量化，精度损失小但训练复杂
+$$
+q = \text{round}\left(\frac{x}{s}\right), \qquad \hat{x} = q \cdot s
+$$
+
+其中 $s$ 是 scale，$q$ 是量化后的整数（INT8 时 $q \in [-128, 127]$）。非对称量化再加一个 zero point $z$：
+
+$$
+q = \text{round}\left(\frac{x}{s}\right) + z, \qquad \hat{x} = (q - z) \cdot s
+$$
+
+scale $s$ 怎么选决定了量化误差。最朴素的做法是取张量绝对值最大值再除以 127，但这种 max-scale 对离群值极度敏感 - 一个极端激活就能把整体精度拉到只有 7 位有效。生产里常用的两种改进：
+
+1. **percentile**：取 99.99% 分位的绝对值做 max，丢掉极端离群值。
+2. **MSE 最小**：在校准集上搜索使 $\|\hat{x} - x\|_2^2$ 最小的 scale。
+
+把权重和激活从 FP16 降到 INT8 甚至 INT4 有两种路线：
+
+- **PTQ**（Post-Training Quantization，训练后量化）：训练完后用校准数据集（几百张代表性图）估计 scale 与 zero point，直接量化。流程简单，精度损失大小取决于模型对量化误差的鲁棒性。
+- **QAT**（Quantization-Aware Training，量化感知训练）：训练时在前向里插入"伪量化"算子（quantize-dequantize 对），让梯度看到量化引入的误差，模型在训练阶段就学会容忍。精度损失小但需要重新训练，工程成本高。
 
 INT8 量化的潜在收益：
 
@@ -179,6 +338,14 @@ GPU 上 INT8 量化更复杂，通常通过 TensorRT 或 ONNX Runtime 做。
 - 算子融合 + 内核选择 + 量化
 - 输出**针对特定 GPU 优化**的二进制（`.plan` 文件）
 - 提供 C++/Python API 推理
+
+为什么 TensorRT 比直接 PyTorch / ONNX Runtime 快？三件事：
+
+1. **算子融合更激进**。把 Conv + BN + ReLU + Add 这种连续算子融合成一个 CUDA kernel，省掉中间张量的显存来回和 kernel 启动开销。PyTorch eager 模式做不到，torch.compile 做一部分但保守。
+2. **kernel 自动调优**。同一个 conv 在 NVIDIA 提供的几十个实现里（不同 tile size、不同 layout、不同 tensor core 路径），TensorRT 在你给的输入 shape 上跑 benchmark 选最快的。这个调优结果绑在 plan 文件里，所以 plan 不能跨 GPU 复用 - 在 A100 上 build 的 plan 不能扔到 4090 上跑。
+3. **低精度路径与 tensor core**。FP16 / BF16 / INT8 / FP8 路径下 TensorRT 直接用 Ampere / Hopper 的 tensor core，理论吞吐相比 CUDA core 高 4-8×。PyTorch eager 也用 cuDNN 走 tensor core，但 TensorRT 在更广的算子范围内能用到。
+
+代价是构建慢。一个 SDXL UNet 在 A100 上构建 FP16 plan 大约 5-15 分钟（看是否开 `BUILDER_OPTIMIZATION_LEVEL` 高档），INT8 加校准更慢，可达 30+ 分钟。所以 plan 应当作为 CI 产物缓存，不是每次启动现 build。
 
 ### 工作流
 
@@ -512,7 +679,17 @@ NNAPI（Android 8+）能把 TFLite 模型路由到设备 NPU，但兼容性差�
 
 实践：**Android 端常用厂商专用 SDK**——高通的 SNPE、联发科的 NeuroPilot、华为的 HiAI。
 
-## 15.7 模型蒸馏：极致轻量
+## 15.7 模型蒸馏与剪枝：极致轻量
+
+### 15.7.0 三类"让模型变小"的技术
+
+本节讲蒸馏，但要先把它放在更大的"模型压缩"语境里。让一个训好的模型变小有三条常见路径，工程上经常混用：
+
+1. **量化**（15.2.5 节）：把 FP32/FP16 权重 / 激活降到 INT8 / INT4，模型大小线性减小，速度看硬件。不改变模型结构。
+2. **剪枝**（pruning）：去掉对输出贡献小的权重 / 通道 / 层。结构剪枝（structured pruning，按通道 / 头剪）能直接减少 FLOPs 与显存；非结构剪枝（unstructured，按单个权重剪）压缩率高但要专门硬件支持稀疏算子才有速度收益。低层视觉里**通道剪枝**最常用 - 训练时给每个 conv 通道加 L1 正则 → 训完按通道幅度排序 → 剪掉幅度最小的 k% → 在剩余通道上微调几个 epoch。Real-ESRGAN-Mini 的瘦身路径之一就是通道剪枝 + 蒸馏组合。
+3. **蒸馏**（distillation）：训一个全新的小学生模型从头模仿大教师的输出 / 中间特征。学生结构可以与教师完全不同（这是和剪枝最大的区别），所以能换 backbone、换算子、换层数。
+
+三者可以叠加：蒸馏出小学生 → 通道剪枝 → INT8 量化 → 进端侧。每一步独立看损失都可控（蒸馏掉 ~5% 质量、剪枝掉 ~2%、量化掉 ~3%），叠加后整体掉 ~10% 但模型大小可能从 60MB 压到 3MB，速度提升 10×+。这是端侧实时增强能成立的根本原因。
 
 预训练模型太大？训一个**学生模型**（小模型）模仿教师模型（大模型）的输出。
 
@@ -546,7 +723,70 @@ def distillation_loss(student_out, teacher_out, hr_target):
 
 ## 15.8 LCM / Turbo 蒸馏（扩散通用）
 
-扩散模型 50 步推理太慢。**Latent Consistency Models (LCM)** 把它蒸馏到 4-8 步：
+扩散模型 50 步推理太慢。**Latent Consistency Models (LCM)** 把它蒸馏到 4-8 步。
+
+### 为什么 50 步是个问题：先把推理时序看清楚
+
+理解蒸馏前要先看清原始的多步扩散推理是怎么用掉时间的。下面这张时序图画的是一次条件扩散 SR 的标准 DDIM 推理（N = 50 步）：每一步都要 VAE 解码外推 + U-Net forward + 调度器更新潜变量。每一步的 U-Net forward 几乎相同的耗时，所以总时间近似与步数成正比。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户/上游
+    participant E as VAE Encoder
+    participant S as Scheduler<br/>DDIM/DPM-Solver/UniPC
+    participant N as U-Net (条件)
+    participant D as VAE Decoder
+    participant O as 输出
+
+    U->>E: LR 图像 y
+    E->>S: z_T 噪声初始化 + LR 条件 latent
+
+    Note over S,N: 步 t = T → T-1 → ... → 1<br/>(DDIM 50 步)
+
+    loop 每一步 t
+        S->>N: (z_t, t, cond)
+        N-->>S: 预测噪声 ε_θ(z_t, t, cond)<br/>或 v / x0 形式
+        Note over S: 一步更新:<br/>z_{t-1} = α·z_t + β·ε_θ + γ·z_0_pred<br/>(DDIM 公式)
+    end
+
+    S->>D: z_0 (干净潜变量)
+    D->>O: 解码到像素空间 x_hat
+
+    Note over N: 单步耗时由 U-Net forward 主导<br/>SDXL UNet ~250 ms (A100 FP16)<br/>50 步 ≈ 12.5 s
+    Note over O: 总延迟 ≈ N × T_unet + T_vae<br/>线性依赖 N
+```
+
+把这张图刻在脑子里之后再看后面的优化路径：
+
+- **DDIM → DPM-Solver++ / UniPC**：相同质量下 50 步降到 15-20 步。算法换名，单步耗时不变，靠采样器把"少几步也能收敛"做出来。
+- **LCM / Turbo 蒸馏**：进一步把步数压到 4-8 步。本质是教学生网络"从任意 t 一步直接预测 x_0"。
+- **OSEDiff / TSD-SR 等 1 步扩散 SR**：把整张时序图压缩到只剩一次 U-Net forward + 一次 VAE 解码，单步 ~0.3-0.8 秒。
+- **正交优化**：U-Net 内部 Flash Attention 把 attention kernel 融合、TensorRT 编译把 conv/attn 算子融合到底层 kernel、FP16/BF16 把单 forward 耗时再砍一半。这些与"减步数"是叠加生效的。
+
+这就是为什么本章把"蒸馏减步数"和"通用 TensorRT/编译/半精度"分两条线讲：它们解决的是不同维度的瓶颈，可以同时上。
+
+### 核心思想
+
+### 扩散采样器选择：DDIM / DPM-Solver / UniPC 的速度-质量取舍
+
+蒸馏不是唯一加速路线。在不重新训学生网络的前提下，**换采样器**就能把步数从 50 砍到 15-20，几乎零代价。本节顺便把几个主流采样器的取舍说清楚。
+
+| 采样器 | 推荐步数 | 阶数 | 收敛特征 | 适用场景 |
+|--------|---------|------|---------|---------|
+| **DDIM** | 30-50 | 1 阶 | 慢但稳，对所有模型 OK | baseline / 调参 |
+| **DPM-Solver** | 15-25 | 2-3 阶 | 同质量步数减半 | 通用加速 |
+| **DPM-Solver++** | 10-20 | 2-3 阶 | 高 CFG 下更稳 | 大引导系数场景 |
+| **UniPC** | 8-15 | 多阶 predictor-corrector | 极少步数下质量最佳 | 实时优先 |
+| **Euler / Heun** | 30-50 | 1-2 阶 | 简单稳定 | 教学 / 调试 |
+
+工程经验：
+
+- **新项目 baseline 用 DDIM 30 步**，质量与速度都中等。
+- **生产侧默认 DPM-Solver++ 20 步**，节省 30-50% 延迟，质量与 DDIM 50 步相当。
+- **极致延迟用 UniPC 10-15 步**，能再省一半时间，但低引导系数下会糊。
+- **步数小于 8 的场景**，采样器优化的收益边际递减，应该直接走 LCM / 1-step SR 蒸馏路径。
+
+注意采样器换了之后模型 checkpoint 不需要重新训 - 这是和蒸馏最大的区别。所以"先换采样器、再考虑蒸馏"是合理的优化顺序。
 
 ### 核心思想
 
@@ -667,6 +907,63 @@ def tile_inference(model, image, tile_size=512, overlap=64, scale=4):
 
     return output / (weight + 1e-8)
 ```
+
+### Tile 推理的数据流
+
+把上面这段代码画成数据流，更直观地看到"切块 → 推理 → 边界融合"三个阶段在做什么。注意权重图 `weight` 的存在不是冗余：在重叠区两个甚至四个 tile 都会贡献输出，必须按权重归一化才能得到无缝拼接的最终图。
+
+```mermaid
+graph TB
+    IN[输入 HR 大图<br/>1 x 3 x H x W]
+
+    subgraph Slice[1. 切块阶段]
+        SCAN[滑窗扫描<br/>步长 = tile_size - overlap]
+        T1[Tile 0,0<br/>左上角]
+        T2[Tile 0,1<br/>与 T1 重叠 overlap]
+        T3[Tile 1,0]
+        TN[...更多 tile]
+        PAD[边角 reflect pad<br/>到 tile_size]
+    end
+
+    subgraph Inf[2. 推理阶段]
+        MODEL[模型 f_theta<br/>每个 tile 独立 forward<br/>输出 tile_size * scale]
+    end
+
+    subgraph Blend[3. 边界融合阶段]
+        MASK[渐变 mask<br/>边缘 0 内部 1]
+        ACC[输出累加器 output<br/>权重累加器 weight]
+        NORM[归一化<br/>output / weight]
+    end
+
+    OUT[输出 HR 大图<br/>1 x 3 x H*scale x W*scale]
+
+    IN --> SCAN
+    SCAN --> T1
+    SCAN --> T2
+    SCAN --> T3
+    SCAN --> TN
+    T1 --> PAD
+    T2 --> PAD
+    T3 --> PAD
+    TN --> PAD
+    PAD --> MODEL
+    MODEL --> ACC
+    MASK --> ACC
+    ACC --> NORM
+    NORM --> OUT
+
+    style IN fill:#e8f5e9
+    style OUT fill:#fff3e0
+    style MASK fill:#e3f2fd
+    style MODEL fill:#fce4ec
+```
+
+实现里有几条不能省的细节：
+
+1. **边角 reflect padding 不能直接 zero pad**。zero pad 会让卷积在 tile 边缘看到一圈黑色，输出在拼接处出现暗带。reflect 才能让 tile 边缘的统计与图内部接近。
+2. **mask 在 HR 输出空间生成，不是 LR 输入空间**。tile 推理后输出空间是 `tile_size * scale`，mask 也要在这个尺度上做渐变，否则与输出不对齐。
+3. **渐变形状**：上面的实现是线性渐变。更高级一点用 cosine（`0.5 - 0.5 * cos`）或者 Hann 窗，过渡更平滑、肉眼更难看出接缝。SwinIR-Tile 官方实现里就是 cosine 渐变。
+4. **重叠量经验值**：overlap 至少要大于"模型感受野的一半"。SwinIR / Restormer 这种感受野上百像素的模型，overlap 给 32 会有明显接缝，给 64-128 才稳。
 
 ### Tile 的 trade-off
 

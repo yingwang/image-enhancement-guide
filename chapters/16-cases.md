@@ -6,6 +6,33 @@
 >
 > 这是这本书最接近"产品手册"的一章。
 
+## 16.0 章首铺垫
+
+到这里为止，本书的章节多数处在"局部最优"视角：第 6-7 章讲单个网络架构如何编码先验，第 11-12 章讲一次训练循环如何稳定收敛，第 15 章讲一次推理调用如何在硬件上跑得动。但任何真正交付给用户的影像增强系统，都不是一个模型对应一个调用，而是**一条由多个模型、多个判别分支、多个保底路径组成的流水线**。这条流水线接受一个不可控的输入（用户随手扔进来的图或一段视频），通过若干检测、路由、特化处理、融合、后期颜色与编码控制，输出一个可以放回产品中的结果。
+
+这一章回答的问题是：**给定一个具体的业务场景，如何把前面章节里那些零散的工具拼成一条能上线的 pipeline**。读完这一章你应当能：
+
+- 拿到一个新的影像增强需求，能先识别它属于哪一类场景（离线消费产品、端侧实时、批处理 UGC、低延迟流媒体、传感器内嵌、可信链监控）
+- 针对该场景，能列出关键约束的优先级（质量、延迟、成本、可解释性），并据此选定主干模型与配套模块
+- 能画出端到端流程图，识别出每一步的失败点与对应的保底分支
+- 不会把学术 benchmark 第一名直接搬上线，而是用本章给出的取舍框架做工程选型
+
+**前置知识。** 本章假设读者已经看完第 1 章的退化模型、第 2 章的表达空间、第 5 章的退化合成、第 9-10 章的扩散派与人脸特化、第 13-14 章的视频与时序、第 15 章的部署优化。每个案例引用相关章节时会显式给出节号。
+
+**术语速查。** 本章会反复出现以下缩写，第一次出现时会给全称，这里先列一份索引方便回查：
+
+- **UGC**（User-Generated Content，用户生成内容）：相对于专业制作内容（PGC）而言，由普通用户上传的图片或视频
+- **ISP**（Image Signal Processor，图像信号处理器）：相机内部把传感器原始读数变成可见图像的整套硬件加软件流水线
+- **HDR**（High Dynamic Range，高动态范围）：能表达比标准 8-bit 显示更宽亮度范围的图像或视频
+- **SDR**（Standard Dynamic Range，标准动态范围）：传统 8-bit 显示对应的亮度范围
+- **Bayer**（拜耳阵列）：彩色传感器上最常见的滤色片排布，每 2×2 区域排列成 RGGB（红绿绿蓝）
+- **CFA**（Color Filter Array，彩色滤色阵列）：Bayer 是其中一种具体方案
+- **NPU**（Neural Processing Unit，神经网络处理器）：手机/嵌入式平台上专用于跑神经网络的硬件加速器，如苹果 ANE、华为达芬奇、高通 Hexagon
+- **NVDEC / NVENC**（NVIDIA Video Decoder / Encoder，英伟达 GPU 的硬件视频解码器/编码器）：在 GPU 上不经过 CPU 直接解/编 H.264、H.265 等码流
+- **OCR**（Optical Character Recognition，光学字符识别）：把图像里的文字识别成可编辑字符的任务
+- **A/B 测试**：把用户随机分成两组分别用不同版本，对比指标差异决定是否上线新版本
+- **OOD**（Out-Of-Distribution，分布外）：输入落在训练分布之外的区域，模型在这种输入上的行为不可预测
+
 ## 16.1 这一章的结构
 
 每个案例包含：
@@ -26,6 +53,32 @@
 16.6  ISP 端侧增强（手机后处理）
 16.7  监控视频增强（安防）
 ```
+
+这六个案例覆盖了影像增强落地的几乎所有典型形态。可以把它们粗略地放在"延迟约束 × 质量约束"两个轴上：
+
+```mermaid
+graph TD
+    subgraph 离线高质量
+        A[16.2 老照片修复<br/>延迟秒级 / 创意可生成]
+    end
+    subgraph 准实时
+        B[16.3 手机暗光<br/>延迟亚秒 / 自然不可见]
+        C[16.4 UGC 视频增强<br/>批处理 / 大规模 / 保守]
+    end
+    subgraph 强实时
+        D[16.5 4K 直播<br/>每帧 33ms / 因果模型]
+        E[16.6 ISP 端侧<br/>NPU 实时 / 物理 RAW]
+    end
+    subgraph 可信链
+        F[16.7 监控视频<br/>不允许生成 / 可追溯]
+    end
+
+    style A fill:#e3f2fd
+    style D fill:#ffebee
+    style F fill:#fff3e0
+```
+
+把这张图压在脑子里，再去读后面六节，每节其实都是同一个问题在不同约束下的不同答案：**你打算让模型走多大胆？**
 
 ## 16.2 案例：老照片修复
 
@@ -90,30 +143,68 @@
 增强后的照片
 ```
 
+### Pipeline 数据流图
+
+把上面 6 步画成端到端图，可以更清楚地看到主分支与人脸子分支的关系：
+
+```mermaid
+graph TD
+    Input[用户上传<br/>原始老照片] --> Decode[Step 1<br/>解码 / 检测分辨率<br/>保留原文件]
+    Decode --> Defect[Step 2<br/>缺陷检测<br/>划痕 / 折痕 / 缺失]
+    Defect --> Inpaint[Step 2<br/>LaMa Inpainting<br/>填补缺失区域]
+    Inpaint --> IsBW{是否黑白?}
+    IsBW -- 是 --> Color[Step 3<br/>DDColor 上色<br/>可选 prompt]
+    IsBW -- 否 --> SR
+    Color --> SR[Step 4<br/>通用增强<br/>SUPIR / Real-ESRGAN<br/>用户调 fidelity]
+    SR --> Detect[Step 5a<br/>人脸检测<br/>RetinaFace / SCRFD]
+    Detect --> Align[Step 5b<br/>人脸对齐<br/>5 点关键点]
+    Align --> Face[Step 5c<br/>CodeFormer<br/>fidelity 0.5]
+    Face --> Blend[Step 5d<br/>无缝贴回<br/>Poisson / Laplacian]
+    SR --> Blend
+    Blend --> Post[Step 6<br/>颜色平衡 / USM<br/>JPEG Q=95]
+    Post --> Output[增强后照片<br/>+ 处理日志]
+
+    style Input fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style Face fill:#fff3e0
+    style SR fill:#fff3e0
+```
+
+注意几个关键的工程细节：
+
+1. **Step 2 的 inpainting 与 Step 4 的通用增强是串行的，不是并行**——必须先把缺失结构补齐，再让通用 SR 工作在一个完整的图上，否则 SR 会把"破损"当成纹理放大
+2. **Step 5 的人脸子分支与主分支共享同一个增强后的背景**——人脸 crop 来自原图（保证清晰边界与对齐），增强后贴回到 SR 输出（保证背景已被处理）
+3. **Step 6 的颜色平衡放在所有生成式步骤之后**——因为 SUPIR、DDColor、CodeFormer 都可能引入色调漂移，最后统一拉回（见 17.9 节）
+
 ### 关键决策
 
 **Step 2 用 LaMa 不用扩散 inpainting**：
-- LaMa 速度快、对小划痕效果好
-- 扩散 inpainting 慢且容易"创造"内容（可能补出不存在的物体）
+- LaMa（Large Mask inpainting，使用快速傅里叶卷积的大掩码补全模型）速度快、对小划痕效果好，单张 4K 图在 A10 上几百毫秒
+- 扩散 inpainting 慢且容易"创造"内容，可能在没有人物的位置补出半张脸，这种"惊喜"在老照片场景里是事故
+
+**Step 3 上色用 DDColor**：
+- DDColor（Dual Decoder Colorization，双解码器自动上色，2023）在 ImageNet 与 COCO 上预训练，对老照片中常见的人物、服饰、室内场景有合理先验
+- 用户可选 prompt（如"sepia tone"、"natural daylight"）控制整体色调，避免模型把所有照片都修成同一种现代调
 
 **Step 4 给用户调 fidelity**：
 - 0.3：充分利用扩散先验，老照片质感被替换成"现代质感"
 - 0.7：保留原照片的颗粒、年代感
-- 不同用户偏好不同，不能写死
+- 不同用户偏好不同，不能写死。后台 A/B 测试常见默认在 0.55 附近
 
 **Step 5 face crop 单独处理**：
-- 通用 SR 在人脸上效果差（第 10 章）
-- 检测出人脸 → 对齐 → CodeFormer → 贴回
-- fidelity_weight = 0.5：身份保留 + 适度生成
+- 通用 SR 在人脸上效果差（第 10 章），因为人脸先验与自然图像先验差别很大
+- 检测出人脸，对齐到 CodeFormer 训练时使用的 512×512 标准位置，过模型后再用 Poisson blending 或 Laplacian pyramid blending 贴回，避免出现"接缝"
+- fidelity_weight = 0.5：身份保留与适度生成的平衡点。这个值是经过人评 A/B 测试得到的产品默认，并非论文推荐
 
 ### 失败模式
 
-- **多人脸场景**：检测漏掉某些人脸 → 那些脸糊
-- **侧脸 / 极端角度**：face detector 失效
-- **老照片有印章 / 题字**：模型当作"瑕疵"修掉了
+- **多人脸场景**：检测漏掉某些人脸，那些脸糊
+- **侧脸或极端角度**：人脸检测器失效，CodeFormer 的对齐前提不成立
+- **老照片有印章或题字**：模型当作"瑕疵"修掉了
 - **服饰图案**：模型修补成"现代风"，时代感丢失
+- **多人脸合影里某些人脸 OOD**（Out-Of-Distribution，分布外，如儿童、老人、非欧美人种）：CodeFormer 修复结果"看起来像别人"，详见 17.11 节
 
-应对：UI 给用户**手动选择重点修复区域**，而不是全自动。
+应对：UI 给用户**手动选择重点修复区域**，而不是全自动；并在结果页明确标注"AI 修复结果可能与原始细节有差异"。
 
 ### 代表产品
 
@@ -175,17 +266,19 @@ RAW / 多帧 RGB
 ### 关键决策
 
 **多帧融合而不是单帧增强**：
-- 单帧 ISO 6400 噪声极大，去噪损失细节
-- 多帧融合等效于"增加曝光"，根本上提升信噪比
-- 这是 Google Pixel HDR+、iPhone 夜景的核心思想
+- 单帧 ISO（International Organization for Standardization，国际标准化组织。在摄影里 ISO 指传感器感光度等级，数值越高放大倍率越大，噪声越严重）6400 噪声极大，去噪会显著损失细节
+- 多帧融合等效于"增加曝光"，根本上提升信噪比。$N$ 帧融合理论上把读出噪声降到 $1/\sqrt{N}$，是物理层面的改善，而不是后处理的猜测
+- 这是 Google Pixel HDR+（High Dynamic Range Plus，Google 提出的多帧合成 HDR 流程）、iPhone 夜景的核心思想
 
 **端侧 NAFNet 而不是 Restormer**：
-- NAFNet 没有 attention，ANE 友好
-- 蒸馏到 1M 参数，单帧 12MP 推理 ~100ms
+- **NAFNet**（Non-linear Activation Free Network，去掉非线性激活换成门控乘法的极简残差网络）没有 self-attention，对 ANE（Apple Neural Engine，苹果神经网络处理器）友好，量化与编译都顺畅
+- 蒸馏到 1M 参数，单帧 12MP（12 Megapixel，1200 万像素）图推理约 100ms
+- Restormer 有 channel attention，端侧 NPU 的编译器对它支持不一致，跨设备稳定性差
 
 **颜色还原**比"质量提升"更重要：
-- 用户能容忍轻微噪声、不能容忍颜色失真
-- 暗光场景白平衡漂移严重，必须校正
+- 用户能容忍轻微噪声，不能容忍颜色失真
+- 暗光场景白平衡漂移严重，必须校正。常见做法是用一个小 CNN 估计场景光源的色温与色调（gain factor），再做反向校正
+- 颜色这一环之所以"无感"才是好，是因为人眼对色彩偏差极敏感，对 0.5 dB PSNR 提升却几乎察觉不到
 
 ### 失败模式
 
@@ -256,18 +349,19 @@ RAW / 多帧 RGB
 
 **1.5× 而不是 4× SR**：
 - 用户在手机屏幕上看，1080P 已足够
-- 4× 计算成本是 4× 的平方
-- 1080P → 1080P 的"清晰化"在感知上接近 4× SR
+- 4× 计算成本是 4× 的平方关系（输出像素是输入的 16 倍），1.5× 只多 2.25 倍
+- 1080P → 1080P 的"清晰化"在感知上接近 4× SR，因为去掉了压缩伪影、提高了局部锐度，主观感觉比物理分辨率更重要
 
 **BasicVSR++ 不用 SUPIR**：
-- 视频不能编造（一致性问题）
-- BasicVSR++ 速度快（< 50ms/帧）
-- 成本：单段 1 分钟视频处理 < $0.01
+- 视频不能编造，一致性问题在第 13 章详谈过：扩散派每帧都是独立采样，相邻帧细节不同导致闪烁
+- BasicVSR++（第二代 BasicVSR，加入二阶传播与 flow-guided 可变形卷积）速度快，A100 上单帧 720P 不到 50ms
+- 成本：单段 1 分钟 30fps 视频处理（1800 帧）GPU 时间约 90 秒，按 A100 按小时计费换算每分钟视频处理成本远低于 1 美分
 
 **内容分类前置**：
 - 风景视频：减弱去噪（保留纹理）
 - 人脸主导：开人脸增强
-- 动画：跳过 SR（动画原本就是矢量风）
+- 动画：跳过 SR（动画原本就是矢量风，超分会引入"自然图像式纹理"破坏画风）
+- 屏幕录制（教学视频、游戏直播录像）：走专门的屏幕截图增强分支，因为字体、UI 边缘有完全不同的统计特性
 
 ### 失败模式
 
@@ -275,8 +369,9 @@ RAW / 多帧 RGB
 - **风格化视频**（动漫、油画）：模型当作"低质量"处理，毁掉风格
 - **极低帧率源**（10 fps 监控）：SR 后看起来更糟
 - **强烈运动场景**：时序一致差
+- **HDR 源视频**（High Dynamic Range，高动态范围）：模型在 SDR 训练数据上学到的统计与 HDR 不同，亮度映射可能错位
 
-应对：**模型必须能识别"不需要增强"并 bypass**。
+应对：**模型必须能识别"不需要增强"并 bypass**。具体做法是在 Step 1 内容分析阶段同时跑一个轻量的 NR-IQA 模型（如 MANIQA-Lite），对原始视频帧打分，分数高于阈值（如 0.7）的片段直接跳过 SR，只走重新编码。这类"不增强也是一种选择"的判断节省了大量算力，也避免了把高质量内容做坏的尴尬。
 
 ### 代表实现
 
@@ -370,10 +465,10 @@ for frame in video_stream:
 
 ### 关键约束
 
-- **传感器原始 RAW 输入**（不是 RGB）
-- **多种摄像头**（主摄 / 超广角 / 长焦 / 微距）
-- **端侧 NPU**（高通 Hexagon、华为达芬奇、苹果 ANE）
-- **极低功耗**：拍 1000 张照片不能让电池见底
+- **传感器原始 RAW 输入**（不是 RGB）。RAW 指传感器读出的、尚未经过 demosaicing 与色彩处理的原始数据，通常是 **Bayer**（拜耳）阵列编码下的单通道图。Bayer 是最常见的 CFA（Color Filter Array，彩色滤色阵列）排布，每 2×2 区块由 RGGB（红、绿、绿、蓝）四个滤色单元构成，其中绿色占两个位置以匹配人眼对绿色更敏感的生理特性。
+- **多种摄像头**（主摄 / 超广角 / 长焦 / 微距），每颗的传感器尺寸、光学结构、噪声分布都不一样
+- **端侧 NPU**（高通 Hexagon、华为达芬奇、苹果 ANE）。这些 NPU 对算子支持有差异，必须为每个平台单独编译与量化
+- **极低功耗**：拍 1000 张照片不能让电池见底。这一约束意味着每次推理的能耗预算只有几十毫焦，模型与张量编码都要按毫秒级别优化
 
 ### Pipeline（手机 ISP 简化）
 
@@ -420,21 +515,45 @@ for frame in video_stream:
 8-bit JPEG / HEIC
 ```
 
+### ISP 端到端数据流图
+
+把上面那条 ASCII 流水线画成 mermaid 流程图，更便于追踪数据格式从 RAW 到 RGB 再到 JPEG 的演变：
+
+```mermaid
+graph TD
+    Sensor[传感器读出<br/>Bayer RAW 12-bit] --> BLC[Black Level<br/>Correction]
+    BLC --> LSC[Lens Shading<br/>Correction]
+    LSC --> Denoise[Step 2<br/>Bayer 域去噪<br/>NAFNet-Lite]
+    Denoise --> Demosaic[Step 1<br/>学习的 Demosaic<br/>RAW → RGB]
+    Demosaic --> WB[Step 3<br/>白平衡<br/>学习的 illuminant 估计]
+    WB --> CCM[Color Correction Matrix<br/>转标准色域]
+    CCM --> Tone[Step 4<br/>局部 Tone Mapping<br/>学习的 HDR 压缩]
+    Tone --> Sharpen[Step 5<br/>USM 锐化<br/>可选人脸美化]
+    Sharpen --> Encode[JPEG / HEIC<br/>8-bit 输出]
+
+    style Sensor fill:#e8f5e9
+    style Encode fill:#e3f2fd
+    style Denoise fill:#fff3e0
+    style Demosaic fill:#fff3e0
+```
+
+注意在这条 pipeline 里，**Bayer 域去噪在 demosaic 之前**——这是因为 Bayer 域噪声是独立同分布的高斯加泊松（每个 photo-site 独立），demosaic 之后噪声变得跨通道相关、空间相关，去噪难度上升一个量级。
+
 ### 关键决策
 
 **学习的 demosaicing 而不是传统**：
-- 传统 demosaicing（Malvar、AHD）在边缘有 zipper 伪影
-- 学习的 demosaicing 能避免 + 同时去噪
-- 但要为不同传感器单独训练
+- 传统 demosaicing（Malvar、AHD 即 Adaptive Homogeneity-Directed，自适应同质性导向插值）在边缘有 zipper 伪影（边缘上的彩色拉链状色斑）
+- 学习的 demosaicing 能避免，同时还能融合去噪
+- 但要为不同传感器单独训练，传感器换代时模型也要重训
 
 **Bayer 域 vs RGB 域去噪**：
-- Bayer 域（demosaic 前）：噪声独立同分布，去噪简单但损失分辨率
+- Bayer 域（demosaic 前）：噪声独立同分布，去噪简单但分辨率有限（每通道是子采样）
 - RGB 域（demosaic 后）：噪声相关，去噪难度上升
-- 厂商各家选择不同，主流是 Bayer 域去噪 → 学习的 demosaic
+- 厂商各家选择不同，主流是 Bayer 域去噪后再做学习的 demosaic
 
 **人脸美化必须可关闭**：
 - 不同地区/文化偏好不同
-- 法律风险（欧盟 GDPR 对生物特征的处理）
+- 法律风险（欧盟 GDPR 即 General Data Protection Regulation，通用数据保护条例，对生物特征的处理设有严格限制）
 - 设置里给用户自主选择
 
 ### 失败模式
@@ -504,17 +623,17 @@ for frame in video_stream:
 
 **绝对不用扩散模型**：
 - 扩散会生成"合理但不存在"的细节
-- 法庭上"模型生成了一个车牌号 ABC123"是事故
-- 必须用判别式（CNN/Transformer）
+- 法庭上"模型生成了一个车牌号 ABC123"是事故，没人能解释模型为什么会"看到"它
+- 必须用判别式模型（discriminative，给定输入直接输出一个最优答案的范式），代表是 CNN 与非生成式 Transformer
 
 **SR 倍率保守**：
 - 4× SR 在严重退化下会"失真"
-- 监控场景常用 2× 甚至 1.5×（清晰化为主，不放大）
+- 监控场景常用 2× 甚至 1.5×（清晰化为主，不放大），目标是把已经存在但不清晰的信息拉出来
 
 **车牌 / 人脸专项**：
 - 通用 SR 对车牌字符识别帮助有限
-- 用 OCR-aware SR（第 10 章）
-- 用人脸 SR + 身份保留损失
+- 用 OCR-aware SR（第 10 章），训练时加入 OCR 文本相似度损失
+- 用人脸 SR + 身份保留损失（ArcFace embedding distance，ArcFace 是一种用加性角度间隔做人脸识别训练的损失函数与对应的特征提取器）
 
 ### 失败模式
 
@@ -529,6 +648,109 @@ for frame in video_stream:
 - 海康威视 / 大华的 AI 增强
 - 司法部门的视频增强工具
 - Adobe Premiere 的 Detail Boost（标记为"AI 增强"，不用作证据）
+
+## 16.7b 案例：屏幕截图增强
+
+### 场景
+
+用户截一张电脑或手机屏幕上的内容（聊天记录、网页、文档、PPT），用于二次分享或保存。原图可能来自低分辨率屏幕、被压缩过、有摩尔纹（手机拍屏幕时常见）、字体在缩放下出现锯齿。希望增强后字更清楚、UI 边缘更干净。
+
+### 关键约束
+
+- **字体保真**：每个字必须仍能识别，不能出现"目"被改成"日"
+- **UI 线条尖锐**：图标边缘、按钮边框是平直线，不允许变成自然纹理
+- **速度**：通常嵌在分享流程内，亚秒级响应
+
+### Pipeline
+
+```mermaid
+graph TD
+    Input[屏幕截图<br/>含文字 / UI / 截屏伪影] --> Classify[内容分类<br/>纯文字 / 含图像 / 混合]
+    Classify -- 纯文字 --> DocSR[DocSR<br/>OCR-aware 损失训练]
+    Classify -- 含图像 --> Detect[文字区域检测<br/>EAST / DBNet]
+    Detect --> TextCrop[文字 crop<br/>走 DocSR 分支]
+    Detect --> ImgArea[图像区域<br/>走 Real-ESRGAN 分支]
+    TextCrop --> Merge[按位置合并]
+    ImgArea --> Merge
+    DocSR --> Output
+    Merge --> Output[增强后截图<br/>PNG 无损]
+
+    style Input fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style DocSR fill:#fff3e0
+    style ImgArea fill:#fff3e0
+```
+
+### 关键决策
+
+**走 PNG 不走 JPEG**：
+- 屏幕截图有大量"硬边缘"（字、UI 线），JPEG 在硬边缘上的振铃伪影特别明显
+- PNG 无损，输出质量稳定
+
+**文字区域必须走专用模型**：
+- 通用 Real-ESRGAN 把字当自然纹理处理，常常磨平笔画
+- 文字检测后单独跑 DocSR（Document Super-Resolution，文档专用超分模型），用 OCR-aware loss 训练，保证字符识别一致
+
+**摩尔纹检测前置**：
+- 拍屏幕时摩尔纹（屏幕像素与相机采样的周期性干涉条纹）是普遍问题
+- 检测到摩尔纹时先走去摩尔纹模型（如 DMCNN，Demoire CNN），再做后续增强
+
+### 失败模式
+
+- **超小字体**（< 8 像素高）：信息已不足
+- **特殊符号 / emoji / 数学公式**：DocSR 训练数据偏向印刷体，对这些 OOD 表现差
+- **截图本身是别人发来的二次截图**：多次压缩叠加，伪影复杂到模型无法分离
+
+## 16.7c 案例：医学内窥镜增强
+
+### 场景
+
+内窥镜（消化道、呼吸道、关节腔）拍摄的视频，受限于光学结构与传感器尺寸，画面常常偏暗、有强反光、有镜头水汽、运动模糊明显。临床医生希望增强后能更清楚看到组织纹理与微小病灶。
+
+### 关键约束
+
+- **绝对不允许生成**——临床医学场景任何"猜出来的"细节都是医疗事故风险
+- **实时**：内窥镜操作过程中需要实时回放，延迟超过 100ms 医生就难以做精细操作
+- **可解释**：每个增强步骤的物理意义必须清晰，便于做监管审批
+
+### Pipeline
+
+```mermaid
+graph LR
+    Cam[内窥镜视频流<br/>BGR / RGB] --> Spec[镜面反光检测<br/>+ inpainting 局部去高光]
+    Spec --> Fog[水汽检测<br/>暗通道先验去雾]
+    Fog --> Low[Retinexformer<br/>低光增强]
+    Low --> Denoise[Restormer<br/>判别式去噪]
+    Denoise --> Sharpen[USM 锐化<br/>保守强度]
+    Sharpen --> Output[增强视频<br/>+ 处理记录]
+
+    style Cam fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style Low fill:#fff3e0
+    style Denoise fill:#fff3e0
+```
+
+### 关键决策
+
+**反光与水汽分别检测**：
+- 高光反射在医学图像里是严重干扰，必须单独检测并做有限 inpainting（小面积、用 LaMa 这类判别式模型，避免扩散）
+- 水汽则走经典的暗通道去雾（dark channel prior，2009 年 He Kaiming 的工作），可解释、不依赖训练数据
+
+**Retinexformer 而不是扩散派**：
+- 第 18.10 节会详谈，Retinexformer 把 Retinex 物理模型（图像 = 反射 × 光照）作为归纳偏置，符合医学场景对物理可解释性的要求
+- 扩散派在医学场景下不可用，因为"生成"行为不可控
+
+**USM 锐化强度调到保守**：
+- USM（Unsharp Mask，反锐化掩模，把原图减去模糊版后的高频部分加回原图来加强边缘）经典且可解释
+- 太激进会把噪声当边缘放大；医学场景宁可"软"一点
+
+### 失败模式
+
+- **极端暗光**（蜡烛光以下）：Retinex 假设的"光照平滑"失效
+- **大面积出血或强反光**：检测器失效
+- **运动主导**（操作过快）：去噪与运动模糊矛盾
+
+医学场景的工程纪律比监控更严：所有处理过程必须有完整日志、所有模型必须通过监管审批（FDA、NMPA 等），任何模型升级都要走完整的临床验证流程。
 
 ## 16.8 通用工程经验
 

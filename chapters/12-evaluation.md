@@ -1,10 +1,37 @@
 # 第 12 章 · 评估方法论
 
-> 第 4 章讲了**指标本身**——PSNR/LPIPS/FID 各自骗你哪些。
+> 第 4 章讲了**指标本身**：PSNR/LPIPS/FID 各自骗你哪些。
 >
-> 这一章讲**怎么做评估**——主观评测怎么设计、统计显著性怎么算、生产环境 A/B 测试怎么搞。
+> 这一章讲**怎么做评估**：主观评测怎么设计、统计显著性怎么算、生产环境 A/B 测试怎么搞。
 >
 > 在影像增强里，"做实验"这件事本身有一套方法论，绝大多数论文做不好这一步。
+
+## 12.0 阅读须知
+
+第 4 章把每个指标拆开讲过它们各自的偏差，本章往上走一层：**给定一组指标，如何把它们组织成可信的实验结论**。两者的边界可以这样划：第 4 章回答"PSNR 是 32 dB 这件事意味着什么"，本章回答"PSNR 32 dB 比 31 dB 是不是真的更好"以及"在真实用户那里这个差是不是能感知"。
+
+这一章预设读者写过简单的对比实验（跑两个模型、算个 PSNR、画个表），但**不一定专门设计过 user study 或线上 A/B**。我们会展开三个层级的评估方法、几种主观评测协议、评分人质量控制、统计显著性检验，以及生产部署里的 A/B 测试。
+
+**首次出现的缩写。** 本章用到的缩写在此先列定义：
+
+- **IQA**（Image Quality Assessment，图像质量评估）：第 1 章已定义，本章直接使用
+- **MOS**（Mean Opinion Score，平均意见分）：评分人按 1-5 级 Likert 量表对图像质量打分后取平均
+- **DMOS**（Differential MOS）：以参考图为基准的相对 MOS，等于参考分减去测试分，单位是"质量损失"
+- **2AFC**（Two-Alternative Forced Choice，二选一强迫选择）：评分人在 A 和 B 之间必须二选一的对比协议
+- **BT.500**：ITU-R 的视频与图像主观评测标准，影像评测的事实标准
+- **NR-IQA / FR-IQA**（No-Reference / Full-Reference IQA）：第 1 章已定义；本章里 NR-IQA 是真实场景的主力
+- **BRISQUE**（Blind/Referenceless Image Spatial Quality Evaluator）：基于自然场景统计的 NR-IQA 经典指标
+- **NIQE**（Natural Image Quality Evaluator）：另一个基于自然场景统计的 NR-IQA 指标
+- **PI**（Perceptual Index）：PIRM 2018 比赛定义的复合 NR 指标，等于 (10 - NRQM + NIQE) / 2
+- **NRQM**（No-Reference Quality Metric）：Ma et al. 2017 提出的 SR 专用 NR 指标
+- **MANIQA / CLIP-IQA / Q-Align**：第 1 章已定义的现代 NR-IQA
+- **ICC**（Intraclass Correlation Coefficient，组内相关系数）：评分人间一致性指标
+- **AMT**（Amazon Mechanical Turk）：经典众包平台
+- **IRB**（Institutional Review Board，机构伦理审查委员会）：学术受试者研究的伦理审查机构
+- **SUREAL**（Subjective REcovery Algorithm with Latent classes）：Netflix 提出的 MOS 估计方法
+- **PVD**（Preferred Viewing Distance，推荐观看距离）：BT.500 规定的评测物理距离
+
+读完这一章你应该能回答：给一个新模型，我如何设计一组实验同时跑得快、跑得准、还能在论文/产品 review 里站得住脚；用户说"看不出区别"时如何用数据反驳或承认；线上 A/B 测两周看不出差异是模型不好还是样本不够。
 
 ## 12.1 评估的三个层级
 
@@ -29,7 +56,38 @@ Layer 3: 真实场景下游任务
 
 **三个层级要相互验证**：自动指标的提升如果不能在主观评测和下游任务上反映出来，那个提升就值得怀疑。
 
-这一章重点讲 Layer 2 和 Layer 3。
+把这三层和它们各自下面的具体方法画成谱系图，方便后面回查 - 后续每一节本质上都是在补全这棵树的某个子节点：
+
+```mermaid
+graph TD
+    Eval[影像增强评估]
+    Eval --> L1[Layer 1<br/>自动指标]
+    Eval --> L2[Layer 2<br/>主观评测]
+    Eval --> L3[Layer 3<br/>下游任务 / A/B]
+
+    L1 --> FR[FR-IQA 全参考<br/>有 HR 真值]
+    L1 --> NR[NR-IQA 无参考<br/>无 HR 真值]
+    FR --> FR1[PSNR / SSIM / MS-SSIM]
+    FR --> FR2[LPIPS / DISTS]
+    FR --> FR3[FID / KID 分布级]
+    NR --> NR1[BRISQUE / NIQE / PI / NRQM]
+    NR --> NR2[MANIQA / CLIP-IQA / Q-Align]
+
+    L2 --> SS[单刺激<br/>SS / MOS]
+    L2 --> DS[双刺激<br/>DSCQS / DSIS]
+    L2 --> PC[强迫选择<br/>2AFC / PC]
+    L2 --> CV[连续评测<br/>SSCQE 视频专用]
+
+    L3 --> Down[下游任务指标<br/>OCR / 检测 / 识别]
+    L3 --> AB[生产 A/B 测试<br/>用户行为]
+    L3 --> Bandit[多臂老虎机<br/>动态分流]
+
+    style L1 fill:#e8f5e9
+    style L2 fill:#fff3e0
+    style L3 fill:#ffebee
+```
+
+这一章重点讲 Layer 2 和 Layer 3，Layer 1 的细节在第 4 章已经覆盖。
 
 ## 12.2 MOS：单图评分
 
@@ -124,7 +182,33 @@ def normalize_mos_scores(scores: dict) -> dict:
 
 ### 实际推荐：**比 MOS 更可靠**
 
-绝大多数严肃论文/产品对比都用 2AFC 而不是 MOS——除非你只评一个模型的整体质量。
+绝大多数严肃论文/产品对比都用 2AFC 而不是 MOS - 除非你只评一个模型的整体质量。
+
+把一次完整的 paired comparison（PC）实验从招募到结论画成流程图，覆盖了 12.4 - 12.7 节里所有质量控制点：
+
+```mermaid
+flowchart TD
+    Start[招募评分人] --> Train[Training session<br/>5-10 张 anchor 校准尺度]
+    Train --> Catch[加入 5-10 percent catch trial<br/>已知正确答案]
+    Catch --> Random[试次随机化<br/>顺序 / 左右 / 重复位置]
+    Random --> Vote[评分人完成 2AFC 投票<br/>A 胜 / B 胜 / 平]
+
+    Vote --> QC{质量控制}
+    QC -->|catch trial 错率 高| Drop[剔除评分人]
+    QC -->|响应时间 小于 5 秒| Drop
+    QC -->|BT.500 β2 异常| Drop
+    QC -->|test-retest 不一致| Drop
+    QC -->|通过| Keep[保留评分]
+
+    Keep --> Agg[SUREAL 联合估计<br/>q_j / b_i / v_i]
+    Agg --> Stat[Binomial test<br/>+ Bonferroni 修正]
+    Stat --> Out[偏好率 + 置信区间<br/>+ Krippendorff α 报告]
+
+    style Drop fill:#ffebee
+    style Out fill:#e8f5e9
+```
+
+这张图在后面每一节都会被引用 - 12.5 节讲招募与质量控制对应左半边，12.6 节讲一致性指标和 BT.500 异常检测对应中间，12.7 节讲 SUREAL 对应右下，12.11 节讲统计检验对应最后一步。
 
 ```python
 def compute_preference_rate(votes: list) -> dict:

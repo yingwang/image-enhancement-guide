@@ -2,6 +2,37 @@
 
 > "增强"是一种说法。本书用更准确的词：**估计**。
 
+## 1.0 阅读须知
+
+本书面向有一定机器学习基础、但**未必专门做过低层视觉**的算法工程师。预设读者具备的背景：
+
+- 熟悉张量计算，能流畅读 PyTorch 代码；卷积、上采样、归一化、注意力这些基本算子知道大致做什么
+- 看得懂常见的损失函数表达式与梯度下降流程
+- 听说过扩散模型，但不一定亲手训练过
+
+不预设的背景包括：图像信号处理（ISP）、信号采样与混叠的频域理论、视频编码标准、传感器物理模型、特定低层视觉模型的细节。每个第一次出现的术语，本书都会用一两句话先解释它指什么，再展开使用。
+
+**记号约定。** 全书统一以下数学符号：
+
+- $x$：理想的高质量图像（high-quality / ground truth），张量形状一般写作 $(C, H, W)$，$C$ 是颜色通道数，$H, W$ 是高宽
+- $y$：观测到的低质量图像（low-quality / observed），形状可能与 $x$ 不同（超分辨率任务下 $y$ 比 $x$ 小）
+- $\hat{x}$：模型对 $x$ 的估计
+- $D$：退化算子（degradation operator），一个把高质量图像变成低质量图像的过程
+- $n$：噪声
+- $f_\theta$：参数为 $\theta$ 的模型
+- $p(\cdot)$：概率分布
+
+**首次出现的缩写。** 为避免读到一半被术语劝退，本书第一次出现某个缩写时会在括号里给出全称与一句话定义：
+
+- **ISP**（Image Signal Processor，图像信号处理器）：相机内部把传感器原始读数变成可见图像的整套流水线
+- **ISO**：传感器的感光度等级，数值越大放大倍率越高、噪声越明显
+- **DCT**（Discrete Cosine Transform，离散余弦变换）：JPEG 压缩里把 8×8 像素块变换到频域的步骤
+- **HR / LR**（High Resolution / Low Resolution，高/低分辨率）
+- **SR**（Super-Resolution，超分辨率）：把低分辨率图升采样到高分辨率的任务族
+- **IQA**（Image Quality Assessment，图像质量评估）
+
+更多专有缩写出现在对应章节时再展开，本节不一次性堆完。
+
 ## 1.1 一个具体的场景
 
 晚上九点，你在街上举起手机拍了一张霓虹灯下的招牌。回家一看，画面有这些问题：
@@ -106,15 +137,24 @@ def total_variation_loss(x: torch.Tensor) -> torch.Tensor:
 
 ### 数据驱动先验（CNN/Transformer 学到的）
 
-2014 年 SRCNN 之后，深度学习取代了变分方法。一个 CNN 端到端从 $y$ 映射到 $\hat{x}$，先验隐式地编码在权重里。模型在大量自然图像 $(x, y)$ 配对上训练，学到的是"自然图像的分布在权重空间里的低维流形"。
+2014 年 **SRCNN**（Super-Resolution Convolutional Neural Network，三层卷积做超分辨率的开山工作）之后，深度学习取代了变分方法。一个卷积神经网络端到端从 $y$ 映射到 $\hat{x}$，先验隐式地编码在权重里。模型在大量自然图像 $(x, y)$ 配对上训练，学到的是"自然图像的分布在权重空间里的低维流形"。
 
-这一类的特点：**判别式（discriminative）**——给一个 $y$ 输出一个 $\hat{x}$。模型不显式建模 $p(x)$，但在大数据集上训练后，输出的 $\hat{x}$ 自然落在自然图像流形上。
+这一类的特点：**判别式（discriminative，意为给定输入直接输出最优答案）**——给一个 $y$ 输出一个 $\hat{x}$。模型不显式建模 $p(x)$，但在大数据集上训练后，输出的 $\hat{x}$ 自然落在自然图像流形上。
 
-代表：SRCNN、EDSR、RCAN、SwinIR、Restormer、NAFNet（第 6-7 章详讲）。
+代表：
+
+- **SRCNN**（2014，三层卷积）
+- **EDSR**（Enhanced Deep Super-Resolution，2017，去掉 BatchNorm 的深度残差网络）
+- **RCAN**（Residual Channel Attention Network，2018，把通道注意力引入 SR）
+- **SwinIR**（Swin Transformer for Image Restoration，2021，把窗口注意力 Transformer 引入低层视觉）
+- **Restormer**（2022，channel-wise self-attention 让分辨率不再瓶颈）
+- **NAFNet**（Non-linear Activation Free Network，2022，把非线性激活去掉换成门控乘法的极简结构）
+
+第 6-7 章对这些会逐一展开。
 
 ### 生成式先验（扩散模型）
 
-2020 年 DDPM 之后，生成模型本身就显式地建模了 $p(x)$。给定 $y$，可以做条件生成 $p(x | y)$，从这个条件分布里采样出 $\hat{x}$。
+2020 年 **DDPM**（Denoising Diffusion Probabilistic Model，去噪扩散概率模型）之后，生成模型本身就显式地建模了 $p(x)$。给定 $y$，可以做条件生成 $p(x | y)$，从这个条件分布里采样出 $\hat{x}$。
 
 这是**生成式（generative）**路线。和判别式的本质区别：
 
@@ -218,6 +258,35 @@ JPEG 是图像领域最常见的压缩。它的工作流程：
 
 白平衡漂移、颜色衰减、低光导致的色温偏移。这一类退化在数学上不是空间维度的问题，而是值域上的非线性变换。
 
+### 复合退化链的数据流图
+
+把上面这些组件串起来，从理想图像到用户手里那张烂图，整条链可以画成下面这张图。这张图也是后文每一章在心里要不断回放的"目标"：你做的模型，本质上就是在试图把这条链反着走回去。
+
+```mermaid
+graph LR
+    X[理想图像 x<br/>光子分布 / RAW] --> Blur[模糊<br/>defocus / motion / 衍射]
+    Blur --> Down[下采样<br/>bicubic / area / lanczos]
+    Down --> Color[颜色失真<br/>白平衡漂移 / tone shift]
+    Color --> Noise[加噪<br/>泊松 + 读出 + 暗电流]
+    Noise --> Quant[量化<br/>8bit / 10bit]
+    Quant --> JPEG[JPEG 压缩<br/>DCT 量化 + chroma 下采样]
+    JPEG --> Net[网络重压缩<br/>微信 / 微博 / Twitter]
+    Net --> Y[观测图像 y<br/>用户手机里那张]
+    Y -. 反问题 .-> Inv[模型 f_θ<br/>估计 x̂]
+    Inv -. 估计 .-> X
+
+    style X fill:#e8f5e9
+    style Y fill:#ffebee
+    style Inv fill:#fff3e0
+```
+
+这张图有几个工程结论需要明确：
+
+1. **链是有顺序的，但每一步顺序在真实世界里都可能换**——比如 JPEG 可能在颜色失真之前、之后甚至中间。真实情况是一团乱麻，而不是这张图里整齐的箭头链。
+2. **每一步都是随机的**——同样一张原图经过两次同型号相机，每次的具体输出都不同，因为噪声采样不同、压缩量化的截断不同。
+3. **越靠右的步骤越主导视觉上"烂"的感觉**——压缩和噪声直接影响 PSNR，模糊和下采样影响主观锐度。
+4. **模型 $f_\theta$ 不是简单地"倒过来走每一步"**——它学的是这条链整体的逆，不是分步还原。这是端到端方法在这个领域胜过分步方法的根本原因。
+
 ## 1.6 Blind vs non-blind：D 已知还是未知
 
 回到中心方程 $y = D(x) + n$。一个被普遍混在一起讲的问题：**$D$ 在推理时到底是已知还是未知**？这两种设定的工程含义截然不同，本书后面所有章节默认 blind 设定，但这里要先把范式框出来。
@@ -267,10 +336,10 @@ Blind 场景下你**没法精确知道 $D$**，只能做两件事：
 
 ### Blind IQA：评估侧的对应概念
 
-第 4 章会详谈，但这里先点一下。**评估指标也分 full-reference（FR）和 no-reference（NR）**：
+第 4 章会详谈，但这里先点一下。**评估指标也分 full-reference（FR，全参考）和 no-reference（NR，无参考）**：
 
-- **FR-IQA**：PSNR / SSIM / LPIPS / DISTS — 需要 HR 真值
-- **NR-IQA**（也叫 blind IQA）：NIQE / MANIQA / CLIP-IQA / Q-Align — 只看输出图
+- **FR-IQA**（Full-Reference Image Quality Assessment）：把模型输出与真值对比打分，代表指标 **PSNR**（Peak Signal-to-Noise Ratio，峰值信噪比）、**SSIM**（Structural Similarity，结构相似度）、**LPIPS**（Learned Perceptual Image Patch Similarity，用深度网络特征做感知距离）、**DISTS**（Deep Image Structure and Texture Similarity，把结构与纹理拆开评分）。需要 HR 真值。
+- **NR-IQA**（也叫 blind IQA）：只看输出图自身打分，代表指标 **NIQE**（Natural Image Quality Evaluator，基于自然图像统计的无参考指标）、**MANIQA**（Multi-dimension Attention Network for IQA）、**CLIP-IQA**（用 CLIP 文本-图像对齐空间做质量打分）、**Q-Align**（用大模型按 1-5 分给质量做对齐评分）。
 
 生产环境里**真值不存在**（用户传的烂图没有"对应的高清版"），所以**线上质量监控只能靠 NR-IQA**。这是 blind 范式从训练蔓延到评估的必然结果。
 
@@ -352,6 +421,19 @@ y = x + torch.randn_like(x) * sigma
 关键性质：**方差等于均值**。亮的地方光子多，绝对噪声大；暗的地方光子少，绝对噪声小。但**信噪比** SNR $= N / \sqrt{N} = \sqrt{N}$，亮的地方 SNR 更高。
 
 这就是为什么晚上拍的暗部噪点严重——光子少，相对噪声大。
+
+把这件事画成示意图：横轴是像素亮度（光子数），纵轴是该像素噪声标准差，泊松噪声给出的曲线是 $\sigma = \sqrt{N}$，呈平方根增长；高斯近似如果不分亮暗，就是一条水平直线。
+
+```mermaid
+graph LR
+    A[像素亮度 N<br/>光子数] -->|泊松采样| B[实际接收 ~Poisson N]
+    B --> C[绝对噪声 σ = √N<br/>亮处大暗处小]
+    C --> D[相对噪声 σ/N = 1/√N<br/>亮处小暗处大]
+    D --> E[暗部噪点严重<br/>训练时必须用<br/>signal-dependent 噪声]
+
+    style A fill:#e3f2fd
+    style E fill:#ffebee
+```
 
 ### 读出噪声（read noise）
 

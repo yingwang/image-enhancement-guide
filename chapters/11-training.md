@@ -4,18 +4,43 @@
 >
 > 这一章讲"把它们组装起来训练，怎么训得稳"。
 >
-> 增强模型的训练比分类/LLM 更脆弱——多损失冲突、GAN 动态、扩散调度，每一个都能让你训三天结果发现是个崩的模型。
+> 增强模型的训练比分类或语言模型更脆弱：多损失冲突、GAN 动态、扩散调度，每一个都能让你训三天之后发现是个崩的模型。
+
+## 11.0 阅读须知
+
+这一章站在前面所有章节之后的工程位置。第 1-2 章给出了问题定义，第 3 章给出了损失，第 4 章给出了指标，第 5 章给出了数据，第 6-10 章给出了模型与各种架构上的选择。把这些拼成一段能跑起来的训练代码并不难，难的是让它**连续训几天甚至几周不崩**，并且训完真的比上一版更好。这一章回答的就是这个"工程上跑得动"的问题。
+
+预设读者能写常规 PyTorch 训练循环（forward / backward / optimizer step / dataloader），但**不一定专门做过低层视觉训练**。低层视觉训练在四个方面和分类或语言模型显著不同，每一条都会在后面章节展开：
+
+- 输入与输出的尺寸成对：训的不是一个图像到一个标量，而是图像到图像
+- 损失函数几乎从来不是单一的，而是 3-5 项加权和，权重失衡会让模型只优化其中一项
+- 涉及 GAN 或扩散调度时，训练动力学是双方博弈或长时间步采样，比单一目标的优化困难一个数量级
+- 数据 pipeline 通常在 GPU 上做退化合成（见第 5 章），一个采样 bug 可以让模型"看上去在学，其实在学合成 bug"
+
+**首次出现的缩写。** 为方便后面章节直接引用，本章用到的缩写在此先列定义：
+
+- **AMP**（Automatic Mixed Precision，自动混合精度）：训练时把前向与反传放到 FP16/BF16，权重与梯度累积保持 FP32 的训练范式
+- **EMA**（Exponential Moving Average，指数移动平均）：在训练权重之外维护一份滑动平均权重，推理用 EMA 权重
+- **GradAccum**（Gradient Accumulation，梯度累积）：把几个 mini-batch 的梯度加起来再走一次 optimizer step，等价放大 batch size
+- **TTUR**（Two Time-scale Update Rule，双时间尺度更新规则）：GAN 训练里给判别器和生成器分配不同学习率
+- **R1**：对真实样本上判别器梯度做 L2 惩罚的 GAN 正则化
+- **FSDP**（Fully Sharded Data Parallel，完全分片数据并行）：把模型参数、梯度、优化器状态按 rank 分片的分布式训练范式
+- **BPTT**（Backpropagation Through Time，按时间反传）：循环结构的训练方式，把整段序列展开再反传
+- **OOM**（Out Of Memory）：GPU 显存超限崩溃
+- **PSNR / LPIPS / FID**：第 4 章已定义，本章直接使用
+
+读完这一章你应该能回答以下问题：给我一个新的低层视觉模型架构，我大概要怎么搭训练循环；训练中途出了某个症状，我从哪里开始查；GAN 训不动的时候有哪些标配技巧；扩散从零训和 finetune 应该用不同的超参吗；EMA 和 AMP 到底该不该开。
 
 ## 11.1 为什么训练稳定性是大问题
 
-LLM 训练的损失函数是单一 cross-entropy，训练动力学相对简单。增强模型完全不同：
+语言模型训练的损失函数通常是单一的 cross-entropy（交叉熵），训练动力学相对简单：模型规模上去、数据量上去、学习率合适，就能稳定下降。低层视觉的增强模型完全不同：
 
-- **多损失混合**：L1 + VGG + GAN + 任务特化，权重失衡就崩
-- **GAN 训练**：D 和 G 的动态平衡，一方过强就崩
-- **扩散训练**：时间步采样、loss weighting、EMA 缺一不可
-- **数据 pipeline 复杂**：退化合成在 GPU 上做，bug 容易隐藏
+- **多损失混合**：L1 + VGG + GAN + 任务特化损失共同优化，任意一项的权重失衡都会让模型偏向某一种"好"，结果是 PSNR 高但视觉糊、或者视觉锐利但 PSNR 崩
+- **GAN 训练**：判别器 D 和生成器 G 在动态博弈，一方过强就崩；这一点和图像生成里 GAN 的训练崩塌是同源的，区别只是增强里的 G 是有条件输入的
+- **扩散训练**：时间步采样策略、loss weighting（如 Min-SNR）、EMA 缺一不可，少任意一项都会拉低最终质量几个 FID 点
+- **数据 pipeline 复杂**：退化合成（第 5 章）一般在 GPU 上做，里面有十几个随机参数；任何一个分布写错都不会立刻表现为崩溃，而是表现为"模型在真实图上效果差"，等你发现的时候已经训了几天
 
-这一章把工程上的踩坑归纳成可执行的 checklist。
+这一章把工程上的踩坑归纳成可执行的清单。读这章的方式不是从头到尾通读，而是把它当 reference：搭训练时按 11.2 的骨架打底，调超参时翻 11.3-11.8，遇到症状时查 11.15 的诊断表。
 
 ## 11.2 训练 anatomy：基础组件
 
@@ -64,6 +89,37 @@ for step, batch in enumerate(train_loader):
         save_checkpoint(...)
 ```
 
+把这八步画成数据流图，能更清楚地看到每个组件之间的依赖关系。下面这张图也是后续每一节展开时心里的"全景图"：每节讲的就是某一步的细节决策。
+
+```mermaid
+flowchart TD
+    A[Data Loader<br/>HR patch sampling] --> B[Degradation Synth<br/>blur / down / noise / JPEG]
+    B --> C[Forward<br/>autocast bf16/fp16]
+    C --> D[Compute Loss<br/>L1 + VGG + GAN + ...]
+    D --> E[Backward<br/>scaler.scale().backward]
+    E --> F[Grad Clip<br/>max_norm 1.0]
+    F --> G[Optimizer Step<br/>AdamW + scaler]
+    G --> H[Scheduler Step<br/>warmup + cosine]
+    H --> I[EMA Update<br/>β = 0.999~0.9999]
+    I --> J{Log / Eval / Ckpt?}
+    J -->|每 N 步| K[Log Metrics]
+    J -->|每 M 步| L[Validate + Sample]
+    J -->|每 K 步| M[Save Checkpoint]
+    J -->|否| A
+    K --> A
+    L --> A
+    M --> A
+
+    style A fill:#e3f2fd
+    style B fill:#e3f2fd
+    style C fill:#fff3e0
+    style D fill:#fff3e0
+    style I fill:#e8f5e9
+    style M fill:#ffebee
+```
+
+读这张图有两个工程上反复出现的细节值得点出。第一，**退化合成（B）放在 GPU 上和 dataloader（A）放在 CPU 上是两种工程取舍**。CPU 合成简单、可以多进程并行，但 PCIe 带宽容易成为瓶颈；GPU 合成省传输、退化函数可微，但占模型训练的算力，需要小心安排显存。Real-ESRGAN 官方实现选了 GPU 合成。第二，**EMA 更新（I）必须放在 optimizer step 之后**，而且 EMA 权重不参与训练梯度，只在 validation 和保存 checkpoint 时被读到。
+
 下面逐项展开。
 
 ## 11.3 优化器选择
@@ -92,10 +148,14 @@ optimizer = torch.optim.AdamW(
 
 - **CNN（EDSR/NAFNet）**：$2 \times 10^{-4}$
 - **Transformer（SwinIR/Restormer）**：$2 \times 10^{-4}$，warmup 必须
-- **GAN finetune**：$10^{-4}$ 给 G，$10^{-4} \times 4 = 4 \times 10^{-4}$ 给 D（TTUR）
+- **GAN finetune**：$10^{-4}$ 给 G，$10^{-4} \times 4 = 4 \times 10^{-4}$ 给 D（TTUR，见 11.10 节）
 - **扩散从头训**：$10^{-4}$
 - **扩散 finetune**：$10^{-5}$ 到 $5 \times 10^{-6}$
 - **ControlNet 训练**：$10^{-5}$
+
+这一组数字不是凭空猜的，是大量 SOTA 论文与开源代码库收敛后的"共识值"。它们对应的隐含假设是 batch size 在 16-32 之间、训练步数在 200K-1M 之间、AdamW + cosine。换 batch 或换 schedule 时需要按 11.5 节的缩放规则调整。
+
+`betas=(0.9, 0.99)` 这一对值得多说一句。原生 Adam 默认的 $\beta_2 = 0.999$ 让二阶矩估计窗口非常长，对单峰目标（如分类）很合适；但低层视觉的损失曲面更崎岖（GAN 项、感知项一起作用），太长的窗口会让 Adam 的步长更新滞后于真实梯度，表现为训练后期出现莫名其妙的小尖峰。把 $\beta_2$ 降到 $0.99$ 让二阶矩响应快一点，是这个领域的经验做法。
 
 ## 11.4 学习率调度
 
@@ -166,21 +226,45 @@ scheduler = sched.CosineAnnealingWarmRestarts(
 
 ## 11.5 Batch Size 与 Patch Size
 
-低层视觉训练的特殊性：**几乎不用整张图训**，用 patch。
+低层视觉训练的特殊性：**几乎不用整张图训**，用 patch（图像切片）。这一节展开 patch 训练的几个工程概念。
 
-### Patch-based 训练的标准
+### Patch sampling 的基本流程
 
-- 从 HR 随机裁剪 patch（典型 $256 \times 256$ 或 $128 \times 128$）
-- 经过退化合成得到对应 LR patch
-- 训练 batch 是 patch batch
+- 从原始 HR（高分辨率）图中随机选一个位置，裁出一块固定大小的 patch（典型 $256 \times 256$ 或 $128 \times 128$）
+- 用第 5 章的退化合成 pipeline 把这块 HR patch 变成对应 LR patch
+- 多个这样的 patch 凑成一个 batch 喂给模型
 
-为什么不直接训整张图：
+写成代码大致是：
 
-- 内存：整张 $2048 \times 2048$ 一个 batch 都装不下
-- 数据增强：裁剪本身是隐式的数据增强
-- 训练效率：相同 GPU 时间，patch 训练能见到更多多样性
+```python
+class PatchSampler:
+    def __init__(self, hr_size: int = 256, scale: int = 4):
+        self.hr_size = hr_size
+        self.lr_size = hr_size // scale
 
-### Patch size 选择
+    def __call__(self, hr_image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        H, W = hr_image.shape[-2:]
+        # 随机左上角
+        top  = random.randint(0, H - self.hr_size)
+        left = random.randint(0, W - self.hr_size)
+        hr_patch = hr_image[..., top:top+self.hr_size, left:left+self.hr_size]
+        # 退化合成在这里调用
+        lr_patch = self.degrade(hr_patch)
+        return lr_patch, hr_patch
+```
+
+### 为什么不直接训整张图
+
+主要原因是显存和效率：
+
+- **内存**：整张 $2048 \times 2048$ 三通道 FP32 是 50MB，乘以 batch 和模型中间激活之后，单卡装不下
+- **数据增强**：裁剪本身是隐式的数据增强，每个 epoch 都能"看到"图像的不同部位
+- **训练效率**：相同 GPU 时间下，patch 训练能见到更多场景多样性
+- **batch 内尺寸一致**：原始图大小不一，patch 化让 batch 维度能堆起来
+
+### Patch size 与感受野的耦合
+
+Patch size 不是越大越好，它有一个**与模型感受野的天然耦合**关系。如果模型的有效感受野是 $R \times R$，patch size 应该至少 $\geq R$，否则模型在 patch 边缘附近的判断信息不足，训练时就拿不到那部分梯度。常见做法是按下表估算：
 
 | 任务 | 推荐 HR patch size | 原因 |
 |------|-----------------|------|
@@ -188,22 +272,47 @@ scheduler = sched.CosineAnnealingWarmRestarts(
 | 8× SR | 384 | LR=48, 需要更多空间上下文 |
 | 去噪 | 128-192 | 局部纹理够用 |
 | 去模糊 | 256-384 | 模糊核大需要大 patch |
-| 扩散 | 512 | 与预训练 SD 一致 |
+| 扩散 | 512 | 与预训练 Stable Diffusion 一致 |
 
-### Effective batch size
+对去模糊任务感受野的要求最直观：如果模糊核半径是 30 像素，patch 至少要 60 以上才能把核的"两端"都包住，否则模型学到的是不完整的反卷积。SwinIR 这种带窗口注意力的模型，窗口尺寸（比如 8）也限制了 patch 的最小有效尺寸。
+
+### Effective batch size 与 gradient accumulation
+
+实际训练里"等效 batch size"由几个量相乘得到：
 
 ```
 effective_batch_size = num_patches_per_image × image_batch × gradient_accumulation × num_gpus
 ```
 
+其中 **GradAccum**（Gradient Accumulation，梯度累积）是一种用时间换显存的技巧：连续做 $N$ 次 forward / backward 但不立刻 optimizer step，把梯度累加在一起，第 $N$ 次后再走 step + zero_grad。效果等价于把 batch size 放大 $N$ 倍，但峰值显存只比单步多一点。
+
+```python
+accum_steps = 4   # 等效 batch 放大 4 倍
+
+for step, batch in enumerate(loader):
+    with torch.cuda.amp.autocast():
+        loss = compute_loss(model, batch) / accum_steps   # 关键: 损失要除以 accum
+
+    scaler.scale(loss).backward()
+
+    if (step + 1) % accum_steps == 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+```
+
+注意两件事：损失要除以 `accum_steps`，否则等价于把 LR 放大了 $N$ 倍；梯度裁剪要放在最后一次 backward 之后、step 之前，因为只有那时累计梯度才是完整的。
+
 常见配置：
 
 - 单卡 A100，CNN SR：8 张图 × 1 patch × 1 = 8
-- 4× A100，扩散：16 张图 × 1 patch × 2 GA × 4 GPU = 128
+- 4× A100，扩散：16 张图 × 1 patch × 2 GradAccum × 4 GPU = 128
 
 ### 大 batch 的 LR 缩放
 
-经验法则：batch size × 2，LR × √2。但低层视觉对 LR 敏感，建议**实测**而不是盲目缩放。
+经验法则：batch size × 2，LR × √2（square-root rule）；或线性 rule：batch × 2，LR × 2。低层视觉对学习率敏感，建议**实测**而不是盲目缩放：取一个 baseline 配置训 5K 步，看 PSNR 曲线斜率，再决定要不要按缩放公式上 LR。
 
 ## 11.6 Gradient Clipping
 
@@ -225,7 +334,9 @@ torch.nn.utils.clip_grad_norm_(
 
 ## 11.7 EMA：扩散和高质量 GAN 必备
 
-EMA（Exponential Moving Average）维护一份模型权重的指数移动平均：
+**EMA**（Exponential Moving Average，指数移动平均）维护一份模型权重的指数移动平均。直觉上理解：训练权重每步都被梯度推一点，方向会抖；EMA 权重是这些抖动权重的一个低通滤波结果，更稳定，往往也更"靠近"真正的最优区域中心。
+
+数学定义：
 
 $$
 \theta_{\text{EMA}}^{(t)} = \beta \cdot \theta_{\text{EMA}}^{(t-1)} + (1-\beta) \cdot \theta^{(t)}
@@ -261,11 +372,19 @@ EMA decay 经验值：
 - GAN：0.999（推理用 EMA 输出更稳）
 - 扩散：**0.9999** 或 **0.99995**（必须，论文标准）
 
-EMA 在扩散训练里尤其重要——纯训练权重的 FID 通常比 EMA 权重的 FID 差几个点。
+EMA 在扩散训练里尤其重要。纯训练权重的 FID（Fréchet Inception Distance，用 Inception 特征统计衡量生成质量）通常比 EMA 权重的 FID 差几个点。直观理解：扩散训练里每一步是对某个随机时间步的噪声预测做梯度更新，方向极其抖；EMA 把这些方向平滑掉，得到一个对全部时间步都"中庸"的权重。
+
+decay 大小的含义可以这样估算：EMA 权重的"等效记忆长度"约为 $1 / (1 - \beta)$ 步。$\beta = 0.999$ 等效 1000 步，$\beta = 0.9999$ 等效 1 万步。这就解释了为什么扩散要用 0.9999 甚至 0.99995：扩散训练通常要几十万到几百万步，等效记忆几千步才能滤掉早期的过渡阶段。
+
+工程细节：
+
+- EMA 权重要单独保存，不能覆盖训练权重（中途崩了要 resume 是从训练权重 resume，不是 EMA）
+- BatchNorm 的 running_mean / running_var 要不要也 EMA？严格说要，但实操里很多实现忽略；想严格的话见 `timm` 库里的 `ModelEmaV2`
+- 评估时切到 EMA 权重，下一步训练再切回训练权重
 
 ## 11.8 Mixed Precision (AMP)
 
-用 FP16/BF16 计算，FP32 累积。能节省显存 + 加速 ~1.5-2×。
+**AMP**（Automatic Mixed Precision，自动混合精度）的核心思想是把前向与反传放到低精度（FP16 或 BF16）以节省显存与加速计算，把权重存储与梯度累积保持 FP32 以维持数值稳定。能节省显存约 40-50%，并在 Volta 之后的 NVIDIA GPU 上获得 1.5-2× 的吞吐提升。
 
 ```python
 scaler = torch.cuda.amp.GradScaler()
@@ -292,7 +411,7 @@ for batch in loader:
 | 硬件 | V100, A100, H100 | A100, H100 |
 | 推荐 | 老硬件 | **A100 及以后默认** |
 
-低层视觉里 BF16 几乎总是更好的选择——数值稳定性强，不需要 GradScaler。
+低层视觉里 BF16 几乎总是更好的选择，数值稳定性强、不需要 GradScaler。原理上 BF16 与 FP32 共享相同的指数位宽（8 bit），所以不会像 FP16 那样在累积或除法时溢出；代价是尾数只剩 7 bit，最末几位的小数精度比 FP16 差一截。对低层视觉来说，损失函数的数值范围动辄跨几个数量级（GAN 项与像素项加在一起），FP16 频繁溢出反而比 BF16 的小数精度损失更致命。
 
 ### 哪些层不能用低精度
 
@@ -402,7 +521,9 @@ d_loss = d_loss_main + 10.0 * r1_penalty(d_real, real_imgs)
 
 R1 让 D 在真实数据附近不要太陡，减少 D 过强问题。
 
-### TTUR
+### TTUR：两个学习率的赛跑
+
+**TTUR**（Two Time-scale Update Rule，双时间尺度更新规则）由 Heusel et al. 2017 提出。直觉：GAN 训练里 G 与 D 是动态博弈，理论上需要 D 在每一步都"接近最优判别器"才能给 G 提供有意义的梯度方向；但 D 训太快会过早把 G 锁死。TTUR 给 D 更大的学习率，让它在每一步内多走一点，相当于"D 在快时间尺度上跟随 G，G 在慢时间尺度上优化"。
 
 D 用比 G 更大的学习率（典型 4×）：
 
@@ -410,6 +531,8 @@ D 用比 G 更大的学习率（典型 4×）：
 opt_g = AdamW(g.parameters(), lr=1e-4)
 opt_d = AdamW(d.parameters(), lr=4e-4)   # 4× lr
 ```
+
+这一条配上 SpectralNorm + R1 是当代 GAN 训练的"三件套"，三个一起用基本上能避免常见的崩塌模式。
 
 ## 11.11 两阶段训练（强烈推荐）
 
@@ -444,6 +567,33 @@ g_loss = l1_loss + 1.0 * vgg_loss + 0.05 * adv_loss
 - 损失加权不容易调到合适
 
 ESRGAN、Real-ESRGAN、BSRGAN 等都用两阶段策略。**这是事实标准**，不要尝试创新省一阶段。
+
+把整个 GAN 训练过程的损失权重随时间的变化画出来，能更清楚地理解 loss balancing 这件事：
+
+```mermaid
+graph TD
+    subgraph Stage1[阶段 1: Pretrain G 共 200K~500K 步]
+        S1L[loss = 1.0 * L1 + 1.0 * VGG]
+        S1Note[目标: PSNR / LPIPS 收敛<br/>不引入 GAN]
+    end
+
+    subgraph Stage2[阶段 2: GAN finetune 共 100K~200K 步]
+        S2L[loss = 1.0 * L1 + 1.0 * VGG + 0.05 * Adv + 10.0 * R1]
+        S2D[D: SpectralNorm + TTUR lr_d = 4 * lr_g]
+        S2Note[目标: 在不损失结构忠诚的前提下加细节]
+    end
+
+    Init[随机初始化 G] --> Stage1
+    Stage1 --> Load[加载 Pretrain checkpoint<br/>LR 降到 1/2]
+    Load --> Stage2
+    Stage2 --> Final[发布权重]
+
+    style Stage1 fill:#e3f2fd
+    style Stage2 fill:#fff3e0
+    style Final fill:#e8f5e9
+```
+
+这张图里有几个工程经验值得记住。**先用大权重的像素项把 G 训到能"接近"GT 的位置**，再让 GAN 项小幅度推它去补细节。如果一上来就把 adv 权重设到 1.0，G 还没学到基本恢复，就被 D 拉去模仿"看起来像真图"的高频纹理，结果是输出非常锐利但和 GT 完全不对应。**R1 系数 10.0 与 adv 系数 0.05 的比例**是 Karras et al. 在 StyleGAN2 里给的经验值，低层视觉直接沿用即可。
 
 ## 11.12 扩散训练的特殊性
 
@@ -630,6 +780,49 @@ log_image_grid(sample_outputs, step=step)
 | GAN 输出鬼东西 | G 没 pretrain | 先 pretrain G |
 | 训练 1 epoch 极慢 | 数据加载瓶颈 | 增 num_workers，用 LMDB |
 
+## 11.15.5 Loss balancing 调度
+
+第 3 章详细讨论过几种损失的来源与含义；这一节讲训练阶段如何让它们的权重在时间维度上协同。一个常见反模式是在整段训练里用同一组权重，但不同阶段对各项损失的需求是不同的：
+
+- 训练早期：模型还在学"输出的颜色与尺寸要对"，像素项权重应该大、感知项可以小
+- 训练中期：基本结构已经稳定，感知项与 GAN 项可以加大，去补结构外的纹理
+- 训练后期：换 EMA 权重做评估，损失权重保持稳定让模型微调
+
+把这个调度画成图：
+
+```mermaid
+graph LR
+    subgraph T1[早期 0~30%]
+        T1L[w_l1 = 1.0<br/>w_vgg = 0.1<br/>w_adv = 0]
+    end
+    subgraph T2[中期 30%~80%]
+        T2L[w_l1 = 1.0<br/>w_vgg = 1.0<br/>w_adv = 0.05]
+    end
+    subgraph T3[后期 80%~100%]
+        T3L[w_l1 = 1.0<br/>w_vgg = 1.0<br/>w_adv = 0.05<br/>LR cosine decay]
+    end
+
+    T1 -->|warmup vgg, 加 GAN| T2
+    T2 -->|降 LR, 不改权重| T3
+
+    style T1 fill:#e3f2fd
+    style T2 fill:#fff3e0
+    style T3 fill:#e8f5e9
+```
+
+实现上有两种写法。简单写法是按 step 分段：
+
+```python
+def get_loss_weights(step: int, total: int) -> dict:
+    if step < total * 0.3:
+        return {'l1': 1.0, 'vgg': 0.1, 'adv': 0.0}
+    if step < total * 0.8:
+        return {'l1': 1.0, 'vgg': 1.0, 'adv': 0.05}
+    return {'l1': 1.0, 'vgg': 1.0, 'adv': 0.05}
+```
+
+复杂写法是用线性插值在 segment 之间平滑过渡，避免权重突变时损失曲线出现"台阶"。两阶段 GAN 训练（11.11 节）就是这一思想的一种极端形式：先把 adv 权重设 0 训到收敛，再切到 0.05。
+
 ## 11.16 Checkpoint 与恢复
 
 ### 保存什么
@@ -706,6 +899,36 @@ def auto_resume(ckpt_dir, model, optimizer, scheduler, ema, scaler):
 - 先在 $128 \times 128$ patch 上证明思路
 - 再上 $256 \times 256$
 - 最后才上完整训练
+
+## 11.17.5 一段端到端的训练日志解读
+
+把上面所有概念串起来，看一段典型 SR + GAN 训练日志应该是什么样：
+
+```
+[Stage 1: Pretrain G]
+step 1000   | l1 0.0421 | vgg 0.7823 | psnr 24.31 | lr 2.0e-4 | grad 2.31
+step 10000  | l1 0.0287 | vgg 0.6102 | psnr 27.84 | lr 2.0e-4 | grad 1.84
+step 50000  | l1 0.0203 | vgg 0.4891 | psnr 29.12 | lr 1.8e-4 | grad 1.42
+step 200000 | l1 0.0156 | vgg 0.3941 | psnr 30.08 | lr 1.2e-4 | grad 1.08
+[switch to Stage 2: GAN finetune, lr_g=1e-4, lr_d=4e-4]
+step 200100 | l1 0.0158 | vgg 0.3935 | adv 0.6932 | d 1.3867 | grad_g 1.21 | grad_d 0.89
+step 210000 | l1 0.0162 | vgg 0.3811 | adv 0.5421 | d 1.0982 | grad_g 1.35 | grad_d 1.12
+step 250000 | l1 0.0171 | vgg 0.3654 | adv 0.4823 | d 0.9712 | grad_g 1.41 | grad_d 1.08
+step 300000 | l1 0.0179 | vgg 0.3589 | adv 0.4521 | d 0.9234 | grad_g 1.38 | grad_d 1.05
+```
+
+健康的几个迹象：
+
+- Stage 1 的 l1 与 vgg 都在单调下降，PSNR 单调上升
+- 切到 Stage 2 后 l1 略微回升（约 10%）但 vgg 继续下降，意味着模型从"像素接近"转向"特征接近"
+- adv loss 在 0.4-0.7 之间震荡而不是单调下降到 0，d loss 在 ln(2) ≈ 0.69 附近不极端漂移，说明 G 与 D 在动态平衡
+- 梯度 norm 始终 < 2，没有出现 spike
+
+不健康的几个迹象：
+
+- d loss 突然降到 < 0.05 并不再回升，说明 D 已经"碾压" G（症状 2，需要降 lr_d 或加 R1）
+- adv loss 突然飙到 > 5 或 NaN，说明 G 输出已经被 D 推到失常区域，要重启
+- l1 在 Stage 2 飙升 50% 以上，说明 adv 权重过大，要把 0.05 降到 0.01
 
 ## 11.18 小结
 

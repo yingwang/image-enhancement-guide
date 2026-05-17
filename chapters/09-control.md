@@ -6,6 +6,36 @@
 >
 > 这一章是过去三年这个领域最活跃的工程战场。
 
+## 9.0 阅读须知
+
+这一章紧接着第 8 章。第 8 章把扩散模型的"生成器"部分讲清楚了：给定一个潜空间噪声 $x_T$，UNet + 采样器能采出一张符合自然图像分布的 $\hat{x}_0$。但这只是"无条件生成"——结果可以是任何图。增强任务要做的是**条件生成**：给定退化图 $y$，从 $p(x \mid y)$ 里采样出与 $y$ 内容一致、质量更高的 $\hat{x}$。本章讲怎么把 $y$ 这个条件接进扩散过程，以及不同接法在 fidelity（保真）和 creativity（生成自由度）之间如何取舍。
+
+读这一章前，假设你已经熟悉第 8 章的：
+
+- 前向加噪与反向去噪、$\bar{\alpha}_t$、$\epsilon$-prediction
+- DDIM / DPM-Solver 等采样器
+- LDM 的潜空间结构、SD UNet 的 ResBlock + Spatial Transformer
+- CFG 在推理时的两路前向
+
+本章会反复出现的缩写：
+
+- **SDEdit**（Stochastic Differential Editing，Meng et al. 2022）：把 $y$ 加噪到中间时间步，再用无条件扩散反向去噪，得到"被引导的随机样本"。最便宜的条件方案，零额外训练
+- **SR3**（Super-Resolution via Repeated Refinement，Saharia et al. 2022）：早期用 input concat 把 LR 接入扩散 UNet 的代表
+- **StableSR**（Wang et al. 2023）：基于 SD 的真实场景超分，引入 CFW、time-aware 条件
+- **DiffBIR**（Lin et al. 2023）：Blind Image Restoration with Diffusion，CLIP image cross-attention + ControlNet
+- **SUPIR**（Yu et al. 2024）：SDXL + ControlNet + LLaVA prompt，2024 年 real-world SR 的代表
+- **ControlNet**（Zhang & Agrawala 2023）：复制 UNet encoder + zero conv，扩散条件控制的事实标准
+- **T2I-Adapter**（Mou et al. 2023）：比 ControlNet 更轻量的条件适配器
+- **IP-Adapter**（Image Prompt Adapter，Ye et al. 2023）：把图像作为 prompt 注入扩散，解耦 cross-attention
+- **PnP / Plug-and-Play**（Tumanyan et al. 2023）：训练自由的扩散控制方法，靠 inversion + 特征注入做编辑
+- **null-text inversion**（Mokady et al. 2023）：DDIM inversion 的精度增强，常用于编辑任务
+- **CFW**（Controllable Feature Warping）：StableSR 提出的推理时可调融合
+- **ZeroSFT**（Zero Spatial Feature Transform）：SUPIR 用的特征调制变体
+- **LoRA**（Low-Rank Adaptation）：低秩微调，常和 ControlNet 一起出现
+- **LCM**（Latent Consistency Model）：第 8 章介绍过的 4 步采样蒸馏方法
+
+本章默认所有"扩散模型"指 SD / SDXL 这一支基于 LDM 的实现，不展开像素扩散（GLIDE 系等）的细节，因为生产端几乎全在潜空间。
+
 ## 9.1 核心问题：fidelity vs creativity
 
 第 8 章末尾讲过扩散的"无中生有"能力——这是它的优势，也是它的危险。
@@ -30,13 +60,59 @@
 
 | 范式 | 注入位置 | 代表方法 | 训练成本 | 控制强度 |
 |------|---------|---------|---------|---------|
-| **Input Concat** | UNet 输入通道 | StableSR v1 | 低（改输入） | 中 |
+| **Input Concat** | UNet 输入通道 | SR3、StableSR v1 | 低（改输入） | 中 |
 | **Cross-Attention** | UNet 内部 attention | DiffBIR | 中（训 cross-attn） | 弱（语义级） |
 | **ControlNet** | UNet 中间层加和 | StableSR v2、SUPIR | 高（复制 encoder） | 强 |
-| **IP-Adapter** | 解耦 cross-attention | 风格保持 | 中 | 中 |
+| **IP-Adapter** | 解耦 cross-attention | 风格/身份保持 | 中 | 中 |
 | **Tile + ControlNet** | 局部条件 | 大图增强 | （推理 trick） | 强 |
 
-**没有哪个范式全胜**——选哪个看任务和预算。
+除此之外还有两类**训练自由**的方法，靠在采样过程动手脚而不重训权重：
+
+- **SDEdit**：把 $y$ 加噪到 $t^* \ll T$ 然后无条件采样回 0，相当于"用扩散先验对 $y$ 做一次随机重塑"
+- **PnP / null-text inversion / classifier guidance**：通过 inversion 拿到 $y$ 对应的 $x_T$，然后在反向过程中注入额外约束
+
+这些训练自由方法在生产里偶有用处（特别是没数据训 ControlNet 的时候）。SDEdit 因为足够典型也足够便宜，下面单独画一张数据流图，让读者先建立"训练自由"这条线的直觉：
+
+```mermaid
+graph LR
+    Y[退化图 y<br/>或粗略草图] --> VAE1[VAE encode<br/>转到 latent]
+    VAE1 --> Z0[z_0 latent]
+    Z0 --> Add[+ 高斯噪声 加到 t*<br/>t* in 100, 600 中选]
+    Add --> ZT[z_t*<br/>带噪 latent]
+    ZT --> Loop{反向采样<br/>无条件 UNet<br/>t = t*, t*-1, ..., 1}
+    Loop --> Z0p[ẑ_0]
+    Z0p --> VAE2[VAE decode]
+    VAE2 --> Xhat[x̂<br/>结构来自 y<br/>细节由扩散先验补]
+
+    style Y fill:#ffebee
+    style Xhat fill:#e8f5e9
+    style Loop fill:#fff3e0
+```
+
+SDEdit 的关键参数是中间时间步 $t^*$：$t^*$ 越大噪声加得越狠，模型自由度越高（生成端走更远，可能改变内容）；$t^*$ 越小越保留输入结构（接近恒等映射）。这两个极端正是后面 9.3 节 fidelity-creativity 谱的两端，只不过 SDEdit 通过一个数值就能滑动。
+
+**没有哪个范式全胜**——选哪个看任务和预算。下面这张图把五种范式的注入位置画在同一张 UNet 上，便于对比：
+
+```mermaid
+graph LR
+    LR[退化图 y] -.-> Concat[输入通道 concat]
+    LR -.-> CrossAttn[cross-attn 输入<br/>CLIP image encoder]
+    LR -.-> ControlNet[ControlNet<br/>复制 encoder + zero conv]
+    LR -.-> IPAdapter[IP-Adapter<br/>解耦 cross-attn]
+    Concat --> UNetIn[UNet 输入层<br/>conv_in]
+    UNetIn --> UNetEnc[UNet encoder]
+    CrossAttn --> UNetEnc
+    ControlNet --> UNetMid[加到 skip / mid]
+    UNetEnc --> UNetMid
+    IPAdapter --> UNetMid
+    UNetMid --> UNetDec[UNet decoder]
+    UNetDec --> Out[ε̂ / v̂]
+
+    style ControlNet fill:#fff3e0
+    style Out fill:#e8f5e9
+```
+
+可以看到，不同范式作用点不同：concat 在最浅层、cross-attention 与 IP-Adapter 在每一层 attention 块、ControlNet 在 encoder 的所有 skip 上。一般来说**注入位置越深越广，控制越强但训练成本越高**。
 
 ## 9.3 Fidelity vs Creativity 的工程含义
 
@@ -178,6 +254,45 @@ LR ──→ Encoder copy ──→ Mid block copy
               
 Output (B, 4, h, w) noise prediction
 ```
+
+把这个 ASCII 图换成 mermaid 数据流，看得更清楚：主 UNet 是冻结的 SD 权重，左下角的 trainable copy 只在 encoder + mid 上有梯度，输出经过 zero conv 加到主 UNet 的 skip 上。
+
+```mermaid
+graph LR
+    XT[x_t<br/>noisy latent<br/>B,4,h,w] --> MainEnc
+    XT --> CnetIn[ControlNet 输入<br/>x_t || lr_latent<br/>B,8,h,w]
+    LR[LR / 条件图] --> Pre[cond pre-process<br/>RGB → latent 大小] --> CnetIn
+    T[t, context] --> MainEnc
+    T --> CnetEnc
+
+    subgraph Main[主 UNet · frozen · 预训练 SD]
+        MainEnc[Encoder<br/>多层 ResBlock + Spatial Transformer] --> MainMid[Mid Block]
+        MainMid --> MainDec[Decoder<br/>逐层 upsample + skip concat]
+        MainDec --> EpsOut[ε̂ / v̂<br/>B,4,h,w]
+    end
+
+    subgraph Cnet[ControlNet · trainable · encoder + mid 复制]
+        CnetIn --> CnetEnc[Encoder copy<br/>初始权重 = 主 UNet]
+        CnetEnc --> CnetMid[Mid block copy]
+    end
+
+    CnetEnc -.->|每层| Z1[Zero Conv × N<br/>初始权重 0]
+    CnetMid -.-> Zm[Zero Conv mid]
+    Z1 --> SkipAdd[加到主 UNet 对应 skip]
+    Zm --> SkipAdd
+    SkipAdd --> MainDec
+
+    style Main fill:#e3f2fd
+    style Cnet fill:#fff3e0
+    style EpsOut fill:#e8f5e9
+```
+
+几个细节值得在图里反复看：
+
+- 主 UNet 全部前向都跑（红色虚线没标但永远是必走的路径），所以 ControlNet 的"训练成本低"指的是反向梯度只走 trainable copy，前向显存仍要装下主 UNet
+- ControlNet 的输入是 $x_t$ 和 LR latent 的 concat（与第 9.4 节的"input concat"路线重叠），区别在 concat 走的是一份独立的 encoder 复制，而不是替换主 UNet 第一层
+- zero conv 把每层 ControlNet 输出收敛回 0，让训练初期主 UNet 行为不变；这一点和 LoRA 把适配器初始化为 0 矩阵是同一思想
+- ControlNet 输出加到主 UNet 的 **skip connection** 上（不是替换、不是 cross-attention），所以主 UNet 拿到的是"自己的 skip 特征 + 一点条件偏移"，对预训练知识破坏最小
 
 ### Zero Convolution —— 核心 trick
 
@@ -349,6 +464,70 @@ def forward_with_controlnet(unet, controlnet, x_t, lr_img, t, context):
 要 (LR, HR) 配对（HR 用来做 noisy latent 加噪 target，LR 是 ControlNet 输入）。
 
 数据规模：ControlNet 论文用了几十万到几百万张图。增强任务的 ControlNet 通常用第 5 章的合成 pipeline 生成训练数据。
+
+## 9.6b 范式四：IP-Adapter —— 解耦的图像 prompt
+
+IP-Adapter (Ye et al. 2023) 解决一个 ControlNet 不太好做的问题：**用一张参考图当作"风格 / 身份 prompt"**，不直接控制每个像素的结构，而是控制"这张生成的图整体看起来像参考图"。
+
+放到增强语境下：
+
+- 给定 LR + 一张同人的高清照（reference），让生成的 HR 在身份上贴近 reference
+- 给定 LR + 一张目标光照的样图，让 HR 复刻样图的色调
+- 给定 LR + 一张目标纹理的高清 patch，让 HR 学习这种纹理
+
+IP-Adapter 的设计思想可以一句话概括：
+
+> 不要让图像 prompt 抢 text prompt 的 cross-attention，**单独给图像 prompt 开一个 cross-attention 通道**，与原 text cross-attention 相加。
+
+这就是"解耦 cross-attention"。原 SD UNet 的 attention 是 $\text{Attn}(Q, K_t, V_t)$，其中 $K_t, V_t$ 来自 text encoder。IP-Adapter 增加一个并行项：
+
+$$
+\text{Output} = \text{Attn}(Q, K_t, V_t) + \lambda \cdot \text{Attn}(Q, K_i, V_i)
+$$
+
+$K_i, V_i$ 来自图像 encoder（CLIP image）经过一个新的投影层。$\lambda$ 是用户可调的"图像 prompt 强度"。
+
+这种解耦相对"直接把 image token 拼到 text token 后面"的好处：
+
+1. **保留原 text 通道的训练分布**：原 cross-attention 见的是 text token，强行混入图像 token 会让分布漂移；解耦让 text 通道完全不变
+2. **图像和文字可以独立调强度**：text 部分仍按 CFG 控制，图像部分用 $\lambda$ 控制，互不干扰
+3. **只需训新增的图像 cross-attention 层**，原 UNet 不动，新增参数极少（< 100M）
+
+代码骨架：
+
+```python
+class IPAdapterCrossAttn(nn.Module):
+    """IP-Adapter: 解耦的图像 cross-attention。
+    与原 text cross-attention 并行, 输出相加。
+    """
+
+    def __init__(self, dim: int, num_heads: int, image_dim: int = 1024):
+        super().__init__()
+        # 复用原 cross-attention 的 Q (来自 latent)
+        # 新增图像分支的 K, V projection
+        self.to_k_img = nn.Linear(image_dim, dim, bias=False)
+        self.to_v_img = nn.Linear(image_dim, dim, bias=False)
+        self.num_heads = num_heads
+        nn.init.zeros_(self.to_k_img.weight)
+        nn.init.zeros_(self.to_v_img.weight)        # 0 初始化, 训练初期无影响
+
+    def forward(self, q, text_kv, image_tokens, scale: float = 1.0):
+        # text_kv 走原 cross-attention (省略, 主 UNet 内置)
+        text_out = original_cross_attn(q, text_kv)
+
+        # 图像分支
+        k_img = self.to_k_img(image_tokens)
+        v_img = self.to_v_img(image_tokens)
+        image_out = scaled_dot_product_attention(q, k_img, v_img, num_heads=self.num_heads)
+
+        return text_out + scale * image_out
+```
+
+在增强任务里 IP-Adapter 常与 ControlNet 一起用：ControlNet 管"结构对齐 LR"，IP-Adapter 管"风格/身份对齐 reference"。SUPIR 用 LLaVA prompt 取代了 IP-Adapter 的图像 prompt 角色，是另一种解法。
+
+### 与第 10 章 RefSR 的关系
+
+IP-Adapter 在工程上和第 10 章的 RefSR 极为接近：都是"LR + Ref → HR"的多输入扩散增强。区别是 RefSR 的 cross-attention 通常做 patch-level matching（Ref 的局部纹理 → 主图的对应区域），IP-Adapter 把 Ref 全局编成一个 token 序列，控制偏向全局风格 / 身份。生产里这两种思路常常同时存在，并不互斥。
 
 ## 9.7 SUPIR（2024）—— 当前 SR SOTA 的设计
 
