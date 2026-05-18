@@ -6,6 +6,36 @@
 >
 > This chapter is the most active engineering battleground of this field over the past three years.
 
+## 9.0 Reading guide
+
+This chapter follows directly from Chapter 8. Chapter 8 settled the "generator" part of diffusion models: given a latent noise $x_T$, UNet + sampler can produce an $\hat{x}_0$ that lies on the natural-image distribution. But this is only "unconditional generation" — the result can be any image. Enhancement tasks need **conditional generation**: given a degraded image $y$, sample from $p(x \mid y)$ an $\hat{x}$ that is content-consistent with $y$ and of higher quality. This chapter discusses how to plug the condition $y$ into the diffusion process, and how different ways of plugging it in trade off fidelity (faithfulness) against creativity (generative freedom).
+
+Before reading this chapter, you are assumed to be familiar with the following from Chapter 8:
+
+- Forward noising and reverse denoising, $\bar{\alpha}_t$, $\epsilon$-prediction
+- Samplers such as DDIM / DPM-Solver
+- The latent-space structure of LDM, the ResBlock + Spatial Transformer in SD's UNet
+- The two-pass forward of CFG at inference
+
+Abbreviations that recur in this chapter:
+
+- **SDEdit** (Stochastic Differential Editing, Meng et al. 2022): add noise to $y$ up to an intermediate time step, then run unconditional reverse diffusion to get a "guided random sample". The cheapest condition scheme, with zero additional training
+- **SR3** (Super-Resolution via Repeated Refinement, Saharia et al. 2022): an early representative of using input concat to feed LR into a diffusion UNet
+- **StableSR** (Wang et al. 2023): SD-based real-world SR, introducing CFW and a time-aware condition
+- **DiffBIR** (Lin et al. 2023): Blind Image Restoration with Diffusion, using CLIP image cross-attention + ControlNet
+- **SUPIR** (Yu et al. 2024): SDXL + ControlNet + LLaVA prompt, the 2024 representative for real-world SR
+- **ControlNet** (Zhang & Agrawala 2023): copy the UNet encoder + zero conv; the de facto standard for diffusion condition control
+- **T2I-Adapter** (Mou et al. 2023): a lighter-weight condition adapter than ControlNet
+- **IP-Adapter** (Image Prompt Adapter, Ye et al. 2023): injects an image as a prompt into diffusion via decoupled cross-attention
+- **PnP / Plug-and-Play** (Tumanyan et al. 2023): a training-free diffusion control method that does editing via inversion + feature injection
+- **null-text inversion** (Mokady et al. 2023): a precision enhancement of DDIM inversion, common in editing tasks
+- **CFW** (Controllable Feature Warping): the inference-time tunable fusion proposed by StableSR
+- **ZeroSFT** (Zero Spatial Feature Transform): the feature-modulation variant used by SUPIR
+- **LoRA** (Low-Rank Adaptation): low-rank fine-tuning, often paired with ControlNet
+- **LCM** (Latent Consistency Model): the 4-step distillation method introduced in Chapter 8
+
+This chapter implicitly takes all "diffusion models" to mean SD / SDXL — the LDM line — and does not expand on pixel-space diffusion (the GLIDE family), because production-side work is almost entirely in latent space.
+
 ## 9.1 The core problem: fidelity vs creativity
 
 Chapter 8 ended with diffusion's "creating something from nothing" capability — this is its strength as well as its danger.
@@ -30,13 +60,59 @@ Overview:
 
 | Paradigm | Injection point | Representative method | Training cost | Control strength |
 |------|---------|---------|---------|---------|
-| **Input Concat** | UNet input channels | StableSR v1 | Low (modify input) | Medium |
+| **Input Concat** | UNet input channels | SR3, StableSR v1 | Low (modify input) | Medium |
 | **Cross-Attention** | Internal UNet attention | DiffBIR | Medium (train cross-attn) | Weak (semantic level) |
 | **ControlNet** | Sum to UNet middle layers | StableSR v2, SUPIR | High (copy encoder) | Strong |
-| **IP-Adapter** | Decoupled cross-attention | Style preservation | Medium | Medium |
+| **IP-Adapter** | Decoupled cross-attention | Style / identity preservation | Medium | Medium |
 | **Tile + ControlNet** | Local condition | Large-image enhancement | (Inference trick) | Strong |
 
-**No paradigm wins overall** — the choice depends on task and budget.
+In addition there are two **training-free** approaches that tweak the sampling process without retraining weights:
+
+- **SDEdit**: noise $y$ up to $t^* \ll T$ then run unconditional sampling back to 0, equivalent to "applying a random reshaping under the diffusion prior to $y$"
+- **PnP / null-text inversion / classifier guidance**: invert $y$ to its corresponding $x_T$, then inject extra constraints during the reverse process
+
+These training-free methods are occasionally useful in production (especially when there is no data to train a ControlNet). SDEdit is typical and cheap enough to deserve its own data-flow figure, so the reader can build intuition for this "training-free" line:
+
+```mermaid
+graph LR
+    Y[degraded image y<br/>or rough sketch] --> VAE1[VAE encode<br/>to latent]
+    VAE1 --> Z0[z_0 latent]
+    Z0 --> Add[+ Gaussian noise up to t*<br/>t* in 100, 600]
+    Add --> ZT[z_t*<br/>noisy latent]
+    ZT --> Loop{reverse sampling<br/>unconditional UNet<br/>t = t*, t*-1, ..., 1}
+    Loop --> Z0p[ẑ_0]
+    Z0p --> VAE2[VAE decode]
+    VAE2 --> Xhat[x̂<br/>structure from y<br/>details filled by diffusion prior]
+
+    style Y fill:#ffebee
+    style Xhat fill:#e8f5e9
+    style Loop fill:#fff3e0
+```
+
+The key parameter of SDEdit is the intermediate time step $t^*$: a larger $t^*$ adds more noise and gives the model more freedom (the generation may drift further, possibly changing content); a smaller $t^*$ preserves more of the input structure (close to an identity map). These two extremes are exactly the two ends of the fidelity-creativity spectrum discussed in Section 9.3, except that SDEdit slides along it with a single number.
+
+**No paradigm wins overall** — the choice depends on task and budget. The figure below draws the injection points of all five paradigms on the same UNet for comparison:
+
+```mermaid
+graph LR
+    LR[degraded image y] -.-> Concat[input channel concat]
+    LR -.-> CrossAttn[cross-attn input<br/>CLIP image encoder]
+    LR -.-> ControlNet[ControlNet<br/>copy encoder + zero conv]
+    LR -.-> IPAdapter[IP-Adapter<br/>decoupled cross-attn]
+    Concat --> UNetIn[UNet input layer<br/>conv_in]
+    UNetIn --> UNetEnc[UNet encoder]
+    CrossAttn --> UNetEnc
+    ControlNet --> UNetMid[added to skip / mid]
+    UNetEnc --> UNetMid
+    IPAdapter --> UNetMid
+    UNetMid --> UNetDec[UNet decoder]
+    UNetDec --> Out[ε̂ / v̂]
+
+    style ControlNet fill:#fff3e0
+    style Out fill:#e8f5e9
+```
+
+The injection point differs across paradigms: concat is at the shallowest layer; cross-attention and IP-Adapter are at every attention block; ControlNet is at all encoder skips. Roughly speaking, **the deeper and broader the injection, the stronger the control but the higher the training cost**.
 
 ## 9.3 The engineering meaning of fidelity vs creativity
 
@@ -178,6 +254,45 @@ LR ──→ Encoder copy ──→ Mid block copy
               
 Output (B, 4, h, w) noise prediction
 ```
+
+Re-drawing this ASCII figure as a mermaid data-flow diagram makes it clearer: the main UNet is the frozen SD weights, the trainable copy in the lower-left has gradients only on encoder + mid, and its output goes through a zero conv before being added to the main UNet's skips.
+
+```mermaid
+graph LR
+    XT[x_t<br/>noisy latent<br/>B,4,h,w] --> MainEnc
+    XT --> CnetIn[ControlNet input<br/>x_t || lr_latent<br/>B,8,h,w]
+    LR[LR / condition image] --> Pre[cond pre-process<br/>RGB → latent size] --> CnetIn
+    T[t, context] --> MainEnc
+    T --> CnetEnc
+
+    subgraph Main[Main UNet · frozen · pretrained SD]
+        MainEnc[Encoder<br/>multi-layer ResBlock + Spatial Transformer] --> MainMid[Mid Block]
+        MainMid --> MainDec[Decoder<br/>upsample + skip concat per layer]
+        MainDec --> EpsOut[ε̂ / v̂<br/>B,4,h,w]
+    end
+
+    subgraph Cnet[ControlNet · trainable · encoder + mid copy]
+        CnetIn --> CnetEnc[Encoder copy<br/>initial weights = main UNet]
+        CnetEnc --> CnetMid[Mid block copy]
+    end
+
+    CnetEnc -.->|per layer| Z1[Zero Conv × N<br/>initial weights 0]
+    CnetMid -.-> Zm[Zero Conv mid]
+    Z1 --> SkipAdd[add to corresponding skip of main UNet]
+    Zm --> SkipAdd
+    SkipAdd --> MainDec
+
+    style Main fill:#e3f2fd
+    style Cnet fill:#fff3e0
+    style EpsOut fill:#e8f5e9
+```
+
+A few details worth re-examining in the figure:
+
+- The main UNet runs its entire forward pass (the path is not drawn dashed but is always taken), so ControlNet's "low training cost" means only that backward gradients flow through the trainable copy; the forward memory still has to hold the main UNet
+- The ControlNet input is the concat of $x_t$ and the LR latent (overlapping with the input-concat route in Section 9.4); the difference is that the concat goes through a separate copy of the encoder rather than replacing the first layer of the main UNet
+- The zero conv collapses every ControlNet output back to 0, so the main UNet behaviour is unchanged at the start of training; this is the same idea as LoRA initializing its adapters to a zero matrix
+- ControlNet's outputs are added to the main UNet's **skip connections** (not replacing them and not via cross-attention), so the main UNet receives "its own skip features + a small condition offset", minimizing damage to pretrained knowledge
 
 ### Zero Convolution — the core trick
 
@@ -351,6 +466,70 @@ def forward_with_controlnet(unet, controlnet, x_t, lr_img, t, context):
 Pairs (LR, HR) are required (HR is used as the target after noising the latent, and LR is the ControlNet input).
 
 Data scale: the ControlNet paper used hundreds of thousands to millions of images. The ControlNet for enhancement tasks usually generates training data using the synthesis pipeline of Chapter 5.
+
+## 9.6b Paradigm 4: IP-Adapter — a decoupled image prompt
+
+IP-Adapter (Ye et al. 2023) addresses something ControlNet does not do well: **using a reference image as a "style / identity prompt"**, not controlling each pixel's structure but controlling how the generated image as a whole looks like the reference.
+
+In the enhancement context:
+
+- Given LR + a high-resolution photo of the same person (reference), make the generated HR identity-consistent with the reference
+- Given LR + a target-lighting sample image, make the HR replicate the sample's tone
+- Given LR + a high-resolution patch with the target texture, make the HR learn that texture
+
+The IP-Adapter design can be summarized in one sentence:
+
+> Do not let the image prompt steal the text prompt's cross-attention; **open a separate cross-attention channel for the image prompt**, and add it to the original text cross-attention.
+
+This is "decoupled cross-attention". The original SD UNet's attention is $\text{Attn}(Q, K_t, V_t)$ where $K_t, V_t$ come from the text encoder. IP-Adapter adds a parallel term:
+
+$$
+\text{Output} = \text{Attn}(Q, K_t, V_t) + \lambda \cdot \text{Attn}(Q, K_i, V_i)
+$$
+
+$K_i, V_i$ come from the image encoder (CLIP image) through a new projection layer. $\lambda$ is the user-tunable "image-prompt strength".
+
+The advantages of this decoupling over "concat image tokens onto text tokens":
+
+1. **Preserves the original text channel's training distribution**: the original cross-attention has only seen text tokens; force-mixing image tokens would shift the distribution. Decoupling keeps the text channel completely unchanged
+2. **Image and text strengths can be tuned independently**: the text part is still under CFG control, the image part is controlled by $\lambda$, the two not interfering
+3. **Only the new image cross-attention layers need training**, the original UNet is untouched, and new parameters are very few (< 100M)
+
+A skeleton implementation:
+
+```python
+class IPAdapterCrossAttn(nn.Module):
+    """IP-Adapter: decoupled image cross-attention.
+    Parallel to the original text cross-attention; outputs are summed.
+    """
+
+    def __init__(self, dim: int, num_heads: int, image_dim: int = 1024):
+        super().__init__()
+        # Reuse the original cross-attention's Q (from the latent)
+        # Add K, V projections for the image branch
+        self.to_k_img = nn.Linear(image_dim, dim, bias=False)
+        self.to_v_img = nn.Linear(image_dim, dim, bias=False)
+        self.num_heads = num_heads
+        nn.init.zeros_(self.to_k_img.weight)
+        nn.init.zeros_(self.to_v_img.weight)        # zero init -> no effect at start
+
+    def forward(self, q, text_kv, image_tokens, scale: float = 1.0):
+        # text_kv goes through the original cross-attention (omitted; built into main UNet)
+        text_out = original_cross_attn(q, text_kv)
+
+        # Image branch
+        k_img = self.to_k_img(image_tokens)
+        v_img = self.to_v_img(image_tokens)
+        image_out = scaled_dot_product_attention(q, k_img, v_img, num_heads=self.num_heads)
+
+        return text_out + scale * image_out
+```
+
+In enhancement tasks IP-Adapter is often used together with ControlNet: ControlNet handles "structural alignment with LR" while IP-Adapter handles "style / identity alignment with the reference". SUPIR replaces IP-Adapter's image-prompt role with a LLaVA prompt — a different solution.
+
+### Relation to RefSR in Chapter 10
+
+IP-Adapter is engineering-wise extremely close to RefSR in Chapter 10: both are "LR + Ref → HR" multi-input diffusion enhancement. The difference is that RefSR's cross-attention usually does patch-level matching (local textures of Ref → corresponding regions of the main image), while IP-Adapter encodes Ref globally into a token sequence, biasing control toward global style / identity. In production these two ideas often coexist; they are not mutually exclusive.
 
 ## 9.7 SUPIR (2024) — the design behind the current SR SOTA
 

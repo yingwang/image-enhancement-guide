@@ -6,6 +6,34 @@
 >
 > This chapter unpacks that statement.
 
+## 5.0 Reading Notes
+
+This chapter is the last in Part I and the chapter closest to engineering implementation in the entire book. The concepts built in the previous four chapters all land here in Python code, directory structures, and training loops. After reading, you should be able to directly write a training dataloader you can feed to ESRGAN/Real-ESRGAN/Restormer.
+
+This chapter assumes you have already mastered:
+
+- The image from Chapter 1 of "the degradation operator $D$ is a stack of random compositions" (the data-flow figure in §1.5, which this chapter will expand into a finer-grained version)
+- The pixel-space vs feature-space correspondence with loss functions from Chapters 2-3
+- The distinction in Chapter 4 between PSNR/SSIM/LPIPS and NIQE/MANIQA (which determines when "ground truth doesn't exist")
+
+It does not assume you have written a Real-ESRGAN dataloader before, or read its 700-line degradation code.
+
+**Abbreviations that appear for the first time in this chapter or will appear repeatedly.** To avoid being turned away by jargon halfway through, here they are upfront:
+
+- **Real-ESRGAN**: the representative 2021 "real-scene" SR model whose core contribution is the degradation-synthesis pipeline, not the network architecture
+- **BSRGAN** (Blind Super-Resolution GAN): a contemporaneous, similarly-oriented blind-SR scheme by Zhang et al. that trains a model robust to real images by "randomizing the order of degradations"
+- **SRMD** (Super-Resolution with Multiple Degradations): an early work that feeds "degradation parameters" to the network as conditioning input; a non-blind compromise
+- **KernelGAN**: a method that estimates the degradation kernel on the test image with a GAN; another route to blind SR
+- **RRDB** (Residual in Residual Dense Block): the dense-residual block proposed by ESRGAN; Real-ESRGAN reuses it as backbone (covered in Chapter 6)
+- **DiffJPEG**: a differentiable JPEG encode/decode implementation, allowing the JPEG step to be done in batch on the GPU as part of the degradation pipeline
+- **DCT** (Discrete Cosine Transform): the core operator of JPEG compression (introduced in §1.0; repeated here)
+- **ISP** (Image Signal Processor): the entire in-camera pipeline that turns sensor readouts into 8-bit RGB (also introduced in §1.0)
+- **LMDB** (Lightning Memory-Mapped Database): a lightweight key-value store, often used to pre-encode large numbers of small images for cached, training-accelerated access
+- **USM** (Unsharp Mask): a classical image-processing sharpening operator—Gaussian-blur the image, subtract the blurred version from the original to extract the high frequencies, then add the high frequencies back
+- **chroma subsampling**: after JPEG converts RGB to YCbCr, it downsamples the two chrominance channels Cb/Cr in patterns like 4:2:0; perceptually invisible to humans but very visible to models
+
+When specific terms come up later, we expand them again with one-sentence definitions.
+
 ## 5.1 Data > Network
 
 Chapter 1 mentioned a recurring pattern in 2014–2020:
@@ -82,9 +110,9 @@ Cons:
 
 ## 5.3 The Classical Bicubic Pipeline's Problems (a Bit More Depth)
 
-Chapter 1 mentioned the problems of bicubic degradation. Going deeper here:
+Chapter 1 mentioned the problems of bicubic degradation. Going deeper here.
 
-**Complexity of real low-resolution images**:
+**Complexity of real low-resolution images.** An image a user casually drops in from their album has typically gone through something like:
 
 ```
 User photo flow:
@@ -96,15 +124,50 @@ User photo flow:
     → someone downloads it (possibly recompressed once more)
 ```
 
-Each step has changes; the final LR is the composition of all of these.
+Each step contributes its own degradation; the final LR is a non-linear composition of all of these. Demosaicing is the step that reconstructs a three-channel color image from the sensor's Bayer-array data (each pixel only captures one of R, G, B); essentially every camera does this internally, but different vendors' algorithms leave different neighbor-pixel correlations.
 
-**Which step does bicubic degradation simulate?** Strictly, **not a single one of them is truly simulated**—it assumes LR is the ideal anti-aliased downsampling of HR, **with no correspondence to the real physical process**.
+**Which step does bicubic degradation simulate?** Strictly, **not a single one of them is truly simulated**. Bicubic assumes the LR is the result of HR put through an ideal anti-aliasing filter then downsampled, an entire process that is linear, differentiable, and content-independent, **with no correspondence to the physical chain above**.
 
-ESRGAN trained on bicubic data learns the "inverse bicubic function," and that function happens to have near-zero transferability to real degradations.
+ESRGAN trained on bicubic data learns precisely the "inverse bicubic function." That function performs perfectly on bicubic test sets, but the moment the test image is replaced with a real phone-captured low-resolution image, the model does exactly what "inverse bicubic" should: it sharpens noise it shouldn't have sharpened, treating it as "high-frequency signal," and outputs an image full of magnified noise. This transfer failure isn't accidental; the function spaces simply don't overlap.
 
-**The fix direction**:
+**The fix direction: make the training data's degradation distribution cover the real-world degradation distribution.** Real-ESRGAN's design heads in this direction. The next section expands.
 
-Make the training data's degradation distribution **cover** the real-world degradation distribution. Real-ESRGAN's design is in this direction.
+To prevent §5.4's code from feeling abstract, here is a diagram of this section's claim: the physical process by which a user gets a bad image on the left, the process Real-ESRGAN simulates in code on the right, with arrows indicating which synthesis step corresponds to which physical step.
+
+```mermaid
+graph LR
+    subgraph Real["Real world (physical chain, single capture)"]
+        S1[Photon distribution]
+        S2[Sensor readout<br/>+ shot + read noise]
+        S3[demosaicing<br/>+ ISP]
+        S4[JPEG quality 70-95]
+        S5[Network recompression<br/>quality 50-70]
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    subgraph Synth["Synthetic world (second-order degradation, parameterized)"]
+        D1[blur 1<br/>isotropic/anisotropic Gaussian]
+        D2[resize 1<br/>area / bilinear / bicubic]
+        D3[noise 1<br/>Gaussian + Poisson]
+        D4[JPEG 1<br/>quality 30-95]
+        D5[blur 2<br/>smaller]
+        D6[resize 2]
+        D7[noise 2]
+        D8[JPEG 2 / sinc]
+        D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7 --> D8
+    end
+
+    S2 -. simulates .-> D3
+    S3 -. simulates .-> D1
+    S3 -. simulates .-> D2
+    S4 -. simulates .-> D4
+    S5 -. simulates .-> D8
+
+    style Real fill:#e3f2fd
+    style Synth fill:#fff8e1
+```
+
+Several patterns in this figure are worth remembering. First, the physical chain happens once and has a fixed order; the synthesis chain deliberately shuffles the order and randomizes parameters, because the model needs to see not the degradations of one particular camera, but the degradation distribution of "all possible cameras + all possible transmission paths." Second, some steps of the physical chain (such as ISP denoising and sharpening) leave detail coupling in the LR that the synthesis chain cannot precisely replicate, which is why §5.12 emphasizes "fine-tune with real data" as the last mile. Third, the intermediate product between the two stages of JPEG carries blocking artifacts, and the second-stage JPEG further scrambles those block boundaries—this is the fundamental reason §5.4 will emphasize "second-order."
 
 ## 5.4 Real-ESRGAN Degradation Pipeline in Detail
 
@@ -116,7 +179,7 @@ Each kind of degradation (blur, downsampling, noise, JPEG) is not fixed but **sa
 
 ### Design 2: high-order / second-order degradation modeling
 
-Run the entire degradation pipeline twice. This is Real-ESRGAN's core innovation.
+Run the entire degradation pipeline twice. This is Real-ESRGAN's core innovation, and it is the meaning of "high-order" that the paper title highlights.
 
 ```
 First-order degradation (simulating in-camera):
@@ -128,12 +191,38 @@ Second-order degradation (simulating transmission/recompression):
 
 The synthesized LR thus approaches "an image processed by the camera and then compressed multiple times by the internet."
 
-The key parameters of the second order are slightly different:
+The key parameters of the second order are **deliberately different** from the first:
 
 - First-order blur tends to be larger (simulating actual camera/transmission blur)
 - Second-order blur tends to be smaller (avoid making training data too blurry to learn)
-- Second order may add **sinc filtering**—simulating the ringing artifacts caused by over-sharpening (an artifact specific to LCD displays / certain image processing software)
+- Second order may add **sinc filtering** (a filter based on the sinc function, a rectangular low-pass in the frequency domain producing oscillations in the spatial domain)—simulating the ringing artifacts caused by over-sharpening, an artifact especially common in LCD displays / certain image-processing software outputs
 - The order of **resize / sinc / JPEG** in the final stage of the second order is **randomized** in the official code (a random order is picked each training step), not fixed—this exposes the model to more combinations
+
+Drawing "second-order + order randomization" as a state diagram makes it more intuitive:
+
+```mermaid
+graph TD
+    HR[HR clean image<br/>x in 0,1]
+    HR --> B1[blur 1<br/>sigma 0.2-3.0]
+    B1 --> R1[resize 1<br/>scale 0.15-1.5]
+    R1 --> N1[noise 1<br/>std 1-30/255]
+    N1 --> J1[JPEG 1<br/>quality 30-95]
+    J1 --> Mid[Intermediate product]
+    Mid --> B2[blur 2<br/>sigma 0.2-1.5]
+    B2 --> Choice{Random order}
+    Choice -->|case A| A1[resize -> sinc -> JPEG]
+    Choice -->|case B| A2[resize -> JPEG -> sinc]
+    Choice -->|case C| A3[sinc -> resize -> JPEG]
+    A1 --> LR[LR degraded]
+    A2 --> LR
+    A3 --> LR
+
+    style HR fill:#e8f5e9
+    style Mid fill:#fff3e0
+    style LR fill:#ffebee
+```
+
+Two engineering conclusions are worth emphasizing in this figure. First, every step's parameter is sampled from an explicit range, so "the $D$ distribution the model sees during training" is written down in code rather than vaguely "hoping it has seen everything." Second, the final three steps' order randomization exists so that the model sees both "resize-then-JPEG" and "JPEG-then-resize" outputs, the former closer to a camera's in-device processing, the latter closer to a Weibo reshare chain. If the model has only ever seen one order, it overfits to the artifact patterns left by that order.
 
 ### A simplified Real-ESRGAN pipeline
 
@@ -278,9 +367,11 @@ In practice, the real version is more complex: the full Real-ESRGAN code is arou
 - Sinc filtering (simulating over-sharpening artifacts)
 - Differentiable JPEG (done directly on GPU)
 - Probability allocation for grayscale/color images
-- Inverse USM sharpening (simulating phone post-processing)
+- USM sharpening (Unsharp Mask) inverse (simulating phone post-processing)
 
-But the skeleton is the above.
+USM's specific procedure: first Gaussian-blur the image to get $x_b$, then enhance high frequencies via $x_{usm} = x + \lambda (x - x_b)$, where $\lambda$ controls sharpening strength. Phone-vendor ISPs almost all bake in USM-style sharpening, which means a user's photo already carries a mild "over-sharpened" signature. Real-ESRGAN also includes a USM step during synthesis so the model can "recognize" inputs that have been pre-sharpened, avoiding stacking another round of sharpening during SR that would look greasy.
+
+But the skeleton is the above; the extensions only replace "kernel sampling" from a single function with a family of functions, and the degradation order from fixed to randomly chosen. After reading §5.5 through §5.8 on each component, you should be able to fill the skeleton above out to a production-grade implementation.
 
 ## 5.5 The Blur Kernel Family
 
@@ -292,7 +383,7 @@ $$
 k(u, v) = \frac{1}{2\pi\sigma^2} \exp\left(-\frac{u^2 + v^2}{2\sigma^2}\right)
 $$
 
-A single parameter $\sigma$. Simulates defocus, atmospheric blur.
+A single parameter $\sigma$. Simulates defocus, atmospheric blur. Larger $\sigma$ gives stronger blur, and the blur is the same in every direction.
 
 ### Anisotropic Gaussian
 
@@ -300,7 +391,13 @@ $$
 k(u, v) \propto \exp\left(-\frac{1}{2}\begin{pmatrix}u\\v\end{pmatrix}^T \Sigma^{-1} \begin{pmatrix}u\\v\end{pmatrix}\right)
 $$
 
-The covariance matrix $\Sigma$ controls different blur magnitudes in x/y. Simulates camera shake, lens aberrations.
+The covariance matrix $\Sigma$ controls different blur magnitudes in x/y. Simulates camera shake, lens aberrations. Expanding $\Sigma$:
+
+$$
+\Sigma = R(\theta)\begin{pmatrix}\sigma_1^2 & 0 \\ 0 & \sigma_2^2\end{pmatrix} R(\theta)^T
+$$
+
+where $R(\theta)$ is a rotation matrix, $\theta$ is the blur direction, and $\sigma_1, \sigma_2$ are the blur scales along the two principal axes. The three parameters jointly determine the kernel shape (one angle + two scales), giving two more degrees of freedom than the isotropic case—enough to model the common "horizontal blur is more pronounced than vertical blur" pattern of residual camera shake.
 
 ### Generalized Gaussian
 
@@ -312,11 +409,11 @@ An extra shape parameter $\beta$: $\beta = 1$ is standard Gaussian, $\beta > 1$ 
 
 ### Plateau-shaped kernel
 
-Real-ESRGAN also uses a family of **plateau kernels**—a flat "plateau" region in the center with steep edges. They and generalized Gaussian are **two independent families**, not simply "$\beta < 1$ equals plateau." When sampling training kernels, Real-ESRGAN probabilistically mixes these families (isotropic Gaussian, anisotropic Gaussian, generalized Gaussian, plateau).
+Real-ESRGAN also uses a family of **plateau kernels**—a flat "plateau" region in the center with steep edges. They and generalized Gaussian are **two independent families**, not simply "$\beta < 1$ equals plateau." Plateau kernels are closer to the shape of a "defocus disc," common in small-aperture / deep-focus scenes, and cannot be precisely expressed by an ordinary Gaussian. When sampling training kernels, Real-ESRGAN probabilistically mixes these families (isotropic Gaussian, anisotropic Gaussian, generalized Gaussian, plateau). The specific proportions can be checked in the official code's `degradations.py`; the most common ratio is roughly isotropic Gaussian 0.55, anisotropic 0.10, generalized Gaussian 0.12, plateau 0.03, with the remaining probability reserved for sinc.
 
 ### Motion blur kernel
 
-Line-segment shaped:
+Simulates linear motion of the camera or subject during capture. If during exposure time $T$ the sensor moves linearly relative to the scene at velocity $v$, every scene point sweeps out a line of length $vT$ on the image plane along the motion direction. Discretizing this line onto the pixel grid and normalizing it gives the simplest form of a motion blur kernel. In the frequency domain it is a sinc function extended along the motion direction, so motion blur not only blurs edges but selectively suppresses high frequencies along that direction.
 
 ```python
 import numpy as np
@@ -336,6 +433,8 @@ def motion_blur_kernel(length: int, angle_deg: float) -> torch.Tensor:
     return torch.from_numpy(kernel).unsqueeze(0).unsqueeze(0)
 ```
 
+More realistic motion kernels add slight curvature to the line (simulating non-uniform-speed hand shake) or stack several short lines at different angles (simulating camera shake + local subject motion). Motion kernels have a low proportion in the official Real-ESRGAN implementation, mainly used as "low-probability hard samples" sampled into the training distribution, to keep the model from overfitting to any single blur type.
+
 ### Sinc filter
 
 $$
@@ -344,7 +443,28 @@ $$
 
 where $J_1$ is the first-order Bessel function. Sinc is an ideal low-pass filter (rect-shaped) in the frequency domain, but a truncated sinc oscillates in the pixel domain—producing **ringing** artifacts.
 
-Why Real-ESRGAN uses sinc: to simulate the ringing produced by sharpening algorithms in certain image processing software (like Adobe products) when overdone. Such artifacts are very common in real "post-processed" images.
+Why Real-ESRGAN uses sinc: to simulate the ringing produced by sharpening algorithms in certain image processing software (like Adobe products) when overdone. Such artifacts are very common in real "post-processed" images, especially the "looks sharp but the detail is fake" images downloaded from Weibo / Twitter. If the model has not seen sinc-style ringing in training data, it will treat the ringing as real high frequencies and preserve or even amplify it, making the output look more fake.
+
+To form an intuitive picture of the "blur kernel family," the diagram below compares the spatial-domain profiles of various kernels:
+
+```mermaid
+graph LR
+    A[Isotropic Gaussian<br/>circular bell] --> Aa[1 param sigma]
+    B[Anisotropic Gaussian<br/>elliptical bell] --> Bb[3 params sigma1 sigma2 theta]
+    C[Generalized Gaussian<br/>bell with adjustable sharpness] --> Cc[extra shape param beta]
+    D[Plateau<br/>flat center steep edges] --> Dd[simulates defocus disc]
+    E[Motion kernel<br/>line segment] --> Ee[length and direction]
+    F[Sinc<br/>oscillating rings] --> Ff[simulates over-sharpening ringing]
+
+    style A fill:#e3f2fd
+    style B fill:#e3f2fd
+    style C fill:#fff8e1
+    style D fill:#fff8e1
+    style E fill:#ffebee
+    style F fill:#ffebee
+```
+
+Color groups reflect "difficulty." The blue group on the left is the Gaussian family—few parameters, cheap to sample. The middle two need extra geometric parameters but can still be batch-generated on GPU. The right two (motion, sinc) have special shapes and are the hardest for the model, requiring dedicated sampling and not approximated by a single Gaussian.
 
 ## 5.6 Multiple Downsampling Strategies
 
@@ -360,19 +480,23 @@ Different interpolation kernels behave very differently in the frequency domain:
 
 Real-ESRGAN's pipeline **randomly picks** one of these on each resize, exposing the model to a variety of interpolation artifacts.
 
+Why this matters can be understood from the frequency domain: bicubic is nearly an ideal low-pass, cleanly chopping off high frequencies; nearest does no low-pass at all and leaves heavy aliasing; area averages each LR pixel as a box filter over the HR patch, with a sinc frequency response that corresponds to a rectangle in the pixel domain—able to remove small-motion blur but pass through large edges. If the model has only ever seen "clean low-frequency images" from bicubic, it will treat residual aliasing from real images (which were typically processed by area or bilinear) as high-frequency signal and "amplify" it—the result is making the jaggies sharper rather than restoring detail.
+
+A small but useful engineering detail: with `align_corners=False`, `torch.nn.functional.interpolate` matches OpenCV's `cv2.resize` defaults; with `align_corners=True`, it matches some old TensorFlow alignments, with the two differing visibly at the 1-2 pixel edge. Make sure the resize library used at inference time matches training; otherwise you get hard-to-spot bugs like "trained with bicubic, but deployment calls ImageMagick's catmull-rom implementation, output size off by one row."
+
 ## 5.7 Implementation Details of Noise
 
 Chapter 1 already covered the physical model of noise. Here are a few engineering details.
 
 ### Grayscale noise vs color noise
 
-The color correlation of real noise is a subtle issue:
+The color correlation of real noise is a subtle issue, to be understood from both the optics and the processing-chain perspectives:
 
-- High-end cameras: noise is approximately i.i.d. (per channel independent)
-- Phone cameras: after demosaicing, neighboring pixel noise is correlated; channels are also correlated
-- After ISP denoising: residual noise is often "gray" (correlated across the three channels)
+- High-end cameras (full-frame DSLR, medium format): sensor pixels are large, SNR is high, single-frame noise is approximately i.i.d. (per channel independent), with essentially zero three-channel correlation
+- Phone cameras: pixels are small, ISOs are often high; after demosaicing (interpolating missing colors from neighbors), **neighbor-pixel noise becomes correlated**; the color matrix also mixes noise across channels, leading to inter-channel correlation
+- After ISP denoising: built-in denoising first removes "independent color noise," and the residual noise is often "gray" (correlated across all three channels, looking like a thin layer of gray haze)
 
-Engineering practice: training data **provides both**—50% of the time use three-channel-independent color noise, 50% of the time use gray noise (the same noise map across channels).
+Engineering practice: training data **provides both**—50% of the time use three-channel-independent color noise (simulating low-ISP-processing or RAW), 50% of the time use gray noise (a single noise map shared across channels, simulating post-ISP residue). A more refined implementation mixes in "neighbor-correlated" noise at a 9:1 ratio (lightly Gaussian-blur a random noise map before adding it), modeling the actual post-demosaicing state of phones.
 
 ### Noise intensity distribution
 
@@ -437,10 +561,22 @@ This model is critical for training-data synthesis in **phone low-light denoisin
 
 ## 5.8 JPEG Compression
 
+JPEG is the step most easily overlooked and most critical in the synthesis pipeline. If training data lacks JPEG, the model fails on any image that has gone through network transmission (i.e. 99% of real inputs), because JPEG blocking artifacts are entirely outside its input distribution.
+
+The JPEG encode/decode flow, summarized briefly to help understand why the "DCT quantization step" is the non-differentiable core:
+
+1. RGB → YCbCr, separating luminance Y from chrominance Cb/Cr
+2. Apply chroma subsampling to Cb/Cr (4:2:0 most common, each chroma dimension halved)
+3. Apply 8×8 block DCT, yielding 64 frequency coefficients per block
+4. Divide and round each coefficient using a quality-dependent quantization table
+5. Zig-zag scan + entropy coding to disk
+
+The "round" in step 4 maps continuous values to integers, with **no gradient**. This means propagating a gradient through JPEG in end-to-end training requires a softened replacement of rounding (e.g. straight-through estimator or first-order Taylor expansion), which is exactly what the DiffJPEG library does.
+
 JPEG in the synthesis pipeline must satisfy:
 
-1. **Can be done on GPU** (don't write each image to disk and read back)
-2. **Ideally differentiable** (although gradients are not propagated through JPEG in enhancement training, the differentiable version performs well)
+1. **Can be done on GPU** (don't write each image to disk and read back)—disk I/O bottlenecks will stall the entire dataloader
+2. **Ideally differentiable** (although gradients are not usually propagated through JPEG in enhancement training, the differentiable version still performs well, and is required if you ever want to compute perceptual loss gradients on post-JPEG images)
 
 Recommended: the **DiffJPEG** library ([github.com/mlomnitz/DiffJPEG](https://github.com/mlomnitz/DiffJPEG)), which implements differentiable JPEG encoding/decoding:
 
@@ -463,10 +599,14 @@ def random_jpeg_diffjpeg(x: torch.Tensor, quality_range=(30, 95)) -> torch.Tenso
 Real-ESRGAN's second-order JPEG simulates "an already compressed image being compressed again." In this case:
 
 - The first-order JPEG's blocking artifacts are further scrambled by the second-order JPEG
-- Block boundaries don't align, causing complex composite artifacts
-- This phenomenon is widespread in real "network-retransmitted" images
+- The two JPEGs' 8×8 block boundaries are usually not aligned because a resize sits between them, causing complex non-aligned composite artifacts
+- This phenomenon is widespread in real "network-retransmitted" images—a Weibo image you saved has already had its block boundaries "drift" once after a reshare
 
-Calling JPEG twice in a row simulates this phenomenon directly.
+Calling JPEG twice directly simulates this. A notable detail: the second JPEG's quality does not need to be lower than the first's; the reverse is common (phone → WeChat quality 70 → you save at quality 90). The point is that **the two quantization grids do not align**, not the quality numbers themselves.
+
+### A note on chroma subsampling
+
+JPEG's 4:2:0 chroma subsampling halves the resolution of the Cb/Cr channels. It is almost invisible to the human eye, but models can pick up unreal relations like "green edges are sharper than red edges" from it. If your goal is to repair "network-mangled images," your training JPEG simulation must preserve chroma subsampling; if your goal is repairing "high-fidelity professional captures with mild JPEG traces," you may turn it off. DiffJPEG defaults to 4:2:0.
 
 ## 5.9 Dataset Selection
 
@@ -512,6 +652,8 @@ The two most common:
 1. **Academic standard**: train on DF2K (DIV2K + Flickr2K), test on Set5/14/B100/Urban100/Manga109/DIV2K val
 2. **Realistic-oriented**: train on LSDIR + DF2K + OST300, fine-tune with a bit of RealSR, test on DRealSR/RealSR
 
+The academic standard has the benefit of comparability, with the downside that the benchmarks are small (Set5 really is only 5 images), limiting the statistical significance of the conclusions. The realistic-oriented choice better reflects the production distribution but lacks a standardized test set for direct comparison with other papers—you can only compare on your internal real holdout. Running both in production is common: academic benchmarks confirm "we didn't break the basics," real test sets confirm "we deserve this deployment."
+
 ## 5.10 Data Augmentation
 
 Data augmentation in low-level vision is very different from classification. **Safe** ones:
@@ -538,10 +680,10 @@ def safe_augment(hr: torch.Tensor, lr: torch.Tensor):
 
 **Use with caution**:
 
-- **Color jitter**: changes the degradation distribution, the model learns wrong color mappings
-- **Arbitrary-angle rotation**: interpolation introduces extra degradation, not in the original D
-- **Random scaling**: equivalent to changing the scale factor; don't use it in SR
-- **mixup / cutmix**: rarely used in low-level vision, unclear effect
+- **Color jitter**: changes the degradation distribution, the model learns wrong color mappings; for real-degradation models, color shift itself is part of $D$ and shouldn't be treated as an "axis you can freely change"
+- **Arbitrary-angle rotation**: interpolation introduces extra degradation (effectively another round of bicubic/bilinear resampling), not in the original $D$; the model will learn that "slight interpolation artifacts in the output are normal"
+- **Random scaling**: equivalent to changing the scale factor; don't use it in SR—the input-to-output size relation is part of the task definition
+- **mixup / cutmix**: rarely used in low-level vision, unclear effect; their design premise is "the task is invariant to category," but pixel-regression tasks have ground truth at every pixel and mixing pixels lacks a clear semantic interpretation
 
 **Cropping strategy**:
 
@@ -595,7 +737,7 @@ loader = DataLoader(
 
 ### Option 2: do degradation on GPU (recommended by Real-ESRGAN)
 
-Move the degradation pipeline to GPU and process the whole batch at once:
+Move the degradation pipeline to GPU and process the whole batch at once. This option seems counter-intuitive: usually we put data preprocessing on CPU so the GPU can focus on matrix multiplications. But blur, JPEG, and resize inside degradation synthesis are themselves heavy convolutions and frequency-domain operations, and running them on GPU is 20× or more faster than CPU; keeping them on CPU instead drags training down.
 
 ```python
 # Inside the training loop
@@ -617,6 +759,28 @@ Cons:
 
 - Uses GPU memory (some intermediate tensors)
 - Degradation code must support batched + GPU
+
+To keep both "CPU reads" and "GPU degradation" sides from idling, the full data flow should look like:
+
+```mermaid
+graph LR
+    Disk[HR PNG / LMDB] --> CPU[CPU workers<br/>read + crop + to_tensor]
+    CPU --> Queue[pinned memory queue]
+    Queue --> GPU1[GPU: degradation<br/>blur/resize/noise/JPEG]
+    GPU1 --> GPU2[GPU: model forward]
+    GPU2 --> GPU3[GPU: loss + backward]
+    GPU3 --> GPU4[GPU: optimizer step]
+    GPU4 -.next batch.-> Queue
+
+    style Disk fill:#e3f2fd
+    style CPU fill:#fff8e1
+    style GPU1 fill:#ffebee
+    style GPU2 fill:#ffebee
+    style GPU3 fill:#ffebee
+    style GPU4 fill:#ffebee
+```
+
+Two often-overlooked engineering tips in this figure. First, the pinned-memory queue is the fixed-memory buffer enabled by PyTorch's `pin_memory=True`, which lets CPU-to-GPU copy use asynchronous DMA without blocking the main process. Second, the degradation step must be written as "batched + fully GPU-executable"; any code that accidentally becomes a Python for-loop or includes `.cpu()` drops training throughput by an order of magnitude.
 
 ### LMDB storage to accelerate large datasets
 
@@ -664,7 +828,9 @@ Stage 2: fine-tune (real data)
   - Goal: calibrate the general model to the real degradation distribution
 ```
 
-The reason for not training from scratch on real data: too little data (a few hundred images)—the model overfits to the specific objects and scenes in those few hundred images.
+The reason for not training from scratch on real data: too little data (a few hundred images)—the model overfits to the specific objects and scenes in those few hundred images. This is a classic catastrophic-specialization trap: PSNR rises rapidly on the training-set objects, but as soon as you switch to a different scene type, the model collapses. The two-stage training method essentially uses synthetic data to lay down the model's "prior" first, leaving real data only the small task of distribution alignment rather than learning "what natural images should look like" from scratch.
+
+A few more engineering details for fine-tuning. The learning rate should not only be one order of magnitude smaller than pretraining; ideally it follows a cosine schedule that decays nearly to zero over the final few thousand steps, to avoid the model oscillating on the small dataset. EMA (Exponential Moving Average, a shadow copy of weights that follows an exponential moving average) is especially important during fine-tuning—it further smooths training jitter. Finally, the validation set should be from **a different source** of real images than the fine-tuning set (e.g. fine-tune on RealSR, validate on DRealSR); otherwise the gains you see may be entirely overfit.
 
 ## 5.13 Data Quality Audit
 
@@ -730,6 +896,26 @@ clusters = KMeans(n_clusters=20).fit_predict(np.vstack(embeddings))
 ```
 
 If a cluster is extremely small (< 1%), consider supplementing data for that part.
+
+### Hidden hazards of imbalanced degradation distributions
+
+Another hidden issue in synthetic data is the distribution of the degradation parameters themselves. Suppose your blur sigma range is [0.2, 3.0]—that looks reasonable, but if you sample uniformly, the [2.5, 3.0] range gets as many samples as [0.2, 0.7], whereas real-world blur is overwhelmingly concentrated in the small-sigma end. This makes the model over-react to "mild blur" inputs (treating clear small details as objects to deblur) and, conversely, perform reasonably well on "severe blur."
+
+A common engineering fix is to swap uniform sampling for log-uniform or beta-distribution sampling:
+
+```python
+import math
+import random
+
+def log_uniform(low: float, high: float) -> float:
+    """Log-uniform distribution: small values get sampled more often."""
+    return math.exp(random.uniform(math.log(low), math.log(high)))
+
+# Usage
+sigma = log_uniform(0.2, 3.0)
+```
+
+The same fix applies to noise sigma, JPEG quality, and every other "degradation strength" parameter. When you observe model anomalies in production, the first thing to check is whether the training-time parameter distribution matches the real distribution you encounter at deploy time.
 
 ## 5.14 Summary
 

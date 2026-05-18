@@ -2,9 +2,151 @@
 
 > Training a good model is only the beginning.
 >
-> Pushing it to production—servers, desktop GPUs, mobile, embedded—is a whole separate engineering domain.
+> Pushing it to production - servers, desktop GPUs, mobile, embedded - is a whole separate engineering domain.
 >
 > This chapter covers quantization, TensorRT, CoreML, torch.compile, tile inference, and streaming.
+
+## 15.0 Setup and terminology
+
+The first fourteen chapters covered the training side: starting from a degradation model and walking through representation spaces, loss functions, evaluation metrics, data synthesis, discriminative and generative architectures, training schedules, video temporality, and controllable generation - all under the assumption that the training machine has ample VRAM, can iterate slowly, and can be interrupted and restarted. This chapter switches viewpoint. **Production environments do not look like that**. The hard constraints in a live service are latency, throughput, VRAM ceilings, power, thermals, bitrate alignment, and alignment with upstream / downstream encoders. A 0.3 dB PSNR lead from an academic eval is essentially invisible online, but blowing the p99 latency budget by 20 ms makes the product instantly unusable.
+
+The harder bit: a training-side good model may not make it to production at all. A SwinIR-Large that trained happily on A100 with batch=8 may, once exported to a device, fall back to CPU on iOS 16 for PixelShuffle, hit an unsupported attention op on a Qualcomm NPU, develop checkerboard artifacts after INT8 quantization, throttle from heat after running 30 minutes continuously on a phone, lack future frames in a video-conferencing context so it can only run causal, and have all its output detail eaten by the H.264 encoder on the way to the wire. None of these issues exist in papers; each one can singlehandedly block a launch.
+
+So this chapter is not a "TensorRT tutorial." It is an **engineering checklist for pushing trained low-level vision models from PyTorch to real terminals**. The structure starts with cross-platform optimizations (export, compilation, half precision, quantization), then splits by deployment target: TensorRT on NVIDIA GPUs, CoreML / ANE on Apple devices, TFLite and vendor SDKs on Android / embedded. Next come three cross-platform techniques: model distillation (including diffusion-school 1-step SR), tile inference for large images, and streaming / real-time video. The chapter closes with pipeline orchestration, monitoring, and cost estimation.
+
+Keep one simple contrast in mind throughout: **academic metrics care about "distance between model output and ground truth"; production metrics care about "whether the product ships."** They are not in conflict, but the optimization paths diverge sharply. Every section in this chapter is helping you translate the second kind of caring into executable code and process.
+
+### Abbreviations and first-appearance terms
+
+To avoid a wall of jargon, the first appearance of each abbreviation is collected here with a full name and one-line definition. We do not re-expand on subsequent use.
+
+- **TensorRT**: NVIDIA's inference engine, which compiles ONNX / PyTorch models into binary plan files optimized for a specific GPU.
+- **ONNX** (Open Neural Network Exchange): a cross-framework intermediate model representation; almost every inference engine reads from ONNX.
+- **CUDA** (Compute Unified Device Architecture): NVIDIA's general-purpose parallel computing platform and programming model.
+- **cuDNN** (CUDA Deep Neural Network library): NVIDIA's GPU deep-learning operator library; both TensorRT and PyTorch depend on it.
+- **FP32 / FP16 / BF16**: 32-bit / 16-bit floating point. BF16 (Brain Float 16), introduced by Google, keeps the same exponent bits as FP32 with fewer mantissa bits - wide range, lower precision. Natively supported on A100 and later NVIDIA GPUs.
+- **INT8 / INT4**: 8-bit / 4-bit integer. Low-bit representations for quantization, trading speed and VRAM for precision loss.
+- **PTQ** (Post-Training Quantization): after training, estimate scale and zero point from calibration data and quantize directly.
+- **QAT** (Quantization-Aware Training): insert "fake-quantize" operators into the training loop so the model adapts to quantization error.
+- **TorchScript**: PyTorch's scripted intermediate representation, runnable in a C++ runtime without the Python interpreter.
+- **torch.compile**: PyTorch 2.0's JIT compilation entry point, dispatching TorchDynamo / TorchInductor behind the scenes to compile the model graph into fused kernels.
+- **CoreML**: Apple's device-side inference framework, can dispatch to CPU / GPU / ANE.
+- **ANE** (Apple Neural Engine): Apple's low-power neural-network accelerator integrated into A-series and M-series chips.
+- **NPU** (Neural Processing Unit): the generic name for mobile / embedded neural accelerators, e.g. Qualcomm HTP, Huawei NPU, MediaTek APU, Apple ANE.
+- **HTP** (Hexagon Tensor Processor): the NPU implementation in Qualcomm Snapdragon chips; runs INT8 extremely fast.
+- **SNPE** (Snapdragon Neural Processing Engine): Qualcomm's NPU SDK; converts ONNX to DLC format and dispatches to HTP / GPU / CPU.
+- **DLC** (Deep Learning Container): SNPE's model container format.
+- **NeuroPilot**: MediaTek's NPU SDK for Dimensity APU.
+- **TFLite** (TensorFlow Lite): Google's mobile / embedded inference framework, the de facto Android standard.
+- **NNAPI** (Neural Networks API): the system-layer NPU abstraction available on Android 8+; TFLite can route through NNAPI to the device NPU.
+- **OpenVINO**: Intel's inference toolchain optimized for its own CPU / integrated GPU / VPU.
+- **DirectML**: Windows' hardware-abstraction inference API, uniformly covering NVIDIA / AMD / Intel GPU.
+- **VAE** (Variational Auto-Encoder): covered in detail in Chapter 7. It comes up repeatedly here because diffusion-school latent encode / decode all go through a VAE, and VAEs are easily overflow-prone at low bit depths.
+- **KV cache** (Key-Value cache): the technique of caching previously computed attention keys and values to avoid recomputation during Transformer autoregressive inference. In low-level vision it shows up in video Transformers and on the causal inference path of diffusion Transformers.
+- **Flash Attention**: an implementation that splits attention's softmax(QK^T)V into tiled chunks and fuses into a single CUDA kernel - VRAM-thrifty and faster.
+- **Tiling**: split a large image into small blocks, infer separately, and stitch back. Section 15.9 covers this.
+- **SwinIR-Tile**: the tile inference implementation shipped with the official SwinIR repo; a community reference implementation.
+- **Boundary blending**: feathered weighting over overlap regions when stitching tiles back together; avoids visible seams.
+- **DDIM** (Denoising Diffusion Implicit Models): a deterministic sampler for diffusion models, allowing sampling with far fewer steps than training.
+- **DDIM steps**: the sampling step count when using DDIM; typically 20-50.
+- **DPM-Solver / DPM-Solver++**: high-order numerical solvers for the diffusion ODE; reach DDIM-50-quality with 10-20 steps.
+- **UniPC** (Unified Predictor-Corrector): one of the diffusion samplers; predictor-corrector structure, 8-15 usable steps.
+- **LCM** (Latent Consistency Model): a distillation that compresses a diffusion model into a student that samples in 4-8 steps.
+- **LoRA** (Low-Rank Adaptation): a low-rank delta added on top of a pretrained large model's weights; very few trainable parameters.
+- **OSEDiff / TSD-SR / AdcSR / SinSR**: four works on the "1-step diffusion SR" path; see Chapter 18.
+- **GOP** (Group of Pictures): in video coding, a group of frames starting from one I-frame (keyframe) with subsequent P/B frames depending on neighbors.
+- **I / P / B frames**: video frame types. I-frames decode independently, P-frames depend on past frames, B-frames depend on both directions.
+- **NAL** (Network Abstraction Layer) units: the transport units H.264 / H.265 cut encoded data into.
+- **A/V sync** (Audio/Video sync): audio-video temporal alignment. Humans become sensitive to lipsync errors around ±40 ms.
+- **p50 / p90 / p99 latency**: the median / 90th / 99th percentile of the latency distribution.
+- **OOM** (Out Of Memory): VRAM exhausted.
+- **QPS** (Queries Per Second): throughput metric.
+- **GAN** (Generative Adversarial Network): comes up repeatedly when discussing ESRGAN / Real-ESRGAN.
+- **RRDB** (Residual-in-Residual Dense Block): the trunk module in ESRGAN / Real-ESRGAN.
+
+Later sections introduce new abbreviations on first appearance but do not repeat the common ones.
+
+### Chapter through-line
+
+The whole chapter can be read as a "diffusion graph" from training artifact to production terminal: the PyTorch weights sit in the middle, deployment targets fan out around them, and every edge is labeled with a set of optimization techniques. The figure below gives a bird's-eye view; later sections fill in the details on individual edges.
+
+```mermaid
+graph TB
+    subgraph Source[Training side]
+        PT[PyTorch checkpoint<br/>.pt / .safetensors]
+    end
+
+    subgraph Common[Cross-platform optimization layer]
+        ONNX[ONNX<br/>cross-platform IR]
+        TS[TorchScript<br/>PyTorch native]
+        COMP[torch.compile<br/>JIT compile]
+        FUSE[op fusion<br/>Conv+BN / Conv+ReLU]
+        HALF[FP16 / BF16<br/>half precision]
+    end
+
+    subgraph Compress[Compression and distillation]
+        PTQ[PTQ<br/>post-training quantization]
+        QAT[QAT<br/>quantization-aware training]
+        DIST[distillation<br/>student-teacher]
+        LCM[LCM / 1-step SR<br/>diffusion distillation]
+        PRUNE[model pruning<br/>sparsification]
+    end
+
+    subgraph GPU[NVIDIA GPU]
+        TRT[TensorRT<br/>plan binary]
+    end
+
+    subgraph Apple[Apple devices]
+        CML[CoreML<br/>mlpackage]
+        ANE[ANE op whitelist<br/>Conv / PixelShuffle...]
+    end
+
+    subgraph Android[Android / embedded]
+        TFL[TFLite]
+        SNPE[SNPE / DLC<br/>Qualcomm HTP]
+        NEU[NeuroPilot<br/>MediaTek APU]
+    end
+
+    subgraph Runtime[Runtime techniques]
+        TILE[tile inference<br/>boundary blend]
+        STREAM[streaming / causal<br/>RNN state management]
+        PIPE[multi-model pipeline<br/>latent passthrough]
+        THERM[thermal-aware degradation]
+    end
+
+    PT --> ONNX
+    PT --> TS
+    PT --> COMP
+    COMP --> FUSE
+    ONNX --> HALF
+    ONNX --> PTQ
+    PT --> QAT
+    PT --> DIST
+    PT --> LCM
+    PT --> PRUNE
+    ONNX --> TRT
+    PT --> CML
+    CML --> ANE
+    ONNX --> TFL
+    ONNX --> SNPE
+    ONNX --> NEU
+    TRT --> TILE
+    CML --> TILE
+    TFL --> TILE
+    TRT --> STREAM
+    CML --> STREAM
+    TILE --> PIPE
+    STREAM --> PIPE
+    PIPE --> THERM
+
+    style PT fill:#e8f5e9
+    style TRT fill:#fff3e0
+    style CML fill:#e3f2fd
+    style TFL fill:#fce4ec
+    style LCM fill:#f3e5f5
+```
+
+The question this diagram answers: "I have this PyTorch checkpoint in hand; which production scenario am I deploying into, and which edge do I take?" Examples: server-side 4K live enhancement → ONNX → TensorRT FP16 + tile + multi-model pipeline; iPhone real-time filter → CoreML + ANE op whitelist + per-channel INT8 + causal streaming; diffusion-school SR going live → LCM or 1-step SR distillation + TensorRT FP16 + tile. Every later section explains the concrete decisions along one of these paths.
 
 ## 15.1 Deployment targets for inference optimization
 
@@ -123,10 +265,27 @@ Watch out for:
 
 ### 15.2.5 Quantization (INT8 / INT4)
 
-Drop weights and activations from FP16 to INT8 or even INT4:
+The core of quantization is mapping a high-precision floating-point tensor to a low-bit integer, and at inference time decoding the integer back to an approximate float. The most common symmetric linear quantization formula is:
 
-- **PTQ (Post-Training Quantization)**: quantize after training, simple but with precision loss
-- **QAT (Quantization-Aware Training)**: account for quantization during training, smaller precision loss but more complex
+$$
+q = \text{round}\left(\frac{x}{s}\right), \qquad \hat{x} = q \cdot s
+$$
+
+where $s$ is the scale and $q$ is the quantized integer (for INT8, $q \in [-128, 127]$). Asymmetric quantization adds a zero point $z$:
+
+$$
+q = \text{round}\left(\frac{x}{s}\right) + z, \qquad \hat{x} = (q - z) \cdot s
+$$
+
+How you pick the scale $s$ determines the quantization error. The naive choice is to take the tensor's absolute maximum and divide by 127, but max-scale is extremely sensitive to outliers - a single extreme activation can drag the effective precision down to 7 bits. Two improvements common in production:
+
+1. **Percentile**: take the absolute value at the 99.99th percentile as max, discarding extreme outliers.
+2. **MSE-minimum**: search on a calibration set for the scale that minimizes $\|\hat{x} - x\|_2^2$.
+
+Dropping weights and activations from FP16 to INT8 or even INT4 has two routes:
+
+- **PTQ** (Post-Training Quantization): after training, use a calibration dataset (a few hundred representative images) to estimate scale and zero point, and quantize directly. Simple flow; the size of the precision loss depends on the model's robustness to quantization error.
+- **QAT** (Quantization-Aware Training): insert "fake-quantize" operators (quantize-dequantize pairs) into the forward pass during training so gradients see the quantization error and the model learns to tolerate it. Smaller precision loss but requires retraining, with higher engineering cost.
 
 Potential gains from INT8:
 
@@ -179,6 +338,14 @@ What it does:
 - Operator fusion + kernel selection + quantization
 - Outputs a **GPU-specific optimized** binary (`.plan` file)
 - Provides C++/Python APIs for inference
+
+Why is TensorRT faster than plain PyTorch / ONNX Runtime? Three things:
+
+1. **More aggressive op fusion.** It fuses chains like Conv + BN + ReLU + Add into a single CUDA kernel, eliminating intermediate-tensor VRAM round-trips and kernel-launch overhead. PyTorch eager mode cannot do this, and torch.compile only does part of it conservatively.
+2. **Automatic kernel tuning.** For each conv, NVIDIA ships dozens of implementations (different tile sizes, layouts, tensor-core paths); TensorRT benchmarks them on your input shape and picks the fastest. The result is baked into the plan file, so plans cannot move between GPUs - a plan built on A100 will not run on a 4090.
+3. **Low-precision paths and tensor cores.** Under FP16 / BF16 / INT8 / FP8, TensorRT directly hits Ampere / Hopper tensor cores; the theoretical throughput is 4-8× higher than CUDA cores. PyTorch eager also uses cuDNN tensor cores, but TensorRT applies them across a wider set of ops.
+
+The cost is slow build time. Building an FP16 plan for an SDXL UNet on A100 takes about 5-15 minutes (depending on the `BUILDER_OPTIMIZATION_LEVEL`); adding INT8 calibration takes longer, up to 30+ minutes. So plans should be cached as CI artifacts, not rebuilt at startup.
 
 ### Workflow
 
@@ -512,7 +679,17 @@ NNAPI (Android 8+) can route TFLite models to the device NPU, but compatibility 
 
 In practice: **on Android, vendor-specific SDKs are common**—Qualcomm's SNPE, MediaTek's NeuroPilot, Huawei's HiAI.
 
-## 15.7 Model distillation: ultra-lightweight
+## 15.7 Model distillation and pruning: ultra-lightweight
+
+### 15.7.0 Three classes of "make the model smaller"
+
+This section is about distillation, but distillation should be placed in the broader context of model compression. There are three common paths to shrinking a trained model, and they are often mixed in engineering:
+
+1. **Quantization** (Section 15.2.5): drop FP32 / FP16 weights / activations to INT8 / INT4. Model size shrinks linearly; speed depends on hardware. The model structure is unchanged.
+2. **Pruning**: remove weights / channels / layers that contribute little to the output. Structured pruning (along channels / heads) directly reduces FLOPs and VRAM; unstructured pruning (per individual weight) achieves higher compression but only yields speed gains on hardware with sparse-op support. In low-level vision, **channel pruning** is the most common: during training add an L1 regularizer to each conv channel → after training sort channels by magnitude → cut the smallest k% → fine-tune for a few epochs on the remaining channels. Real-ESRGAN-Mini's slimming path includes channel pruning + distillation.
+3. **Distillation**: train a brand-new small student model from scratch to mimic the large teacher's outputs / intermediate features. The student's structure can differ completely from the teacher's (this is the biggest difference from pruning), so backbone, ops, and depth can all be swapped.
+
+The three can stack: distill a small student → channel-prune → INT8-quantize → push to device. Each step's loss is controllable in isolation (distillation costs ~5% quality, pruning ~2%, quantization ~3%); stacked, total quality drops ~10% but model size can go from 60 MB to 3 MB and speed can improve by 10×+. This is the fundamental reason real-time on-device enhancement is achievable.
 
 Pretrained model too large? Train a **student model** (small) to imitate the teacher's (large) outputs.
 
@@ -546,7 +723,70 @@ Representative projects:
 
 ## 15.8 LCM / Turbo distillation (diffusion-general)
 
-Diffusion models are too slow at 50 steps. **Latent Consistency Models (LCM)** distill them down to 4–8 steps:
+Diffusion models are too slow at 50 steps. **Latent Consistency Models (LCM)** distill them down to 4-8 steps.
+
+### Why 50 steps is a problem: get the inference timeline clear first
+
+Before getting into distillation, we should look at how the original multi-step diffusion inference actually spends time. The sequence diagram below shows a standard DDIM inference of a conditional diffusion SR (N = 50 steps): every step does a VAE-conditional outer step, a U-Net forward, and a scheduler update of the latent. The U-Net forward dominates the time per step, and every step takes roughly the same amount of time, so total time is approximately proportional to the number of steps.
+
+```mermaid
+sequenceDiagram
+    participant U as User/upstream
+    participant E as VAE Encoder
+    participant S as Scheduler<br/>DDIM/DPM-Solver/UniPC
+    participant N as U-Net (conditional)
+    participant D as VAE Decoder
+    participant O as Output
+
+    U->>E: LR image y
+    E->>S: z_T noise init + LR conditioning latent
+
+    Note over S,N: step t = T → T-1 → ... → 1<br/>(DDIM 50 steps)
+
+    loop each step t
+        S->>N: (z_t, t, cond)
+        N-->>S: predict noise ε_θ(z_t, t, cond)<br/>or v / x0 parameterization
+        Note over S: one-step update:<br/>z_{t-1} = α·z_t + β·ε_θ + γ·z_0_pred<br/>(DDIM formula)
+    end
+
+    S->>D: z_0 (clean latent)
+    D->>O: decode to pixel space x_hat
+
+    Note over N: per-step time dominated by U-Net forward<br/>SDXL UNet ~250 ms (A100 FP16)<br/>50 steps ≈ 12.5 s
+    Note over O: total latency ≈ N × T_unet + T_vae<br/>linear in N
+```
+
+With this diagram in mind, the later optimization paths make sense:
+
+- **DDIM → DPM-Solver++ / UniPC**: same quality drops 50 steps to 15-20. The algorithm changes name; per-step time does not change; "fewer steps and still converges" is achieved by the sampler.
+- **LCM / Turbo distillation**: further pushes step count to 4-8. The essence is teaching a student network to "predict x_0 in a single step from any t."
+- **OSEDiff / TSD-SR and other 1-step diffusion SR**: compress the whole timeline down to one U-Net forward + one VAE decode, ~0.3-0.8 s per image.
+- **Orthogonal optimizations**: inside the U-Net, Flash Attention fuses the attention kernel; TensorRT compilation fuses conv / attn kernels at the bottom; FP16 / BF16 halves single-forward time. These compose with "fewer steps."
+
+This is why this chapter splits "distillation for fewer steps" and "general TensorRT / compile / half precision" into two threads: they tackle different bottleneck dimensions and can be applied together.
+
+### Core idea
+
+### Diffusion sampler selection: speed-quality trade-offs of DDIM / DPM-Solver / UniPC
+
+Distillation is not the only acceleration path. **Just switching samplers** can drop 50 steps to 15-20 without retraining any student. This subsection summarizes the trade-offs among the mainstream samplers.
+
+| Sampler | Recommended steps | Order | Convergence | When to use |
+|---------|-------------------|-------|-------------|-------------|
+| **DDIM** | 30-50 | 1st-order | slow but stable, works on every model | baseline / parameter tuning |
+| **DPM-Solver** | 15-25 | 2nd-3rd order | halves step count at same quality | general acceleration |
+| **DPM-Solver++** | 10-20 | 2nd-3rd order | more stable at high CFG | large-guidance scenarios |
+| **UniPC** | 8-15 | multi-order predictor-corrector | best quality at very few steps | latency-first |
+| **Euler / Heun** | 30-50 | 1st-2nd order | simple and stable | teaching / debugging |
+
+Engineering notes:
+
+- **New-project baseline: DDIM 30 steps**, both quality and speed are middle of the road.
+- **Production default: DPM-Solver++ 20 steps**, saves 30-50% latency at quality comparable to DDIM 50 steps.
+- **Extreme latency: UniPC 10-15 steps**, can halve time again, but at low guidance scales the output goes soft.
+- **Step counts below 8**, sampler optimization has diminishing returns; switch directly to LCM / 1-step SR distillation.
+
+Note that switching samplers does not require retraining the model checkpoint - this is the biggest difference from distillation. So the rational optimization order is "swap sampler first, then consider distillation."
 
 ### Core idea
 
@@ -667,6 +907,63 @@ def tile_inference(model, image, tile_size=512, overlap=64, scale=4):
 
     return output / (weight + 1e-8)
 ```
+
+### Tile inference data flow
+
+Drawing the code above as a data flow makes the three stages "slice → infer → boundary-blend" concrete. Note the weight map `weight` is not redundant: in overlap regions, two or even four tiles contribute to the same output and we must normalize by their summed weight to get a seamless stitched result.
+
+```mermaid
+graph TB
+    IN[input HR large image<br/>1 x 3 x H x W]
+
+    subgraph Slice[1. slicing stage]
+        SCAN[sliding-window scan<br/>stride = tile_size - overlap]
+        T1[Tile 0,0<br/>top-left corner]
+        T2[Tile 0,1<br/>overlaps T1 by overlap]
+        T3[Tile 1,0]
+        TN[...more tiles]
+        PAD[corner reflect pad<br/>to tile_size]
+    end
+
+    subgraph Inf[2. inference stage]
+        MODEL[model f_theta<br/>each tile independent forward<br/>output tile_size * scale]
+    end
+
+    subgraph Blend[3. boundary-blending stage]
+        MASK[feathered mask<br/>edge 0 interior 1]
+        ACC[output accumulator<br/>weight accumulator]
+        NORM[normalize<br/>output / weight]
+    end
+
+    OUT[output HR large image<br/>1 x 3 x H*scale x W*scale]
+
+    IN --> SCAN
+    SCAN --> T1
+    SCAN --> T2
+    SCAN --> T3
+    SCAN --> TN
+    T1 --> PAD
+    T2 --> PAD
+    T3 --> PAD
+    TN --> PAD
+    PAD --> MODEL
+    MODEL --> ACC
+    MASK --> ACC
+    ACC --> NORM
+    NORM --> OUT
+
+    style IN fill:#e8f5e9
+    style OUT fill:#fff3e0
+    style MASK fill:#e3f2fd
+    style MODEL fill:#fce4ec
+```
+
+A few non-negotiable implementation details:
+
+1. **Corner reflect padding rather than zero padding.** Zero padding makes the conv see a black border around tile edges, leaving dark bands at the seams. Reflect keeps the tile-edge statistics close to the interior.
+2. **The mask is generated in HR output space, not LR input space.** After tile inference, output space is `tile_size * scale`, and the mask must feather in that scale to be aligned with the output.
+3. **Feather shape**: the implementation above uses linear feathering. More refined choices are cosine (`0.5 - 0.5 * cos`) or a Hann window, which give smoother transitions and harder-to-see seams. SwinIR-Tile's official implementation uses cosine.
+4. **Empirical overlap**: overlap should be at least "half the model's receptive field." For SwinIR / Restormer-class models with receptive fields of more than a hundred pixels, overlap = 32 produces visible seams; you need 64-128 for stability.
 
 ### Tile trade-offs
 

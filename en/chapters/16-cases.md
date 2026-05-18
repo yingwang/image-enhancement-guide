@@ -6,6 +6,33 @@
 >
 > This is the chapter closest to a "product manual" in the book.
 
+## 16.0 Chapter prologue
+
+Up to this point, most chapters of the book have lived at a "local optimum" viewpoint: Chapters 6-7 covered how a single network architecture encodes priors, Chapters 11-12 covered how a single training loop converges stably, and Chapter 15 covered how a single inference call runs efficiently on hardware. But any image-enhancement system that is actually shipped to users is never one model behind one call. It is **a pipeline composed of multiple models, multiple discriminative branches, and multiple fall-back paths**. This pipeline accepts an uncontrollable input (an image or video that the user simply dropped in), passes it through detection, routing, specialized processing, fusion, post-stage color and encoding control, and finally returns a result that fits back into the product.
+
+The question this chapter answers is: **given a concrete business scenario, how do you assemble the loose tools from earlier chapters into a pipeline that can actually ship?** After reading this chapter you should be able to:
+
+- Take a new image-enhancement requirement and first identify which class of scenario it belongs to (offline consumer product, on-device real-time, batch UGC, low-latency live streaming, sensor-embedded, evidentiary surveillance)
+- Given that scenario, list the priority order of the key constraints (quality, latency, cost, interpretability) and pick the backbone model and supporting modules accordingly
+- Draw an end-to-end flow chart and identify the failure points of each step along with the corresponding fall-back branches
+- Not drop the top-1 academic benchmark model directly into production, but use the trade-off framework given in this chapter for engineering selection
+
+**Prerequisites.** This chapter assumes the reader has finished Chapter 1's degradation model, Chapter 2's representation spaces, Chapter 5's degradation synthesis, Chapters 9-10's diffusion school and face specialization, Chapters 13-14's video and temporal modeling, and Chapter 15's deployment optimization. Each case explicitly cites the relevant section numbers when referencing earlier chapters.
+
+**Quick-reference abbreviations.** The following abbreviations recur throughout this chapter. They are listed here so you can find them quickly:
+
+- **UGC** (User-Generated Content): content uploaded by ordinary users, as opposed to professionally produced content (PGC), typically images or videos
+- **ISP** (Image Signal Processor): the integrated hardware-plus-software pipeline inside a camera that turns raw sensor readouts into a visible image
+- **HDR** (High Dynamic Range): images or video that can express a wider luminance range than the standard 8-bit display
+- **SDR** (Standard Dynamic Range): the luminance range that traditional 8-bit displays target
+- **Bayer**: the most common color-filter layout on a color sensor, with each 2×2 block arranged as RGGB (red, green, green, blue)
+- **CFA** (Color Filter Array): the general term for color-filter layouts on a sensor; Bayer is one specific instance
+- **NPU** (Neural Processing Unit): on phones and embedded platforms, dedicated hardware accelerators for neural networks, e.g. Apple ANE, Huawei Da Vinci, Qualcomm Hexagon
+- **NVDEC / NVENC** (NVIDIA Video Decoder / Encoder): hardware video decoder/encoder on NVIDIA GPUs that can decode or encode H.264 / H.265 directly on the GPU without going through the CPU
+- **OCR** (Optical Character Recognition): the task of recognizing text in an image as editable characters
+- **A/B testing**: randomly splitting users into two groups, each getting a different version, and comparing metrics to decide whether to ship the new one
+- **OOD** (Out-Of-Distribution): inputs that fall outside the training distribution; model behavior on such inputs is unpredictable
+
 ## 16.1 Structure of this chapter
 
 Each case contains:
@@ -26,6 +53,32 @@ Six cases:
 16.6  On-device ISP enhancement (mobile post-processing)
 16.7  Surveillance video enhancement (security)
 ```
+
+These six cases cover almost every typical form of image-enhancement deployment. They can be roughly placed on two axes, "latency constraint × quality constraint":
+
+```mermaid
+graph TD
+    subgraph Offline_HighQuality[Offline high quality]
+        A[16.2 Old-photo restoration<br/>Latency in seconds / generative OK]
+    end
+    subgraph NearRealtime[Near real-time]
+        B[16.3 Mobile low-light<br/>Sub-second / must be invisible]
+        C[16.4 UGC video<br/>Batch / large scale / conservative]
+    end
+    subgraph StrongRealtime[Strong real-time]
+        D[16.5 4K live stream<br/>33ms per frame / causal model]
+        E[16.6 ISP on-device<br/>NPU real-time / physical RAW]
+    end
+    subgraph EvidentiaryChain[Chain of custody]
+        F[16.7 Surveillance video<br/>No fabrication / auditable]
+    end
+
+    style A fill:#e3f2fd
+    style D fill:#ffebee
+    style F fill:#fff3e0
+```
+
+Keep this picture in your head as you read the six sections below. Each section is really the same question answered under different constraints: **how bold are you letting the model be?**
 
 ## 16.2 Case: old-photo restoration
 
@@ -95,30 +148,68 @@ Original old photo
 Restored photo
 ```
 
+### Pipeline data-flow diagram
+
+Drawing the six steps as an end-to-end diagram makes the relationship between the main branch and the face sub-branch clearer:
+
+```mermaid
+graph TD
+    Input[User upload<br/>Original old photo] --> Decode[Step 1<br/>Decode / detect resolution<br/>Keep original file]
+    Decode --> Defect[Step 2<br/>Defect detection<br/>Scratches / creases / missing]
+    Defect --> Inpaint[Step 2<br/>LaMa inpainting<br/>Fill missing regions]
+    Inpaint --> IsBW{Black and white?}
+    IsBW -- Yes --> Color[Step 3<br/>DDColor colorization<br/>Optional prompt]
+    IsBW -- No --> SR
+    Color --> SR[Step 4<br/>Generic enhance<br/>SUPIR / Real-ESRGAN<br/>User tunes fidelity]
+    SR --> Detect[Step 5a<br/>Face detection<br/>RetinaFace / SCRFD]
+    Detect --> Align[Step 5b<br/>Face alignment<br/>5-point landmarks]
+    Align --> Face[Step 5c<br/>CodeFormer<br/>fidelity 0.5]
+    Face --> Blend[Step 5d<br/>Seamless paste-back<br/>Poisson / Laplacian]
+    SR --> Blend
+    Blend --> Post[Step 6<br/>Color balance / USM<br/>JPEG Q=95]
+    Post --> Output[Enhanced photo<br/>+ processing log]
+
+    style Input fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style Face fill:#fff3e0
+    style SR fill:#fff3e0
+```
+
+A few key engineering details to notice:
+
+1. **Step 2 inpainting and Step 4 generic enhancement are serial, not parallel.** Missing structure must be filled in first so that generic SR works on a complete image; otherwise SR will treat "damaged" regions as texture to be magnified.
+2. **The Step 5 face sub-branch and the main branch share the same enhanced background.** The face crops come from the original image (to preserve clean boundaries and alignment), and the enhanced face is pasted back onto the SR output (so the surrounding background has already been processed).
+3. **Step 6 color balance comes after all generative steps.** Because SUPIR, DDColor, and CodeFormer can each introduce tone drift, the final stage pulls everything back into alignment (see Section 17.9).
+
 ### Key decisions
 
 **Step 2 uses LaMa, not diffusion inpainting**:
-- LaMa is fast and works well on small scratches
-- Diffusion inpainting is slow and tends to "create" content (it might invent objects that aren't there)
+- LaMa (Large Mask inpainting, a fast-Fourier-convolution-based large-mask inpainting model) is fast and works well on small scratches; a single 4K image takes a few hundred milliseconds on an A10
+- Diffusion inpainting is slow and tends to "create" content—it can synthesize half a face in a region where no person exists; that kind of "surprise" is a production incident in the old-photo scenario
+
+**Step 3 uses DDColor for colorization**:
+- DDColor (Dual Decoder Colorization, a 2023 automatic colorization model with two decoders) is pretrained on ImageNet and COCO and has reasonable priors for people, clothing, and indoor scenes common in old photos
+- The user can supply a prompt (e.g. "sepia tone", "natural daylight") to control the overall tone, avoiding the model coercing every photo into the same modern look
 
 **Step 4 lets the user tune fidelity**:
 - 0.3: lean on the diffusion prior, the old-photo grain is replaced with "modern texture"
 - 0.7: keep the original grain and period feel
-- Different users have different preferences—don't hard-code
+- Different users have different preferences—don't hard-code. The most common backend A/B-tested default sits around 0.55
 
 **Step 5 processes face crops individually**:
-- General SR is poor on faces (Chapter 10)
-- Detect faces → align → CodeFormer → paste back
-- fidelity_weight = 0.5: identity preservation + moderate generation
+- General SR is poor on faces (Chapter 10), because the face prior is quite different from the natural-image prior
+- Detect faces, align to the 512×512 standard position used during CodeFormer training, run the model, then paste back with Poisson blending or Laplacian pyramid blending to avoid visible seams
+- fidelity_weight = 0.5: the balance point between identity preservation and moderate generation. This is the product default tuned through human-evaluation A/B testing, not the value recommended in the paper
 
 ### Failure modes
 
-- **Multi-face scenes**: the detector misses some faces → those faces stay blurry
-- **Profile / extreme angles**: the face detector fails
-- **Old photos with stamps / handwriting**: the model treats them as "defects" and removes them
+- **Multi-face scenes**: the detector misses some faces, and those faces stay blurry
+- **Profile or extreme angles**: the face detector fails and CodeFormer's alignment assumption no longer holds
+- **Old photos with stamps or handwriting**: the model treats them as "defects" and removes them
 - **Clothing patterns**: the model "modernizes" them, losing period feel
+- **OOD faces in group portraits** (Out-Of-Distribution, e.g. children, the elderly, non-European/non-American ethnicities): CodeFormer's restoration "looks like a different person"; see Section 17.11
 
-Mitigation: provide UI for the user to **manually mark the priority restoration regions** instead of going fully automatic.
+Mitigation: provide UI for the user to **manually mark the priority restoration regions** instead of going fully automatic; and explicitly label the result page with "AI restoration may differ from the original details".
 
 ### Representative products
 
@@ -187,17 +278,19 @@ RAW / multi-frame RGB
 ### Key decisions
 
 **Multi-frame fusion instead of single-frame enhancement**:
-- A single ISO 6400 frame is overwhelmingly noisy; denoising loses detail
-- Multi-frame fusion is equivalent to "more exposure"—it raises SNR at the source
-- This is the core idea behind Google Pixel HDR+ and iPhone Night Mode
+- A single ISO (International Organization for Standardization; in photography ISO denotes sensor sensitivity, where a higher value means a higher amplification factor and more noise) 6400 frame is overwhelmingly noisy; denoising loses significant detail
+- Multi-frame fusion is equivalent to "more exposure"—it raises SNR at the source. In theory, fusing $N$ frames brings read noise down to $1/\sqrt{N}$, which is a physical improvement, not a post-hoc guess
+- This is the core idea behind Google Pixel HDR+ (High Dynamic Range Plus, Google's multi-frame HDR pipeline) and iPhone Night Mode
 
 **On-device NAFNet instead of Restormer**:
-- NAFNet has no attention—it's ANE-friendly
-- Distilled to 1M parameters, single 12 MP frame inference ~100 ms
+- **NAFNet** (Non-linear Activation Free Network, a minimalist residual network that replaces nonlinear activations with gating multiplications) has no self-attention, so it is friendly to the ANE (Apple Neural Engine, Apple's neural network accelerator), and both quantization and compilation go smoothly
+- Distilled to 1M parameters, single 12 MP (12 Megapixel) frame inference ~100 ms
+- Restormer has channel attention; on-device NPU compilers support it inconsistently, so cross-device stability is poor
 
 **Color restoration** matters more than "quality boost":
 - Users can tolerate mild noise but cannot tolerate color shifts
-- White balance drifts heavily under low light and must be corrected
+- White balance drifts heavily under low light and must be corrected. The common approach is to use a small CNN to estimate the scene illuminant's color temperature and tint (gain factors), then apply an inverse correction
+- The reason this step is "good when invisible" is that the human eye is extremely sensitive to color cast and almost insensitive to a 0.5 dB PSNR gain
 
 ### Failure modes
 
@@ -273,18 +366,19 @@ Original 720p 30fps video
 
 **1.5× instead of 4× SR**:
 - Users watch on phones; 1080p is plenty
-- 4× compute is the square of 4×
-- "Sharpening" 1080p → 1080p is perceptually close to 4× SR
+- 4× compute is the square of 4× (output pixels are 16× the input); 1.5× only increases the pixel count by 2.25×
+- "Sharpening" 1080p → 1080p is perceptually close to 4× SR, because removing compression artifacts and raising local sharpness matters more subjectively than raw physical resolution
 
 **BasicVSR++ instead of SUPIR**:
-- Video cannot fabricate (consistency issues)
-- BasicVSR++ is fast (< 50 ms/frame)
-- Cost: < $0.01 per minute-long clip
+- Video cannot fabricate; the consistency issue was covered in detail in Chapter 13: a diffusion-based model samples each frame independently, and the slight differences across adjacent frames produce flicker
+- BasicVSR++ (the second-generation BasicVSR, adding second-order propagation and flow-guided deformable convolution) is fast: a single 720p frame takes less than 50 ms on an A100
+- Cost: a one-minute 30fps clip (1800 frames) takes about 90 seconds of GPU time on an A100; at hourly rates this comes out to well under one cent per minute of video processed
 
 **Front-load content classification**:
 - Landscape video: weaken denoising (preserve texture)
 - Face-dominant: enable face enhancement
-- Animation: skip SR (animation is already vector-styled)
+- Animation: skip SR (animation is already vector-styled; super-resolving it introduces "natural-image-style texture" that breaks the art style)
+- Screen recordings (instructional video, recorded game streams): take a dedicated screenshot-enhancement branch, because text and UI edges have entirely different statistics
 
 ### Failure modes
 
@@ -292,8 +386,9 @@ Original 720p 30fps video
 - **Stylized video** (anime, oil painting): the model treats it as "low quality" and destroys the style
 - **Very low frame-rate sources** (10 fps surveillance): SR makes it look worse
 - **Heavy-motion scenes**: temporal consistency breaks
+- **HDR source video** (High Dynamic Range): the statistics learned on SDR training data don't match HDR, and the luminance mapping can be off
 
-Mitigation: **the model must be able to recognize "no enhancement needed" and bypass**.
+Mitigation: **the model must be able to recognize "no enhancement needed" and bypass**. Concretely, at Step 1 content analysis, also run a lightweight NR-IQA model (such as MANIQA-Lite) over the source frames; clips whose scores exceed a threshold (e.g. 0.7) skip SR entirely and only go through re-encoding. The "don't enhance" decision saves a lot of compute and avoids ruining already-good content.
 
 ### Representative implementations
 
@@ -390,10 +485,10 @@ A phone vendor wants its phones' photos to "look better than same-priced competi
 
 ### Key constraints
 
-- **Sensor RAW input** (not RGB)
-- **Multiple cameras** (main / ultra-wide / telephoto / macro)
-- **On-device NPU** (Qualcomm Hexagon, Huawei Da Vinci, Apple ANE)
-- **Ultra-low power**: shooting 1000 photos cannot drain the battery
+- **Sensor RAW input** (not RGB). RAW is the unprocessed data read off the sensor before demosaicing and color processing—typically a single-channel image under a **Bayer** color-filter encoding. Bayer is the most common CFA (Color Filter Array) layout, where each 2×2 block consists of four filter cells arranged RGGB (red, green, green, blue); green occupies two slots to match the human eye's higher sensitivity to green.
+- **Multiple cameras** (main / ultra-wide / telephoto / macro), each with a different sensor size, optics, and noise distribution
+- **On-device NPU** (Qualcomm Hexagon, Huawei Da Vinci, Apple ANE). NPUs differ in their operator support, so the model must be compiled and quantized separately for each platform
+- **Ultra-low power**: shooting 1000 photos cannot drain the battery. This means the per-inference energy budget is only tens of millijoules, and both model and tensor encoding must be optimized at the millisecond level
 
 ### Pipeline (simplified phone ISP)
 
@@ -447,21 +542,45 @@ Sensor RAW (Bayer pattern, 12-bit)
 8-bit JPEG / HEIC
 ```
 
+### ISP end-to-end data-flow diagram
+
+Drawing the ASCII pipeline above as a mermaid diagram makes the data-format transitions from RAW to RGB to JPEG easier to track:
+
+```mermaid
+graph TD
+    Sensor[Sensor readout<br/>Bayer RAW 12-bit] --> BLC[Black Level<br/>Correction]
+    BLC --> LSC[Lens Shading<br/>Correction]
+    LSC --> Denoise[Step 2<br/>Bayer-domain denoise<br/>NAFNet-Lite]
+    Denoise --> Demosaic[Step 1<br/>Learned demosaic<br/>RAW → RGB]
+    Demosaic --> WB[Step 3<br/>White balance<br/>Learned illuminant estimate]
+    WB --> CCM[Color Correction Matrix<br/>convert to standard gamut]
+    CCM --> Tone[Step 4<br/>Local tone mapping<br/>Learned HDR compression]
+    Tone --> Sharpen[Step 5<br/>USM sharpening<br/>Optional face beauty]
+    Sharpen --> Encode[JPEG / HEIC<br/>8-bit output]
+
+    style Sensor fill:#e8f5e9
+    style Encode fill:#e3f2fd
+    style Denoise fill:#fff3e0
+    style Demosaic fill:#fff3e0
+```
+
+Note that in this pipeline, **Bayer-domain denoising happens before demosaicing**. The reason is that Bayer-domain noise is i.i.d. Gaussian + Poisson (each photo-site is independent); after demosaicing, the noise becomes cross-channel correlated and spatially correlated, which raises the denoising difficulty by an order of magnitude.
+
 ### Key decisions
 
 **Learned demosaicing instead of classic**:
-- Classic demosaicing (Malvar, AHD) produces zipper artifacts at edges
-- Learned demosaicing avoids them and denoises simultaneously
-- But it must be trained per sensor
+- Classic demosaicing (Malvar; AHD, Adaptive Homogeneity-Directed) produces zipper artifacts at edges (rainbow-colored, zipper-like color smears along edges)
+- Learned demosaicing avoids them and can fuse in denoising at the same time
+- But it must be trained per sensor; when sensors change generation, the model has to be retrained
 
 **Bayer-domain vs. RGB-domain denoising**:
-- Bayer domain (before demosaic): noise is i.i.d., denoising is simple but resolution drops
+- Bayer domain (before demosaic): noise is i.i.d., denoising is simple, but resolution is limited (each channel is sub-sampled)
 - RGB domain (after demosaic): noise is correlated, denoising is harder
-- Vendors choose differently; the mainstream is Bayer-domain denoising → learned demosaic
+- Vendors choose differently; the mainstream is Bayer-domain denoising followed by learned demosaicing
 
 **Face beautification must be toggleable**:
 - Preferences differ across regions and cultures
-- Legal risk (EU GDPR on biometric processing)
+- Legal risk (EU GDPR, General Data Protection Regulation, sets strict limits on biometric processing)
 - Provide a user toggle in settings
 
 ### Failure modes
@@ -537,17 +656,17 @@ Enhanced video + processing log
 
 **Absolutely no diffusion models**:
 - Diffusion synthesizes "plausible but nonexistent" detail
-- "The model generated a license plate ABC123" is a courtroom incident
-- Discriminative models only (CNN/Transformer)
+- "The model generated a license plate ABC123" is a courtroom incident, with no one able to explain why the model "saw" it
+- Discriminative models only (the discriminative paradigm—directly outputting a single best answer from the input—represented by CNNs and non-generative Transformers)
 
 **Conservative SR ratios**:
 - 4× SR distorts severely degraded inputs
-- Surveillance commonly uses 2× or even 1.5× (sharpening, not enlarging)
+- Surveillance commonly uses 2× or even 1.5× (sharpening, not enlarging); the goal is to surface information that is already present but unclear
 
 **Specialized for plates / faces**:
 - General SR helps little with plate character recognition
-- Use OCR-aware SR (Chapter 10)
-- Use face SR with identity-preserving losses
+- Use OCR-aware SR (Chapter 10), adding an OCR text-similarity loss during training
+- Use face SR with identity-preserving losses (ArcFace embedding distance; ArcFace is a loss function and the corresponding feature extractor that trains face recognition with an additive angular margin)
 
 ### Failure modes
 
@@ -562,6 +681,109 @@ Enhanced video + processing log
 - Hikvision / Dahua AI enhancement
 - Forensic video tools used by law enforcement
 - Adobe Premiere's Detail Boost (labeled "AI enhancement", not used as evidence)
+
+## 16.7b Case: screen-capture enhancement
+
+### Scenario
+
+A user takes a screenshot of computer or phone content (a chat log, web page, document, slide deck) for sharing or archiving. The source may come from a low-resolution screen, has been recompressed, has moiré (common when a phone photographs a screen), or fonts have aliased under scaling. The user wants the result to have crisper text and cleaner UI edges.
+
+### Key constraints
+
+- **Font fidelity**: every character must remain readable; the model cannot turn "目" into "日"
+- **Sharp UI lines**: icon edges and button outlines are straight lines, not natural texture
+- **Speed**: typically embedded in a share flow with sub-second response
+
+### Pipeline
+
+```mermaid
+graph TD
+    Input[Screen capture<br/>contains text / UI / capture artifacts] --> Classify[Content classification<br/>text-only / contains image / mixed]
+    Classify -- Text only --> DocSR[DocSR<br/>OCR-aware loss training]
+    Classify -- Contains image --> Detect[Text region detection<br/>EAST / DBNet]
+    Detect --> TextCrop[Text crops<br/>routed to DocSR]
+    Detect --> ImgArea[Image regions<br/>routed to Real-ESRGAN]
+    TextCrop --> Merge[Merge by position]
+    ImgArea --> Merge
+    DocSR --> Output
+    Merge --> Output[Enhanced screenshot<br/>lossless PNG]
+
+    style Input fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style DocSR fill:#fff3e0
+    style ImgArea fill:#fff3e0
+```
+
+### Key decisions
+
+**Output PNG, not JPEG**:
+- Screen captures contain many "hard edges" (text, UI lines), and JPEG's ringing artifacts at hard edges are particularly visible
+- PNG is lossless, so output quality is consistent
+
+**Text regions must use a dedicated model**:
+- Generic Real-ESRGAN treats text as natural texture and tends to smooth out strokes
+- After text detection, run a dedicated DocSR (Document Super-Resolution) trained with OCR-aware loss to ensure character recognition stays consistent
+
+**Front-load moiré detection**:
+- When photographing a screen, moiré (periodic interference patterns between screen pixels and camera sampling) is a universal problem
+- When moiré is detected, run a demoiré model (such as DMCNN, Demoire CNN) first, then continue with later enhancement
+
+### Failure modes
+
+- **Very small fonts** (< 8 pixels tall): information has already been lost
+- **Special symbols / emoji / math formulas**: DocSR's training data is biased toward printed text and performs poorly on these OOD inputs
+- **Screenshots that are themselves second-hand captures** (a forwarded screenshot of a screenshot): the layered compression artifacts are too complex for the model to disentangle
+
+## 16.7c Case: medical endoscopy enhancement
+
+### Scenario
+
+Video from an endoscope (gastrointestinal, respiratory, joint cavity). Because of the optical structure and small sensor, the picture is often dark, has strong specular reflections and lens fog, and shows pronounced motion blur. Clinicians want enhancement that lets them see tissue texture and small lesions more clearly.
+
+### Key constraints
+
+- **Absolutely no generation allowed.** Any "guessed" detail in a clinical-medical setting is a malpractice risk.
+- **Real-time**: real-time playback is needed during the procedure; latency above 100 ms makes precision operation hard for the clinician.
+- **Interpretable**: the physical meaning of each enhancement step must be clear, to support regulatory approval.
+
+### Pipeline
+
+```mermaid
+graph LR
+    Cam[Endoscope video<br/>BGR / RGB] --> Spec[Specular detection<br/>+ local inpaint highlight removal]
+    Spec --> Fog[Fog detection<br/>dark-channel-prior dehaze]
+    Fog --> Low[Retinexformer<br/>low-light enhance]
+    Low --> Denoise[Restormer<br/>discriminative denoise]
+    Denoise --> Sharpen[USM sharpen<br/>conservative strength]
+    Sharpen --> Output[Enhanced video<br/>+ processing log]
+
+    style Cam fill:#e8f5e9
+    style Output fill:#e3f2fd
+    style Low fill:#fff3e0
+    style Denoise fill:#fff3e0
+```
+
+### Key decisions
+
+**Specular reflections and fog are detected separately**:
+- Specular reflection is a severe interference in medical imagery and must be detected and treated with limited inpainting (small area, using a discriminative model like LaMa; no diffusion)
+- Fog goes through classical dark channel prior dehazing (Kaiming He's 2009 work)—interpretable and not dependent on training data
+
+**Retinexformer instead of a diffusion-school model**:
+- Section 18.10 expands on this; Retinexformer takes the Retinex physical model (image = reflectance × illumination) as its inductive bias, which matches the medical scenario's requirement for physical interpretability
+- The diffusion school is unusable in the medical setting because "generation" behavior is uncontrollable
+
+**USM strength is dialed down to conservative**:
+- USM (Unsharp Mask: subtract a blurred copy from the original to get the high frequencies, then add them back to enhance edges) is classical and interpretable
+- Too aggressive and it would amplify noise as edges; in medical settings, prefer the "soft" side
+
+### Failure modes
+
+- **Extreme low light** (below candle light): Retinex's "smooth illumination" assumption fails
+- **Large bleeding or strong reflection**: the detector fails
+- **Motion-dominated** (operating too fast): denoising and motion blur are in conflict
+
+The engineering discipline for medical scenes is even stricter than for surveillance: all processing must have a complete log, all models must pass regulatory approval (FDA, NMPA, etc.), and any model upgrade must go through full clinical validation.
 
 ## 16.8 General engineering takeaways
 

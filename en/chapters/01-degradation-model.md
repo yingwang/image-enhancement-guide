@@ -2,6 +2,37 @@
 
 > "Enhancement" is one way to put it. This book uses a more accurate word: **estimation**.
 
+## 1.0 Reader Orientation
+
+This book is written for algorithm engineers who already have some machine-learning background but have **not necessarily worked on low-level vision specifically**. The background it presumes:
+
+- Familiarity with tensor computation, comfortable reading PyTorch code; you know roughly what convolution, upsampling, normalization, and attention do
+- Comfortable reading standard loss-function expressions and the gradient-descent training loop
+- You have heard of diffusion models even if you have not trained one yourself
+
+What this book does **not** presume: image signal processing (ISP), frequency-domain theory of sampling and aliasing, video coding standards, the physics of sensor noise, or the internals of specific low-level vision models. The first time any term shows up, a sentence or two will explain what it refers to before the book starts using it.
+
+**Notation.** The following symbols are used consistently throughout the book:
+
+- $x$: the ideal high-quality image (ground truth), tensor shape generally written as $(C, H, W)$, where $C$ is the number of color channels and $H, W$ are height and width
+- $y$: the observed low-quality image; shape may differ from $x$ (in super-resolution $y$ is smaller than $x$)
+- $\hat{x}$: the model's estimate of $x$
+- $D$: the degradation operator, the process that turns a high-quality image into a low-quality one
+- $n$: noise
+- $f_\theta$: a model parameterized by $\theta$
+- $p(\cdot)$: a probability distribution
+
+**Abbreviations on first appearance.** To keep terminology from becoming a wall, the first time an acronym appears in this book it is given in parentheses with a one-line definition:
+
+- **ISP** (Image Signal Processor): the in-camera pipeline that turns raw sensor readings into a viewable image
+- **ISO**: the sensor's sensitivity rating; higher means more amplification and more visible noise
+- **DCT** (Discrete Cosine Transform): the step in JPEG that transforms 8×8 pixel blocks to the frequency domain
+- **HR / LR** (High Resolution / Low Resolution)
+- **SR** (Super-Resolution): the task family of upsampling a low-resolution image to high resolution
+- **IQA** (Image Quality Assessment)
+
+More acronyms specific to later chapters are introduced where they first appear; this section does not try to enumerate them all.
+
 ## 1.1 A Concrete Scenario
 
 It's 9 PM. You raise your phone on the street and snap a shot of a neon sign. Back home, the picture has these problems:
@@ -106,15 +137,24 @@ def total_variation_loss(x: torch.Tensor) -> torch.Tensor:
 
 ### Data-driven priors (learned by CNNs/Transformers)
 
-After SRCNN in 2014, deep learning replaced variational methods. A CNN maps end-to-end from $y$ to $\hat{x}$, with the prior implicitly encoded in the weights. The model is trained on large amounts of natural image $(x, y)$ pairs and learns "the low-dimensional manifold of natural images in weight space."
+After **SRCNN** (Super-Resolution Convolutional Neural Network, the seminal 2014 work that did super-resolution with a three-layer CNN) in 2014, deep learning replaced variational methods. A convolutional neural network maps end-to-end from $y$ to $\hat{x}$, with the prior implicitly encoded in the weights. The model is trained on large amounts of natural image $(x, y)$ pairs and learns "the low-dimensional manifold of natural images in weight space."
 
-Characteristics of this family: **discriminative**—given a $y$, output a $\hat{x}$. The model does not explicitly model $p(x)$, but after training on a large dataset, the output $\hat{x}$ naturally lands on the natural image manifold.
+Characteristics of this family: **discriminative (meaning the model, given an input, directly outputs the best answer)**—given a $y$, output a $\hat{x}$. The model does not explicitly model $p(x)$, but after training on a large dataset, the output $\hat{x}$ naturally lands on the natural image manifold.
 
-Representatives: SRCNN, EDSR, RCAN, SwinIR, Restormer, NAFNet (covered in Chapters 6–7).
+Representatives:
+
+- **SRCNN** (2014, three-layer convolution)
+- **EDSR** (Enhanced Deep Super-Resolution, 2017, a deep residual network with BatchNorm removed)
+- **RCAN** (Residual Channel Attention Network, 2018, brought channel attention into SR)
+- **SwinIR** (Swin Transformer for Image Restoration, 2021, brought window-attention Transformers into low-level vision)
+- **Restormer** (2022, channel-wise self-attention so that resolution stops being the bottleneck)
+- **NAFNet** (Non-linear Activation Free Network, 2022, a minimalist design that replaces non-linear activations with gated multiplications)
+
+Chapters 6–7 cover each of these in turn.
 
 ### Generative priors (diffusion models)
 
-After DDPM in 2020, generative models themselves explicitly model $p(x)$. Given $y$, you can do conditional generation $p(x | y)$ and sample $\hat{x}$ from this conditional distribution.
+After **DDPM** (Denoising Diffusion Probabilistic Model) in 2020, generative models themselves explicitly model $p(x)$. Given $y$, you can do conditional generation $p(x | y)$ and sample $\hat{x}$ from this conditional distribution.
 
 This is the **generative** route. The fundamental difference from the discriminative route:
 
@@ -218,6 +258,35 @@ Video compression (H.264/H.265/AV1) is similar but more complex—plus motion co
 
 White-balance drift, color attenuation, color-temperature shifts caused by low light. Mathematically this kind of degradation is not a spatial-dimension problem but a non-linear transformation in value space.
 
+### Data-flow diagram of the compound degradation chain
+
+Stringing all the components above together—from the ideal image down to the bad picture in the user's hand—the full chain can be drawn as the diagram below. This diagram is also the mental target every chapter of this book keeps in view: what your model is doing, fundamentally, is trying to walk this chain backward.
+
+```mermaid
+graph LR
+    X[Ideal image x<br/>photon distribution / RAW] --> Blur[Blur<br/>defocus / motion / diffraction]
+    Blur --> Down[Downsample<br/>bicubic / area / lanczos]
+    Down --> Color[Color distortion<br/>white-balance drift / tone shift]
+    Color --> Noise[Add noise<br/>Poisson + read + dark current]
+    Noise --> Quant[Quantization<br/>8bit / 10bit]
+    Quant --> JPEG[JPEG compression<br/>DCT quantization + chroma subsampling]
+    JPEG --> Net[Network recompression<br/>WeChat / Weibo / Twitter]
+    Net --> Y[Observed image y<br/>the one in the user's phone]
+    Y -. inverse problem .-> Inv[Model f_θ<br/>estimate x̂]
+    Inv -. estimate .-> X
+
+    style X fill:#e8f5e9
+    style Y fill:#ffebee
+    style Inv fill:#fff3e0
+```
+
+A few engineering conclusions are worth being explicit about:
+
+1. **The chain is ordered, but in the real world every step's order can swap**—JPEG, for instance, may happen before, after, or in the middle of the color distortion. Real life is a tangle, not the neat sequence of arrows in this picture.
+2. **Every step is random**—the same scene passed through two units of the same camera model produces different output each time, because the noise samples differ and the compression quantization clips differently.
+3. **Steps further to the right dominate the perceived "badness"**—compression and noise directly hit PSNR; blur and downsampling hit perceived sharpness.
+4. **The model $f_\theta$ is not simply "running each step backward"**—it learns the inverse of the whole chain at once, not stepwise. This is the fundamental reason end-to-end methods beat staged methods in this field.
+
 ## 1.6 Blind vs non-blind: is D known or unknown?
 
 Back to the central equation $y = D(x) + n$. A question commonly conflated in tutorials: **at inference time, is $D$ actually known or unknown?** The two settings have radically different engineering implications. The rest of this book defaults to the blind setting, but the paradigm needs naming first.
@@ -269,8 +338,8 @@ The book's promise of "look at a bad image and immediately judge what to do" is 
 
 Chapter 4 covers this in depth, but briefly. **Evaluation metrics also split into full-reference (FR) and no-reference (NR)**:
 
-- **FR-IQA**: PSNR / SSIM / LPIPS / DISTS — require an HR ground truth
-- **NR-IQA** (also called blind IQA): NIQE / MANIQA / CLIP-IQA / Q-Align — only see the output
+- **FR-IQA** (Full-Reference Image Quality Assessment): score the model output against the ground truth. Representative metrics: **PSNR** (Peak Signal-to-Noise Ratio), **SSIM** (Structural Similarity), **LPIPS** (Learned Perceptual Image Patch Similarity, using deep-network features as a perceptual distance), **DISTS** (Deep Image Structure and Texture Similarity, scoring structure and texture separately). An HR ground truth is required.
+- **NR-IQA** (also called blind IQA): score the output image on its own. Representative metrics: **NIQE** (Natural Image Quality Evaluator, a no-reference metric based on natural-image statistics), **MANIQA** (Multi-dimension Attention Network for IQA), **CLIP-IQA** (uses the CLIP text-image alignment space to score quality), **Q-Align** (uses a large model to score on a 1–5 scale aligned with human judgement).
 
 In production **ground truth doesn't exist** (the bad images users upload have no "matching HD version"), so **online quality monitoring can only rely on NR-IQA**. This is the necessary corollary of the blind paradigm propagating from training to evaluation.
 
@@ -352,6 +421,19 @@ Photons arriving at the sensor follow a **Poisson process**. If a pixel position
 Key property: **variance equals mean**. Bright regions get many photons, large absolute noise; dark regions get few photons, small absolute noise. But the **signal-to-noise ratio** SNR $= N / \sqrt{N} = \sqrt{N}$, so bright regions have higher SNR.
 
 This is why nighttime photos have severe noise in dark areas—few photons, large relative noise.
+
+Drawn as a diagram: the horizontal axis is pixel brightness (photon count), the vertical axis is the noise standard deviation at that pixel. Poisson noise gives a curve $\sigma = \sqrt{N}$ that grows as the square root; a Gaussian approximation that doesn't distinguish bright from dark gives a flat horizontal line.
+
+```mermaid
+graph LR
+    A[Pixel brightness N<br/>photon count] -->|Poisson sampling| B[Actual count ~Poisson N]
+    B --> C[Absolute noise σ = √N<br/>large in bright, small in dark]
+    C --> D[Relative noise σ/N = 1/√N<br/>small in bright, large in dark]
+    D --> E[Severe noise in dark regions<br/>training must use<br/>signal-dependent noise]
+
+    style A fill:#e3f2fd
+    style E fill:#ffebee
+```
 
 ### Read noise
 

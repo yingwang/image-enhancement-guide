@@ -2,13 +2,129 @@
 
 > A model with great average metrics still fails in production.
 >
-> This chapter collects the **most common failure modes** in image enhancement over the past few years—each with a concrete scenario, root cause, and mitigation.
+> This chapter collects the **most common failure modes** in image enhancement over the past few years - each with a concrete scenario, root cause, and mitigation.
 >
 > This is the most "battle-tested" chapter in the book and the one most worth re-reading.
 
+## 17.0 Chapter prologue
+
+After 16 chapters, you have the full toolchain for a complete enhancement system: mathematical definitions, representation spaces, loss design, evaluation metrics, data synthesis, network architectures, training dynamics, video temporal modeling, and deployment optimization. In theory, this toolkit is sufficient to train a model that performs respectably on most public benchmarks.
+
+But there is an asymmetric fact in the engineering world: once an enhancement model ships, **what users remember is not how much you improved the average metric over the previous version, but the catastrophic failure on one specific image**. A face turned into candy wrap, a video that flickers across a scene cut, a document where "日" is rewritten as "目"—any one of these can erase all the PSNR gains. The failure cases that propagate on social media are never the inverse of "average PSNR up by 0.2 dB"; they are dramatic errors on OOD inputs (out-of-distribution samples—inputs whose distribution was not seen during training).
+
+This chapter is a catalog of these dramatic errors. Every entry in the catalog comes from a real product incident: screenshots from social media, user complaints, red lines in internal regression tests. They are the pitfalls the field has stepped into over the past decade, and the navigational chart left behind after others paid the cost. Reading this chapter is unlike reading any earlier one: the earlier ones told you how to build a car, this one tells you which intersections will flip it.
+
+Each failure mode follows the same template: a concrete product scenario first (so you can "see" the problem), then root-cause analysis (so you understand why it happens), and finally a set of actionable mitigations (so you know what defenses to add in your own system). None of the three sections is dispensable. Reading only the scenario without the root cause leads you to think the problem is "the model isn't good enough"; reading the root cause without mitigations leaves you stuck on complaint rather than improvement; jumping to mitigations while skipping the root cause leads to wasted effort (the patches are applied in the wrong place).
+
+At the end of the chapter we also do two things: distill all the failure modes into five general mitigation principles, and operationalize the test set as a regression suite that plugs into CI. The first helps you know where to look when a new failure mode appears; the second ensures that problems discovered today won't quietly come back in the next version.
+
+## 17.0.1 Notes on abbreviations and terminology
+
+The following abbreviations recur in this chapter and across neighboring chapters; they are listed here for quick reference:
+
+- **OOD** (Out-Of-Distribution): inputs not covered by the training distribution. Model behavior on OOD inputs has no theoretical guarantee; most failure modes are essentially this.
+- **PSNR** (Peak Signal-to-Noise Ratio): the log of pixel-level MSE; the dominant academic benchmark metric.
+- **SSIM** (Structural Similarity): a metric that combines luminance, contrast, and structure.
+- **LPIPS** (Learned Perceptual Image Patch Similarity): perceptual distance computed from deep network features (VGG / AlexNet).
+- **MANIQA / CLIP-IQA / Q-Align**: no-reference IQA (Image Quality Assessment) models.
+- **FFHQ** (Flickr-Faces-HQ): the 70K high-resolution face dataset used to train StyleGAN, mostly sourced from Flickr, skewed toward Caucasian and young subjects.
+- **ArcFace**: the most widely used face recognition model in industry, mapping faces to a 512-dimensional angularly separable hyperspherical embedding.
+- **CodeFormer**: a face restoration model that uses a VQ codebook as a strong prior, with a tunable fidelity parameter.
+- **SUPIR / OSEDiff / TSD-SR / SinSR / DiffBIR / PASD / SeeSR / ResShift / StableSR / AdcSR**: different engineering approaches in the diffusion-school SR lineage. The next chapter walks through each one; in this chapter you only need to know that their common failure pattern is "guessing too freely".
+- **SDXL** (Stable Diffusion XL): a 2.6B-parameter text-to-image base model; most diffusion-school SR systems attach a ControlNet or LoRA fine-tune on its UNet.
+- **SD3 / SD3.5 / FLUX** (the next-generation DiT backbones from 2024-2025): MM-DiT text-to-image base models; some newer diffusion SR systems replace SDXL with these as backbones.
+- **ControlNet**: a side-network that injects extra visual conditions (edge maps, depth maps, low-quality images, etc.) into a pretrained UNet.
+- **LLaVA** (Large Language and Vision Assistant): a multimodal large model that produces natural-language descriptions of an image; SUPIR uses it to auto-generate prompts for input images.
+- **QAT / PTQ** (Quantization-Aware Training / Post-Training Quantization): quantization during training vs. after training.
+- **HDR / SDR** (High / Standard Dynamic Range): HDR refers to image/video formats whose brightness range exceeds 0-255.
+- **WCG** (Wide Color Gamut): color spaces whose gamut exceeds Rec.709 (the HDTV standard), e.g. Rec.2020, DCI-P3.
+- **ACES** (Academy Color Encoding System): the standardized color pipeline used in the film industry.
+- **CFA / Bayer / RGGB** (Color Filter Array / Bayer Pattern / Red-Green-Green-Blue Pattern): the color filter array on a camera sensor; most phone cameras use RGGB.
+- **OCR** (Optical Character Recognition): recognizing text in an image as editable characters.
+- **CDN** (Content Delivery Network): images are often recompressed by edge nodes when traveling through CDNs; this is the last stop of the real-world D chain.
+- **CFG** (Classifier-Free Guidance): the prompt-strength knob in diffusion sampling.
+- **VAE** (Variational AutoEncoder): the network the diffusion school uses to encode images into latent space.
+- **ROI** (Region of Interest): a sub-region of an image that needs special processing, e.g. face boxes, text-line boxes.
+
+## 17.0.2 A classification view of failure modes
+
+The 15 concrete failure modes fall into three families by "root-cause level"; understanding this taxonomy is more useful than memorizing each mode individually:
+
+**Family A: prior fabrication.** When LR information is severely insufficient, diffusion- and GAN-school models sample "plausible" details from the training distribution to fill in. This family includes face fabrication, hair failure, finger misalignment, pose deformation, and identity drift. The essence is that the model is executing its training task (sampling the most plausible $\hat{x}$), but that "plausible" conflicts with the user's expectation of "faithful".
+
+**Family B: train-inference mismatch.** The degradation distribution the model learned on synthetic data does not cover the real input. This family includes amplifying adversarial noise, amplifying watermarks, tone drift, text damage, training data bias, and extreme-input collapse. The essence is that the synthesis pipeline for D does not cover the degradations actually seen in the wild.
+
+**Family C: engineering-chain.** The model itself works fine on single-frame static tests but fails when wired into the engineering chain. This family includes video flicker, scene cuts, long-sequence error accumulation, quantization collapse, tile seams, and batch-size inconsistency. The essence is that seams appear when a single-frame model is assembled into a larger system.
+
+Putting the three families on one diagram:
+
+```mermaid
+graph LR
+    subgraph FailureModes[Failure modes]
+        F1[Face fabrication]
+        F2[Finger/pose misalignment]
+        F3[Hair failure]
+        F4[Identity drift]
+        F5[Amplifying adversarial noise]
+        F6[Amplifying watermarks]
+        F7[Tone drift]
+        F8[Text damage]
+        F9[Training data bias]
+        F10[Extreme-input collapse]
+        F11[Video flicker]
+        F12[Scene-cut breakage]
+        F13[Long-sequence error]
+        F14[Quantization collapse]
+        F15[Tile seams]
+        F16[Batch-size inconsistency]
+    end
+
+    subgraph RootCauses[Root-cause families]
+        RA[A. Prior fabrication<br/>LR info insufficient<br/>+ generative fill-in]
+        RB[B. Train-inference mismatch<br/>D synthesis fails to cover<br/>real distribution]
+        RC[C. Engineering chain<br/>Single-frame OK<br/>Breaks when assembled]
+    end
+
+    subgraph Mitigations[Mitigation technique families]
+        MA[Fidelity knob / identity verify<br/>Front-load OOD detection<br/>Fall back to conservative path on failure]
+        MB[Extend degradation synthesis<br/>Fine-tune on real data<br/>Color consistency losses]
+        MC[Temporal model / filtering<br/>Tile overlap+blend<br/>QAT / mixed precision<br/>cuDNN deterministic]
+    end
+
+    F1 --> RA
+    F2 --> RA
+    F3 --> RA
+    F4 --> RA
+    F5 --> RB
+    F6 --> RB
+    F7 --> RB
+    F8 --> RB
+    F9 --> RB
+    F10 --> RB
+    F11 --> RC
+    F12 --> RC
+    F13 --> RC
+    F14 --> RC
+    F15 --> RC
+    F16 --> RC
+
+    RA --> MA
+    RB --> MB
+    RC --> MC
+
+    style RA fill:#ffebee
+    style RB fill:#fff3e0
+    style RC fill:#e3f2fd
+    style MA fill:#e8f5e9
+    style MB fill:#e8f5e9
+    style MC fill:#e8f5e9
+```
+
+This diagram is the "map" of the chapter. The 15 sections that follow are ordered by phenomenon (for easy lookup), but when reasoning about root causes, remember which family each one belongs to. Failure modes in the same family often share the same mitigation patterns.
+
 ## 17.1 Why we need this chapter
 
-Section 12.15 introduced "failure case suite" as an evaluation method. This chapter is the content version—**a systematic catalog of failure modes that recur in the field**.
+Section 12.15 introduced "failure case suite" as an evaluation method. This chapter is the content version - **a systematic catalog of failure modes that recur in the field**.
 
 Rule of thumb:
 
@@ -16,13 +132,13 @@ Rule of thumb:
 >
 > SOTA papers optimize average metrics. Production optimizes **the worst 5%**.
 
-Below are 10+ classes of failure modes, each with scenario, cause, and mitigation.
+Below are 15 classes of failure modes, each with scenario, cause, and mitigation. As you read, keep the three-family classification from Section 17.0.2 in your head: when you reach "diffusion model rewrites a baby's face into someone else", remind yourself this is Family A (prior fabrication) and it shares roots with "extra finger" and "identity drift" further down; when you reach "video flicker", remind yourself this is Family C (engineering chain) and shares mitigation patterns with "scene-cut breakage" and "long-sequence error".
 
 ## 17.2 Failure mode 1: diffusion models fabricate content
 
 ### Scenario
 
-When restoring an old photo, the diffusion model turns "a blurry baby's face" into "a sharp face that doesn't look like the same person"—grandpa holds the photo and says, "this isn't my son."
+When restoring an old photo, the diffusion model turns "a blurry baby's face" into "a sharp face that doesn't look like the same person" - grandpa holds the photo and says, "this isn't my son." This is one of the highest-frequency failure modes of the past three years and one of the most damaging to product reputation; "AI restoration turned grandma into someone else" has gone viral on social media more than once.
 
 ### Cause
 
@@ -30,7 +146,9 @@ Diffusion models perform **generation**, not recovery, on heavily degraded faces
 
 - The LR information is insufficient, so the model samples a "plausible face" from the training distribution
 - That sampled face is **visually realistic** but **not the original face**
-- FFHQ in the training data is mostly Caucasian; the "plausible face" distribution for other ethnicities is biased
+- FFHQ (Flickr-Faces-HQ, the 70K high-resolution face dataset) in the training data is mostly Caucasian; the "plausible face" distribution for other ethnicities is biased
+
+A more precise look at the mathematics. A diffusion model estimates $p(x | y)$—the posterior over high-quality $x$ given low-quality observation $y$. When $y$ is not informative enough to "tighten" this posterior, the mode of the distribution (the most likely sample) sits near the "average face" of the training set, and the specific sample drawn is determined by the noise. Grandpa's son and the face the model sampled are both, mathematically, "plausible posterior samples of $y$". The model did not "make a mistake"; it is executing the sampling task it was trained for. What is wrong is **the mismatch between user expectation (recovery) and model behavior (sampling)**.
 
 ### Mitigation
 
@@ -428,11 +546,11 @@ The model treats the watermark as "image content"—equally weighted, equally en
 2. **Special handling for watermark regions**: choose to ignore / enhance / remove (removal carries copyright risk)
 3. **Training data**: add watermark augmentation so the model learns "watermark stays a watermark, don't sharpen it"
 
-## 17.15 Failure mode 14: pose / hand structure changes
+## 17.15 Failure mode 14: pose / finger / hair structure changes
 
 ### Scenario
 
-For images of people in motion (fitness, dance), diffusion enhancement **moves a hand**, or **adds an extra finger**.
+For images of people in motion (fitness, dance), diffusion enhancement **moves a hand**, or **adds an extra finger**. Same family of failures includes hair turned into tangled plastic strands (hair failure), wrong number of teeth in a smile (teeth failure), asymmetric glasses frames on a glasses-wearing subject, and clothing folds that no longer correspond to the original.
 
 ### Cause
 
@@ -442,11 +560,15 @@ Diffusion's well-known weakness in structural understanding:
 - Hand "details" are not "recovery" for the model—they are "generation"
 - Generation tends to violate structure (extra/missing fingers, misalignment)
 
+Hair failures share the same root: each strand of hair is a sub-pixel-thin line that disappears completely after LR downsampling, and when the model "fills in" hair at HR there is no geometric constraint telling it "this strand starts here and ends there". The "statistical average" of hair in SDXL's training data is a roughly smooth hair bundle without a per-strand tracking inductive bias, so the sampled detail looks like CG rather than real hair. Teeth and frames fail for the same reason—they are fine structures on a low-dimensional manifold, very sensitive to position and shape errors.
+
 ### Mitigation
 
 1. **Avoid using diffusion for heavily degraded hands**
-2. **If diffusion is required, inject pose with ControlNet**
+2. **If diffusion is required, inject pose with ControlNet** (hand keypoints / OpenPose skeleton as extra condition)
 3. **Post-processing: hand detection + replace with a discriminative model**
+4. **Down-weight hair / teeth regions**: weight the loss with a mask during training; at inference, lower the CFG strength in these regions
+5. **Multi-step diffusion preserves refinement opportunities**: single-step diffusion is structurally worse than multi-step; key ROIs (Region of Interest) can preserve 4–8 resampling steps
 
 ## 17.16 Failure mode 15: batch-size inference differences
 
@@ -502,6 +624,47 @@ The vast majority of failure modes trace back to **training data not covering th
 - Surface a warning instead of silently outputting on failure
 - Design retry / undo affordances
 
+### Composing the five principles into one decision flow
+
+The five principles above can be composed into one inference-time decision flow that maps directly to code. The key idea is "detect before calling the big model, verify after calling it, and always have a fall-back along every path":
+
+```mermaid
+graph TD
+    Y[User input y] --> SC[Sanity check<br/>extreme values / noise ratio / flat]
+    SC -->|Abnormal| RET[Return original<br/>or bicubic upsample]
+    SC -->|Normal| DC[Degradation classifier<br/>identify degradation type]
+    DC -->|Text dominant| DOC[Document enhance branch]
+    DC -->|Face dominant| FACE[Face enhance branch<br/>CodeFormer / GFPGAN]
+    DC -->|Video frame| VID[Temporal model branch<br/>BasicVSR++]
+    DC -->|Generic| GEN[Generic enhance<br/>Real-ESRGAN / OSEDiff]
+    DC -->|Heavy degradation| EXTREME[Heavy-degradation branch<br/>SUPIR + user warning]
+
+    FACE --> VID2[ArcFace identity verify]
+    GEN --> Q[NR-IQA quality score]
+    EXTREME --> Q
+    VID2 -->|Similarity too low| FALLBACK[Fall back to conservative<br/>+ user warning]
+    Q -->|Score below threshold| FALLBACK
+    VID2 -->|Pass| OUT[Output + failure case log]
+    Q -->|Pass| OUT
+    DOC --> OUT
+    VID --> OUT
+    FALLBACK --> OUT
+
+    style SC fill:#e3f2fd
+    style DC fill:#e3f2fd
+    style FALLBACK fill:#ffebee
+    style OUT fill:#e8f5e9
+    style RET fill:#fff3e0
+```
+
+Key engineering points in this picture:
+
+1. **Sanity check goes first**: extreme inputs (pure black / pure white / pure noise) do not enter the model, avoiding div-by-zero in normalization layers.
+2. **Degradation classifier is the router**: one lightweight classifier (MobileNet-class is enough) suffices to route inputs to the few main paths.
+3. **Post-verification is not optional**: ArcFace for faces, NR-IQA for generic (MANIQA / CLIP-IQA / Q-Align). Failed verification must not be force-output.
+4. **Failure case logging**: every fall-back must be written to disk as material for the next round of training data expansion. This is the feedback loop from production back into training.
+5. **No path may be without a fall-back**: every path from $y$ to output must degrade in the worst case to "original or bicubic". Under no circumstance should a "model gone wrong" garbage image be handed out.
+
 ## 17.18 Operationalizing the failure-case suite
 
 Translate this chapter into an executable test suite:
@@ -546,7 +709,39 @@ class FailureCaseSuite:
         return results
 ```
 
-Every new model version must run this suite. **A PSNR bump alone is not ship-ready**—every failure case must pass.
+Every new model version must run this suite. **A PSNR bump alone is not ship-ready** - every failure case must pass.
+
+## 17.18.1 The failure-to-fix feedback loop
+
+Putting the failure-case suite into CI only solves the "known failure modes won't regress" problem. The mechanism that actually lowers the failure rate over the long run is to push new failure modes surfaced in production back into training. This is a closed loop:
+
+```mermaid
+graph LR
+    DEV[Train new model] --> CI[Failure-case CI<br/>must all pass]
+    CI -->|Pass| DEPLOY[Canary release]
+    DEPLOY --> PROD[Full production]
+    PROD --> MON[Online NR-IQA monitoring<br/>sample low-score outputs]
+    PROD --> USR[User complaints / failure button]
+    MON --> TRIAGE[Human / LLM review<br/>classify into 15 families]
+    USR --> TRIAGE
+    TRIAGE -->|New mode| ADD[Add to failure-case suite]
+    TRIAGE -->|Known mode| WEIGHT[Up-weight in that family]
+    ADD --> SYN[Extend degradation pipeline<br/>cover the new distribution]
+    WEIGHT --> SYN
+    SYN --> DEV
+
+    style PROD fill:#e8f5e9
+    style TRIAGE fill:#fff3e0
+    style SYN fill:#e3f2fd
+    style DEV fill:#ffebee
+```
+
+Key engineering points in this loop:
+
+1. **Online low-score samples must be auto-sampled**: relying on user complaints to gather failure cases covers far too little (complaint rates are typically < 0.1%); only NR-IQA monitoring (MANIQA / CLIP-IQA / Q-Align) yields enough samples.
+2. **The triage step is the bottleneck**: early on it can be human; at scale, use an LLM (GPT-4V / Claude / Gemini) to classify "which family does this failure belong to", with human spot checks.
+3. **Extending the degradation pipeline is the real lever**: covering new failure modes in the training pipeline is far more effective than tweaking network structure. This connects directly to Section 1.7 and Chapter 5.
+4. **The loop cycle time determines the team's "reaction speed"**: ideally 2–4 weeks per round (sample → review → extend pipeline → retrain → CI → ship); slower than 8 weeks means you are basically taking customer hits as they come.
 
 ## 17.19 Summary
 

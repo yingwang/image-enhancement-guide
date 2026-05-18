@@ -1,8 +1,58 @@
 # Chapter 18 · SOTA models
 
-> This chapter is the book's "quick reference"—9 SOTA models worth remembering plus a selection decision tree.
+> This chapter is the book's "quick reference" - 9 SOTA models worth remembering plus a selection decision tree.
 >
-> The models themselves will go out of date; **the ideas will not**—so for each model we cover: core idea, when to use, when not to use, and who succeeds it.
+> The models themselves will go out of date; **the ideas will not** - so for each model we cover: core idea, when to use, when not to use, and who succeeds it.
+
+## 18.0 Chapter prologue
+
+By this chapter, the previous 17 have explained "why", "how", "how to evaluate", and "how it breaks". This chapter takes a step back and answers a very concrete engineering question: **at the moment of 2026, if you have to build an enhancement system from scratch today, which models should you choose as the foundation?**
+
+The hard part of answering this question is not "which model is highest on the benchmark"; it is that **the academic SOTA and the engineering SOTA almost never coincide**. The "top-scoring" model of each year's top conference, once dropped into a product, often turns out to be too slow, hard to deploy, not robust to real-world degradation distributions, or with stalled community maintenance—and never makes it into production. Conversely, the models that are actually widely deployed in industry (Real-ESRGAN, CodeFormer, BasicVSR++) were not necessarily the highest scorers when their papers came out, but their engineering qualities—robustness, deployability, community activity, maintainability—made them the de facto standards on a five-year time scale.
+
+The 9 models selected in this chapter were filtered by the "engineering odds" standard. Each of them satisfies at least two of the following three: widely deployed in production, with long-term open-source maintenance, and reasonable coverage of real-world degradation distributions. They are not a subset of the paper leaderboards but **the best concrete realization of every argument made in the first 17 chapters**.
+
+The models themselves will go out of date. SUPIR was the flagship of the diffusion school in 2024 and has by 2025 been succeeded by a series of single-step distillations; HAT was once the ceiling of the PSNR school, but DRCT, Hi-IR, and ATD now trade wins across benchmarks. This "half-life" in low-level vision is roughly 12–18 months. So beyond introducing each model, this chapter also writes "current standing" and "succeeded by whom" after each, so that when you reread it two years from now you can tell which sections are out of date and which are still alive. The last section lays out the engineering discipline for "switching SOTA": when should you swap your production model, and when should you stand still.
+
+The recommended way to read this chapter is: first read it through in order to build a panorama of "in 2026, the default choice for each subtask"; then, when you hit a specific project, come back to the relevant section to read "when to use / when not to use / key parameters". The 9 models collectively cover more than 90% of enhancement scenarios; the remaining 10% has an outlet in Section 18.13 "SOTAs not on this list".
+
+## 18.0.1 Notes on abbreviations and terminology
+
+The abbreviations in this chapter span four families (generative, Transformer, video, specialized) and are listed here for quick reference:
+
+- **SR** (Super-Resolution): upsample a low-resolution image to high resolution.
+- **VSR** (Video Super-Resolution).
+- **NR-IQA** (No-Reference Image Quality Assessment).
+- **PSNR / SSIM / LPIPS / DISTS**: common IQA metrics, covered in Chapter 4.
+- **MANIQA / CLIP-IQA / Q-Align**: the mainstream NR-IQA models today.
+- **DDPM / DDIM** (Denoising Diffusion Probabilistic / Implicit Model): two foundational sampler families for diffusion models.
+- **SD / SDXL / SD3 / SD3.5 / FLUX** (Stable Diffusion lineage and contemporaneous DiT backbones): text-to-image base models. SDXL is a 2.6B-parameter UNet backbone; SD3 / SD3.5 / FLUX are the 2024–2025 MM-DiT (Multi-Modal Diffusion Transformer) backbones.
+- **ControlNet**: a side-network that injects extra visual conditions (edges / depth / LR image) into a pretrained UNet, giving the diffusion school the ability to "align with the input image".
+- **LoRA** (Low-Rank Adaptation): low-rank adapters that train only a low-rank residual on top of frozen base weights, used to specialize a base model cheaply.
+- **LLaVA** (Large Language and Vision Assistant): open-source multimodal large model; SUPIR uses it to auto-generate prompts as text conditions from the input image.
+- **VAE** (Variational AutoEncoder): the network the diffusion school uses to encode images into a 4× or 8× downsampled latent space.
+- **ZeroSFT** (Zero-init Spatial Feature Transform): SUPIR's zero-initialized spatial modulation layer, injecting ControlNet features into the SDXL backbone without disrupting pretrained weights.
+- **CFG** (Classifier-Free Guidance): the prompt-strength knob during diffusion sampling.
+- **SUPIR / OSEDiff / TSD-SR / SinSR / DiffBIR / PASD / SeeSR / ResShift / StableSR / AdcSR**: different engineering approaches in the diffusion-school SR lineage; this chapter and the previous one cover them repeatedly.
+- **VSD / TSD** (Variational / Target Score Distillation): two representative losses for distilling multi-step diffusion into a single step.
+- **GAN** (Generative Adversarial Network): adversarial training between discriminator and generator.
+- **ESRGAN / Real-ESRGAN / BSRGAN**: representatives of the GAN-school SR; Real-ESRGAN's core contribution is the degradation synthesis pipeline.
+- **HAT / SwinIR / DRCT / Hi-IR / ATD**: PSNR-oriented Transformer SR models.
+- **Restormer / NAFNet / MAXIM / Uformer**: generic low-level vision backbones (denoise / deblur / derain).
+- **CodeFormer / GFPGAN / GPEN / RestoreFormer++**: face restoration models.
+- **BasicVSR++ / VRT / RVRT / EDVR**: video super-resolution models.
+- **RIFE / FILM / AMT / VFIformer**: frame interpolation models.
+- **Retinexformer / LLFormer / SCI / EnlightenGAN**: low-light enhancement models.
+- **HDR / SDR** (High / Standard Dynamic Range): HDR refers to formats whose brightness range exceeds 8-bit SDR, typically 10-bit or 12-bit.
+- **WCG** (Wide Color Gamut): color spaces with gamut wider than Rec.709.
+- **Rec.709 / Rec.2020**: the HDTV and UHD (4K / 8K) gamut and electro-optical transfer function (EOTF) standards.
+- **ACES** (Academy Color Encoding System): the film industry's unified color pipeline.
+- **ProRes**: Apple's visually lossless intermediate encoding format, commonly used in film post-production.
+- **Bayer / CFA / RGGB** (Color Filter Array / Red-Green-Green-Blue Pattern): the color filter array on camera sensors.
+- **CDN** (Content Delivery Network): edge nodes often recompress images during network delivery.
+- **TensorRT / CoreML / ONNX**: common inference engines and intermediate representations.
+- **QAT / PTQ** (Quantization-Aware Training / Post-Training Quantization): quantization during training vs. after training.
+- **OCR** (Optical Character Recognition).
 
 ## 18.1 Selection overview
 
@@ -21,7 +71,77 @@ Task-specific (4)
   └─ Retinexformer — low-light enhancement
 ```
 
-Nine models, each representing a school of thought. SUPIR and OSEDiff/TSD-SR are two engineering positions of the same diffusion school — the former chases peak quality at 50 steps, the latter pushes one-step inference for product deployment.
+Nine models, each representing a school of thought. SUPIR and OSEDiff/TSD-SR are two engineering positions of the same diffusion school - the former chases peak quality at 50 steps, the latter pushes one-step inference for product deployment.
+
+## 18.1.1 Timeline: from SRCNN to single-step diffusion
+
+Laying the key nodes of the past decade of low-level vision on one timeline reveals a clear two-stage evolution: 2014–2020 belongs to the discriminative school, from SRCNN to SwinIR is the evolution of network architectures; from 2021 onward, real-degradation modeling (Real-ESRGAN) and the diffusion school (StableSR / DiffBIR / SUPIR) split the field; from 2024, single-step distillation lets the diffusion school become production-deployable for the first time, and the DiT backbone (SD3 / FLUX) begins to replace SDXL.
+
+```mermaid
+timeline
+    title SOTA timeline for low-level vision
+    2014 : SRCNN<br/>Three-layer conv opens the door
+    2017 : EDSR<br/>Deep residual, remove BN
+    2018 : ESRGAN / RCAN<br/>GAN school + channel attention
+    2020 : DDPM<br/>Diffusion models rise
+    2021 : SwinIR / Real-ESRGAN<br/>Transformer + real-degradation modeling
+    2022 : Restormer / BasicVSR++ / RIFE<br/>Generic low-level vision backbones
+    2023 : HAT / CodeFormer / Retinexformer<br/>Per-task de facto standards
+    2024 : SUPIR / OSEDiff / SinSR / TSD-SR<br/>Diffusion school 50 steps to 1 step
+    2025 : AdcSR / DiT-based SR<br/>Adversarial distillation + SD3/FLUX backbones
+    2026 : Multimodal-conditioned SR<br/>LLaVA-prompt + ControlNet standardized
+```
+
+A few observations from this timeline worth remembering:
+
+1. **The marginal return of architectural innovation is decreasing**: from SRCNN to SwinIR is an exploration of depth and attention forms, with each generation gaining about 0.5–1 dB PSNR; after 2021, pure architectural improvements rarely exceed 0.2 dB.
+2. **The marginal return of data innovation is rising**: Real-ESRGAN closes a 3–5 dB train-inference gap that no architecture change can match. This echoes Section 1.7.
+3. **The generative school took about 4 years to go from "research" to "production"**: DDPM was proposed in 2020, and only in 2024 did single-step distillation make it truly deployable.
+4. **The DiT backbone replacement is in progress**: SDXL dominated the diffusion school SR in 2023–2024; from 2025 onward MM-DiT backbones like SD3.5 / FLUX appear as new backbones, but the ecosystem maturity still lags SDXL by a generation.
+5. **Multimodal conditioning has become standard**: after SUPIR used LLaVA to auto-generate prompts, "text-visual dual conditioning" became the default in newer diffusion SR.
+
+## 18.1.2 Speed-quality trade-off quadrants
+
+Another perspective that helps most directly in selection: place the candidate models on a 2D plane of "speed × quality". Quality on the x-axis (subjective / NR-IQA score), speed on the y-axis (1080p single-image inference time; smaller is faster). The quadrants correspond to different product positions:
+
+```mermaid
+graph LR
+    subgraph Q1[Quadrant I: high quality + fast<br/>production ideal zone]
+        OSE[OSEDiff / TSD-SR<br/>1-step diffusion ~0.5s]
+        REAL[Real-ESRGAN<br/>~0.2s]
+        BVP[BasicVSR++<br/>~50ms/frame]
+        RIFE_M[RIFE<br/>real-time 1080p]
+    end
+
+    subgraph Q2[Quadrant II: high quality + slow<br/>offline peak]
+        SUPIR_M[SUPIR<br/>50 steps ~5-10s]
+        VRT[VRT / RVRT<br/>video SOTA but slow]
+        HAT_M[HAT<br/>PSNR high but slow]
+    end
+
+    subgraph Q3[Quadrant III: mid quality + fast<br/>on-device mainstream]
+        NAF[Distilled NAFNet<br/>on-device real-time]
+        BSR_M[BSRGAN-Lite]
+        SwinIR_L[SwinIR-Light]
+    end
+
+    subgraph Q4[Quadrant IV: mid quality + slow<br/>avoid this zone]
+        OLD[Early diffusion school<br/>undistilled DiffBIR / PASD]
+    end
+
+    style Q1 fill:#e8f5e9
+    style Q2 fill:#fff3e0
+    style Q3 fill:#e3f2fd
+    style Q4 fill:#ffebee
+```
+
+Engineering takeaways from the picture:
+
+- **Quadrant I is the product ideal zone**: from 2025 on, single-step distilled diffusion (OSEDiff / TSD-SR) and the real-degradation school (Real-ESRGAN) jointly occupy this zone. Default to picking from here when starting a new project.
+- **Quadrant II is the offline-peak zone**: when latency constraints relax (film post-production, high-end print, "batch mode" for premium users), SUPIR / VRT still hold an irreplaceable quality ceiling.
+- **Quadrant III is the on-device mainstream zone**: the de facto standard for phone/embedded deployment; quality is below Quadrant I but they run in real time on phone SoCs.
+- **Quadrant IV is the zone to avoid**: models that are neither at the quality peak nor fast tend to be squeezed out by same-generation competitors; these are the first candidates for "switch SOTA".
+- **Multi-step to single-step diffusion is a jump from Quadrant II to Quadrant I**: this is the most important engineering displacement of 2024–2025; OSEDiff / TSD-SR / SinSR's core value lies in this cross-quadrant jump.
 
 ## 18.2 SUPIR: diffusion-based creative upscaling
 
@@ -222,14 +342,22 @@ Distillation target: train a student network to predict clean $x_0$ in **one ste
 
 ### Representative methods
 
-- **OSEDiff** (NeurIPS 2024): variational score distillation, single-step sampling, VAE-LR as initialization
-- **TSD-SR** (2024): target score distillation, distribution correction tailored to SR
+- **OSEDiff** (NeurIPS 2024): variational score distillation (VSD), single-step sampling, VAE-LR as initialization
+- **TSD-SR** (2024): target score distillation (TSD), distribution correction tailored to SR
 - **SinSR** (CVPR 2024): single-step distillation built on top of ResShift
 - **AdcSR** (2025): adversarial distillation of diffusion into a single-step generator, quality close to SUPIR
 
+### One-step vs. multi-step diffusion: intuition and trade-off
+
+One-step diffusion looks "counter-intuitive": the core argument for diffusion is that a hard one-step generation is split into thousands of small steps; how can it be compressed back to one step? The key is that "what we distill is not the sampling procedure, but the teacher network's score function across noise levels". The student learns: given any noise level and a noisy sample, directly predict the final clean image. This does not replace the mathematical justification for multi-step diffusion; it uses a larger model on a narrower input distribution to do a harder task, moving the "difficulty budget" from iteration count to model capacity.
+
+In SR, this is especially reasonable. The input $y$ provides the model with a very strong conditioning signal (unlike unconditional text-to-image, which starts from pure noise), so the solution space is already squeezed onto a relatively low-dimensional manifold. Approximating the center of that manifold in one step is feasible, and multiple steps do not bring qualitative improvement—they only smooth out small perturbations around the sample. That is why OSEDiff / TSD-SR can match or surpass the multi-step baseline on SR, while the same distillation route on text-to-image still needs 4–8 steps to preserve quality—SR's conditioning density is far higher than pure text-to-image.
+
+The engineering trade-off can be summed up in one line: **multi-step diffusion is a knob trading time for quality; single-step diffusion is a fixed choice trading model capacity for time**. The former is flexible (steps can be tuned at inference for different user tiers) but slow; the latter is fast but loses the steps-as-knob freedom (a "high quality tier" can only be served by switching to another model). Production systems mostly pick the latter and keep a multi-step diffusion model as the backup behind a "high quality mode" button for users.
+
 ### One-line takeaway
 
-"Diffusion school from 50 steps to 1 — finally letting the SUPIR route into production environments."
+"Diffusion school from 50 steps to 1 - finally letting the SUPIR route into production environments."
 
 ### When to use
 
@@ -562,6 +690,75 @@ Most paper SOTAs do not satisfy these 5—so **be conservative about switching m
 > The cost of swapping a production model is far higher than "training a new one".
 >
 > A stable old SOTA usually beats an unstable new SOTA.
+
+## 18.14.1 Side-by-side comparison of the 9 models
+
+A single table puts all 9 core models of this chapter side by side for cross-reference:
+
+| Model | Category | School | Params | A100 inference | Real-degradation robust | On-device deployable | Current standing |
+|------|------|------|--------|-----------|--------------|------------|----------|
+| SUPIR | Generic SR | Diffusion 50-step | ~3B (SDXL+ControlNet) | 5–10s/image | Strong | No | Offline peak benchmark |
+| OSEDiff / TSD-SR | Generic SR | Diffusion 1-step | ~3B + LoRA | 0.3–0.8s | Strong | Partial (~3GB after INT8) | 2025–2026 engineering mainstream |
+| Real-ESRGAN | Generic SR | GAN + real degradation | ~17M | ~0.2s | Strong | Yes | Industry de facto standard |
+| HAT | Generic SR | Transformer PSNR | ~40M | ~80ms (256²) | Weak (bicubic-trained) | No | Academic baseline |
+| Restormer | Denoise/deblur | U-Net Transformer | ~26M | ~50ms (256²) | Medium-strong | No (needs distillation) | Restoration de facto standard |
+| CodeFormer | Face restoration | VQ codebook | ~75M | ~100ms | Strong (face mask) | Yes | Face de facto standard |
+| BasicVSR++ | Video SR | Bi-directional recurrence + second-order propagation | ~7M | ~50ms/720p frame | Medium | Partial | VSR de facto standard |
+| RIFE | Frame interpolation | IFNet intermediate flow | ~10M | 1080p real-time 30+ FPS | Medium-strong | Yes | Frame interp de facto standard |
+| Retinexformer | Low-light enhance | Retinex + Transformer | ~1.6M | ~50ms (256²) | Medium (fails at extreme dark) | Yes | Low-light representative |
+
+Quick conclusions from this table:
+
+1. **Parameter count and quality are not strictly correlated**: CodeFormer's 75M beats generic models with 100M+ on faces because its prior is more specialized.
+2. **A100 inference times span three orders of magnitude**: from RIFE real-time to SUPIR 10 seconds, nearly 1000×. This is a direct illustration of how the latency constraint drives model selection.
+3. **The "on-device deployable" column is mostly "yes" or "partial"**: only SUPIR / HAT / Restormer are pure "no", and each has distillation efforts producing on-device variants.
+4. **The "current standing" column reveals one fact**: of the 9 models, 6 hold a "de facto standard" or "mainstream" position; only SUPIR and HAT are "benchmark / baseline" - which confirms that engineering-strong models have longer half-lives.
+
+## 18.14.2 Lineage chart
+
+Finally, a lineage chart placing every model in this chapter alongside its ancestors and successors, to help you understand the internal evolutionary logic of each line:
+
+```mermaid
+graph LR
+    SRCNN[SRCNN 2014<br/>CNN opens the door] --> EDSR[EDSR 2017]
+    EDSR --> ESRGAN[ESRGAN 2018<br/>GAN school]
+    ESRGAN --> BSR[BSRGAN 2021]
+    ESRGAN --> RESR[Real-ESRGAN 2021<br/>real-degradation modeling]
+    EDSR --> RCAN[RCAN 2018<br/>channel attention]
+    RCAN --> SwinIR[SwinIR 2021<br/>Transformer]
+    SwinIR --> HAT[HAT 2023<br/>multi-attention]
+    HAT --> DRCT[DRCT / Hi-IR / ATD 2024-2025]
+    SwinIR --> Restormer[Restormer 2022<br/>U-Net Transformer]
+    Restormer --> NAF[NAFNet 2022]
+
+    DDPM[DDPM 2020<br/>diffusion opens the door] --> SD[SD 1.5 / SDXL]
+    SD --> StableSR[StableSR / DiffBIR 2023]
+    StableSR --> SUPIR[SUPIR 2024<br/>LLaVA prompt]
+    SUPIR --> OSE[OSEDiff / TSD-SR / SinSR 2024]
+    OSE --> AdcSR[AdcSR 2025<br/>adversarial distillation]
+    AdcSR --> DiT[DiT-based SR 2025+<br/>SD3.5 / FLUX backbone]
+
+    SD --> Code[CodeFormer 2022<br/>VQ face prior]
+    Code --> RestoreFmr[RestoreFormer++ 2023]
+
+    EDVR[EDVR 2019<br/>sliding window] --> BVP[BasicVSR / BasicVSR++ 2021-2022]
+    BVP --> VRT[VRT / RVRT 2022-2023]
+
+    style RESR fill:#e8f5e9
+    style HAT fill:#e3f2fd
+    style Restormer fill:#fff3e0
+    style SUPIR fill:#ffebee
+    style OSE fill:#e8f5e9
+    style Code fill:#e8f5e9
+    style BVP fill:#e8f5e9
+```
+
+A few threads in this picture worth highlighting:
+
+- **The ESRGAN line**, after Real-ESRGAN, turned toward "data is king" and diverged from the PSNR-school SwinIR / HAT lineage.
+- **SwinIR is simultaneously the ancestor of HAT and Restormer**: the former continues on SR, the latter pivots to generic restoration backbones. This is the same Transformer thinking branching across tasks.
+- **The diffusion line from DDPM to OSEDiff is a fast-evolving line**: from foundational paper to production-deployable in 5 years - the fastest-evolving sub-direction in low-level vision history.
+- **The DiT backbone replacement is still in progress**: the "DiT-based SR" node represents the 2025+ trend; there is no flagship work like SUPIR yet, but SD3.5 / FLUX replacing SDXL as the new backbone is a settled direction.
 
 ## 18.15 Closing
 

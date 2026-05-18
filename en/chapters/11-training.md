@@ -4,18 +4,43 @@
 >
 > This chapter is about "putting them together to train, and how to train stably."
 >
-> Training enhancement models is more fragile than training classifiers / LLMs—multi-loss conflicts, GAN dynamics, diffusion schedules, any one of them can leave you with three days of training and a collapsed model.
+> Training enhancement models is more fragile than training classifiers or language models: multi-loss conflicts, GAN dynamics, diffusion schedules — any one of them can leave you with three days of training and a collapsed model.
+
+## 11.0 Reading guide
+
+This chapter sits in the engineering position downstream of all previous chapters. Chapters 1-2 gave the problem definition, Chapter 3 the losses, Chapter 4 the metrics, Chapter 5 the data, and Chapters 6-10 the models and architectural choices. Stitching them into a training script that runs is not hard — what is hard is **getting it to run for days or weeks without collapsing**, and finishing with a model that is genuinely better than the last version. This chapter answers the "engineering-actually-runs" question.
+
+We assume the reader can write a routine PyTorch training loop (forward / backward / optimizer step / dataloader) but **does not necessarily have specialized experience with low-level vision training**. Low-level vision training differs significantly from classification or language model training in four respects, each of which is unpacked in later sections:
+
+- Input and output are paired in size: you train an image-to-image mapping, not image-to-scalar
+- The loss function is almost never single; it is a weighted sum of 3-5 terms, and imbalanced weights cause the model to optimize only one of them
+- When GAN or diffusion scheduling is involved, the training dynamics are an adversarial game or a long-horizon timestep sampling, an order of magnitude harder than optimizing a single objective
+- The data pipeline usually performs degradation synthesis on the GPU (see Chapter 5), and a sampling bug can make the model "appear to learn" while actually learning the synthesis bug
+
+**Abbreviations introduced here.** For convenience in later sections, the abbreviations used in this chapter are listed up front:
+
+- **AMP** (Automatic Mixed Precision): a training paradigm that runs forward and backward in FP16/BF16 while keeping the weights and gradient accumulation in FP32
+- **EMA** (Exponential Moving Average): maintain a running average of the weights alongside the training weights, and use the EMA weights at inference time
+- **GradAccum** (Gradient Accumulation): accumulate gradients across several mini-batches before taking one optimizer step, equivalent to enlarging the batch size
+- **TTUR** (Two Time-scale Update Rule): in GAN training, assign different learning rates to the discriminator and the generator
+- **R1**: a GAN regularizer that penalizes the L2 norm of the discriminator's gradient on real samples
+- **FSDP** (Fully Sharded Data Parallel): a distributed training paradigm that shards model parameters, gradients, and optimizer states across ranks
+- **BPTT** (Backpropagation Through Time): training method for recurrent structures, which unrolls the full sequence before backpropagating
+- **OOM** (Out Of Memory): the GPU runs out of memory and crashes
+- **PSNR / LPIPS / FID**: defined in Chapter 4, used directly here
+
+After reading this chapter you should be able to answer: given a new low-level vision architecture, roughly how do I assemble the training loop; when a symptom appears mid-training, where do I start investigating; what are the standard tricks when a GAN refuses to train; should I use different hyperparameters for training a diffusion model from scratch vs finetuning; do I really need to enable EMA and AMP.
 
 ## 11.1 Why training stability is a big deal
 
-LLM training has a single cross-entropy loss; the training dynamics are relatively simple. Enhancement models are entirely different:
+Training a language model usually has a single cross-entropy loss, and the training dynamics are relatively simple: with the right model scale, data volume, and learning rate, the loss decreases stably. Enhancement models in low-level vision are entirely different:
 
-- **Multi-loss mixtures**: L1 + VGG + GAN + task-specific—imbalanced weights and it collapses
-- **GAN training**: the dynamic balance between D and G; if either side becomes too strong, it collapses
-- **Diffusion training**: timestep sampling, loss weighting, EMA—you cannot skip any of them
-- **Complex data pipeline**: degradation synthesis runs on the GPU, where bugs hide easily
+- **Multi-loss mixtures**: L1 + VGG + GAN + task-specific losses are optimized jointly; an imbalance in any one weight tilts the model toward one specific notion of "good" — the result is either high PSNR but visually blurry, or visually sharp but PSNR collapsing
+- **GAN training**: the discriminator D and the generator G are in a dynamic game; if either side becomes too strong, training collapses. This is the same mechanism as GAN collapse in image generation, with the only difference being that G here is conditioned on input
+- **Diffusion training**: timestep sampling strategy, loss weighting (e.g. Min-SNR), and EMA are all required; missing any one of them costs several FID points
+- **Complex data pipeline**: degradation synthesis (Chapter 5) is usually done on the GPU and contains a dozen-plus random parameters; any misspecified distribution does not immediately manifest as a crash but as "the model performs poorly on real images" — by the time you notice, you have already trained for days
 
-This chapter consolidates the engineering pitfalls into an actionable checklist.
+This chapter consolidates the engineering pitfalls into an actionable checklist. The way to read it is not cover-to-cover but as a reference: when assembling training, lay the skeleton from 11.2; when tuning hyperparameters, consult 11.3-11.8; when symptoms appear, consult the diagnosis table in 11.15.
 
 ## 11.2 Training anatomy: basic components
 
@@ -64,6 +89,37 @@ for step, batch in enumerate(train_loader):
         save_checkpoint(...)
 ```
 
+Drawing these eight steps as a data-flow diagram makes the dependencies between components clearer. The figure below is also the "big picture" each subsequent section drills into — each section is just the detail decisions of one of these steps:
+
+```mermaid
+flowchart TD
+    A[Data Loader<br/>HR patch sampling] --> B[Degradation Synth<br/>blur / down / noise / JPEG]
+    B --> C[Forward<br/>autocast bf16/fp16]
+    C --> D[Compute Loss<br/>L1 + VGG + GAN + ...]
+    D --> E[Backward<br/>scaler.scale().backward]
+    E --> F[Grad Clip<br/>max_norm 1.0]
+    F --> G[Optimizer Step<br/>AdamW + scaler]
+    G --> H[Scheduler Step<br/>warmup + cosine]
+    H --> I[EMA Update<br/>β = 0.999~0.9999]
+    I --> J{Log / Eval / Ckpt?}
+    J -->|every N steps| K[Log Metrics]
+    J -->|every M steps| L[Validate + Sample]
+    J -->|every K steps| M[Save Checkpoint]
+    J -->|no| A
+    K --> A
+    L --> A
+    M --> A
+
+    style A fill:#e3f2fd
+    style B fill:#e3f2fd
+    style C fill:#fff3e0
+    style D fill:#fff3e0
+    style I fill:#e8f5e9
+    style M fill:#ffebee
+```
+
+Two engineering details recur often when reading this figure. First, **degradation synthesis (B) on the GPU vs in the dataloader (A) on the CPU is a deliberate engineering trade-off**. CPU synthesis is simple and parallelizes across worker processes, but PCIe bandwidth easily becomes the bottleneck. GPU synthesis saves transfer and lets the degradation function be differentiable, but consumes model training compute and requires careful memory planning. Real-ESRGAN's official implementation chose GPU synthesis. Second, **the EMA update (I) must come after the optimizer step**, and the EMA weights do not participate in the training gradient — they are only read during validation and when saving checkpoints.
+
 Each item is unpacked below.
 
 ## 11.3 Optimizer choice
@@ -92,10 +148,14 @@ Learning rate empirics:
 
 - **CNN (EDSR/NAFNet)**: $2 \times 10^{-4}$
 - **Transformer (SwinIR/Restormer)**: $2 \times 10^{-4}$, warmup mandatory
-- **GAN finetune**: $10^{-4}$ for G, $10^{-4} \times 4 = 4 \times 10^{-4}$ for D (TTUR)
+- **GAN finetune**: $10^{-4}$ for G, $10^{-4} \times 4 = 4 \times 10^{-4}$ for D (TTUR, see Section 11.10)
 - **Diffusion from scratch**: $10^{-4}$
 - **Diffusion finetune**: $10^{-5}$ to $5 \times 10^{-6}$
 - **ControlNet training**: $10^{-5}$
+
+These numbers are not pulled out of the air. They are "consensus values" converged on by many SOTA papers and open-source codebases. The implicit assumption is batch size between 16-32, training steps between 200K-1M, AdamW + cosine. When you change batch size or schedule, you need to adjust per the scaling rules in Section 11.5.
+
+The choice of `betas=(0.9, 0.99)` deserves a comment. The default $\beta_2 = 0.999$ in vanilla Adam gives the second-moment estimator a very long window, which suits single-peak objectives (like classification) but is too long for low-level vision: the loss landscape is rugged (the GAN and perceptual terms act together), and a long window makes Adam's step updates lag behind the true gradient, showing up as inexplicable small spikes in late training. Lowering $\beta_2$ to $0.99$ lets the second moment respond faster, and this is the empirical practice in the field.
 
 ## 11.4 Learning rate schedule
 
@@ -166,21 +226,45 @@ Engineering experience: cosine restart is especially recommended for diffusion t
 
 ## 11.5 Batch Size and Patch Size
 
-A peculiarity of low-level vision training: **almost never train on whole images**, use patches.
+A peculiarity of low-level vision training: **almost never train on whole images**, use patches (image crops). This section unpacks the engineering concepts around patch training.
 
-### Standards for patch-based training
+### Basic flow of patch sampling
 
-- Randomly crop a patch from HR (typically $256 \times 256$ or $128 \times 128$)
-- Apply degradation synthesis to obtain the corresponding LR patch
-- The training batch is a batch of patches
+- Pick a random position in the original HR (high-resolution) image and crop a fixed-size patch (typically $256 \times 256$ or $128 \times 128$)
+- Run the degradation synthesis pipeline from Chapter 5 to turn this HR patch into a corresponding LR patch
+- Stack several such patches into a batch and feed them to the model
 
-Why not train directly on whole images:
+In code this looks roughly like:
 
-- Memory: a single batch of $2048 \times 2048$ won't fit
-- Data augmentation: cropping itself is implicit data augmentation
-- Training efficiency: for the same GPU time, patch training sees more diversity
+```python
+class PatchSampler:
+    def __init__(self, hr_size: int = 256, scale: int = 4):
+        self.hr_size = hr_size
+        self.lr_size = hr_size // scale
 
-### Patch size choice
+    def __call__(self, hr_image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        H, W = hr_image.shape[-2:]
+        # random top-left corner
+        top  = random.randint(0, H - self.hr_size)
+        left = random.randint(0, W - self.hr_size)
+        hr_patch = hr_image[..., top:top+self.hr_size, left:left+self.hr_size]
+        # degradation synthesis is invoked here
+        lr_patch = self.degrade(hr_patch)
+        return lr_patch, hr_patch
+```
+
+### Why not train directly on whole images
+
+The main reasons are memory and efficiency:
+
+- **Memory**: a single $2048 \times 2048$ three-channel FP32 image is 50MB; multiplied by batch and intermediate activations, a single card cannot hold it
+- **Data augmentation**: cropping itself is implicit data augmentation; each epoch "sees" different parts of the image
+- **Training efficiency**: for the same GPU time, patch training sees more scene diversity
+- **Uniform sizes within a batch**: original images vary in size, and patching makes the batch dimension stackable
+
+### Coupling of patch size with receptive field
+
+Patch size is not "bigger is better"; it has a **natural coupling with the model's receptive field**. If the model's effective receptive field is $R \times R$, the patch size should be at least $\geq R$, otherwise the model has insufficient information near the patch boundaries and the training cannot pick up gradients there. A common rule of thumb is the following table:
 
 | Task | Recommended HR patch size | Reason |
 |------|-----------------|------|
@@ -188,22 +272,47 @@ Why not train directly on whole images:
 | 8× SR | 384 | LR=48, more spatial context needed |
 | Denoising | 128-192 | Local texture is enough |
 | Deblurring | 256-384 | Large blur kernels need large patches |
-| Diffusion | 512 | Matches pretrained SD |
+| Diffusion | 512 | Matches pretrained Stable Diffusion |
 
-### Effective batch size
+The receptive-field requirement is most intuitive for deblurring: if the blur kernel has radius 30 pixels, the patch must be at least 60+ pixels wide to contain both "ends" of the kernel, otherwise the model learns an incomplete deconvolution. For windowed-attention models like SwinIR, the window size (e.g. 8) also lower-bounds the effective patch size.
+
+### Effective batch size and gradient accumulation
+
+The "effective batch size" in practice is a product of several quantities:
 
 ```
 effective_batch_size = num_patches_per_image × image_batch × gradient_accumulation × num_gpus
 ```
 
+Among these, **GradAccum** (Gradient Accumulation) is a time-for-memory trick: run forward / backward $N$ times in a row without immediately taking an optimizer step, accumulate the gradients, and call step + zero_grad on the $N$-th iteration. The effect is equivalent to scaling the batch size by $N$, while the peak memory only slightly exceeds a single step.
+
+```python
+accum_steps = 4   # effective batch enlarged 4×
+
+for step, batch in enumerate(loader):
+    with torch.cuda.amp.autocast():
+        loss = compute_loss(model, batch) / accum_steps   # key: divide loss by accum
+
+    scaler.scale(loss).backward()
+
+    if (step + 1) % accum_steps == 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+```
+
+Two things to note: the loss must be divided by `accum_steps`, otherwise it is equivalent to scaling LR by $N$; gradient clipping must be done after the last backward and before the optimizer step, because only then is the accumulated gradient complete.
+
 Common configurations:
 
 - Single A100, CNN SR: 8 images × 1 patch × 1 = 8
-- 4× A100, diffusion: 16 images × 1 patch × 2 GA × 4 GPU = 128
+- 4× A100, diffusion: 16 images × 1 patch × 2 GradAccum × 4 GPU = 128
 
 ### LR scaling for large batches
 
-Rule of thumb: batch size × 2, LR × √2. But low-level vision is sensitive to LR, so it is recommended to **measure** rather than blindly scale.
+Rule of thumb: batch size × 2, LR × √2 (square-root rule); or the linear rule: batch × 2, LR × 2. Low-level vision is sensitive to LR, so it is recommended to **measure** rather than blindly scale: train a baseline configuration for 5K steps, look at the slope of the PSNR curve, then decide whether to scale up LR per the formula.
 
 ## 11.6 Gradient Clipping
 
@@ -225,7 +334,9 @@ Empirical values for `max_norm`:
 
 ## 11.7 EMA: required for diffusion and high-quality GAN
 
-EMA (Exponential Moving Average) maintains an exponential moving average of the model weights:
+**EMA** (Exponential Moving Average) maintains an exponential moving average of the model weights. Intuitively: the training weights are pushed in one direction at every step and the direction is jittery; the EMA weights are a low-pass-filtered version of these jittery weights, more stable, and often "closer" to the true center of the optimum.
+
+Mathematically:
 
 $$
 \theta_{\text{EMA}}^{(t)} = \beta \cdot \theta_{\text{EMA}}^{(t-1)} + (1-\beta) \cdot \theta^{(t)}
@@ -261,11 +372,19 @@ Empirical values for EMA decay:
 - GAN: 0.999 (inference output is steadier with EMA)
 - Diffusion: **0.9999** or **0.99995** (mandatory, paper standard)
 
-EMA is especially important in diffusion training—the FID of pure training weights is usually a few points worse than that of EMA weights.
+EMA is especially important in diffusion training. The FID (Fréchet Inception Distance, a generation-quality measure using statistics of Inception features) of pure training weights is usually a few points worse than that of EMA weights. Intuitively: each step of diffusion training is a gradient update on noise prediction at some random timestep, and the direction is extremely jittery; EMA smooths these directions, producing a weight that is "centrist" across all timesteps.
+
+The magnitude of decay can be estimated this way: the "effective memory length" of EMA weights is roughly $1 / (1 - \beta)$ steps. $\beta = 0.999$ corresponds to about 1000 steps, $\beta = 0.9999$ to about 10000 steps. This explains why diffusion uses 0.9999 or even 0.99995: diffusion training usually requires hundreds of thousands to millions of steps, and an effective memory of several thousand steps is needed to filter out the early transient phase.
+
+Engineering details:
+
+- EMA weights should be saved separately and must not overwrite the training weights (when training crashes mid-way, you resume from the training weights, not from EMA)
+- Should BatchNorm's running_mean / running_var also be EMA'd? Strictly yes, but many implementations ignore this in practice; for a strict implementation see `ModelEmaV2` in the `timm` library
+- At evaluation, switch to EMA weights, then switch back to training weights for the next training step
 
 ## 11.8 Mixed Precision (AMP)
 
-Compute in FP16/BF16, accumulate in FP32. Saves memory + ~1.5-2× speedup.
+**AMP** (Automatic Mixed Precision) puts the forward and backward passes in low precision (FP16 or BF16) to save memory and accelerate compute, while keeping weight storage and gradient accumulation in FP32 for numerical stability. It saves roughly 40-50% memory and yields 1.5-2× throughput on NVIDIA GPUs after Volta.
 
 ```python
 scaler = torch.cuda.amp.GradScaler()
@@ -292,7 +411,7 @@ for batch in loader:
 | Hardware | V100, A100, H100 | A100, H100 |
 | Recommendation | Old hardware | **Default for A100 and later** |
 
-In low-level vision BF16 is almost always the better choice—numerically stable, and no GradScaler needed.
+In low-level vision BF16 is almost always the better choice — numerically stable, and no GradScaler needed. In principle BF16 shares the same exponent bit-width (8 bits) as FP32, so it does not overflow on accumulation or division the way FP16 does; the cost is that the mantissa has only 7 bits, so the last few decimal places are less precise than FP16. For low-level vision, loss values often span several orders of magnitude (the GAN term and the pixel term together), and FP16's frequent overflow is more damaging than BF16's reduced fractional precision.
 
 ### Which layers cannot use low precision
 
@@ -402,7 +521,9 @@ d_loss = d_loss_main + 10.0 * r1_penalty(d_real, real_imgs)
 
 R1 keeps D from being too steep around the real data, mitigating the D-too-strong problem.
 
-### TTUR
+### TTUR: a race between two learning rates
+
+**TTUR** (Two Time-scale Update Rule) was proposed by Heusel et al. in 2017. Intuition: GAN training is a dynamic game between G and D, and in theory D must remain "close to the optimal discriminator" at every step to provide G with meaningful gradient direction; but if D is trained too fast it locks G too early. TTUR gives D a larger learning rate so that within each step D advances a little more, effectively "D follows G on a fast time-scale, G optimizes on a slow time-scale".
 
 D uses a larger learning rate than G (typically 4×):
 
@@ -410,6 +531,8 @@ D uses a larger learning rate than G (typically 4×):
 opt_g = AdamW(g.parameters(), lr=1e-4)
 opt_d = AdamW(d.parameters(), lr=4e-4)   # 4× lr
 ```
+
+This rule paired with SpectralNorm + R1 forms the "three-piece set" of modern GAN training; using all three together generally avoids the common collapse modes.
 
 ## 11.11 Two-stage training (strongly recommended)
 
@@ -444,6 +567,33 @@ Issues with direct joint training (all-in-one):
 - Loss weighting is hard to tune properly
 
 ESRGAN, Real-ESRGAN, BSRGAN, etc. all use a two-stage strategy. **This is the de facto standard**, do not try to innovate by skipping a stage.
+
+Drawing the loss-weight schedule over time across the full GAN training, the idea of loss balancing becomes clearer:
+
+```mermaid
+graph TD
+    subgraph Stage1[Stage 1: Pretrain G, 200K-500K steps]
+        S1L[loss = 1.0 * L1 + 1.0 * VGG]
+        S1Note[Goal: PSNR / LPIPS convergence<br/>no GAN introduced]
+    end
+
+    subgraph Stage2[Stage 2: GAN finetune, 100K-200K steps]
+        S2L[loss = 1.0 * L1 + 1.0 * VGG + 0.05 * Adv + 10.0 * R1]
+        S2D[D: SpectralNorm + TTUR lr_d = 4 * lr_g]
+        S2Note[Goal: add detail without<br/>losing structural fidelity]
+    end
+
+    Init[Random init G] --> Stage1
+    Stage1 --> Load[Load pretrain checkpoint<br/>LR lowered to 1/2]
+    Load --> Stage2
+    Stage2 --> Final[Release weights]
+
+    style Stage1 fill:#e3f2fd
+    style Stage2 fill:#fff3e0
+    style Final fill:#e8f5e9
+```
+
+Several engineering lessons are worth memorizing from this diagram. **First train G with a large pixel-term weight to bring it "close to" GT**, then let the GAN term push it a little toward filling in detail. If the adv weight is set to 1.0 from the start, G is dragged by D to imitate "looks like a real image" high-frequency texture before it has learned basic restoration, producing an output that is very sharp but completely mismatched with GT. **The ratio of R1 coefficient 10.0 to adv coefficient 0.05** is the empirical value from Karras et al. in StyleGAN2; low-level vision adopts it directly.
 
 ## 11.12 Specifics of diffusion training
 
@@ -630,6 +780,49 @@ Some problems are only revealed by looking:
 | GAN outputs garbage | G not pretrained | Pretrain G first |
 | 1 epoch extremely slow | Data loading bottleneck | Increase num_workers, use LMDB |
 
+## 11.15.5 Loss balancing schedule
+
+Chapter 3 discussed the origin and meaning of several losses in detail; this section is about how to coordinate their weights along the time dimension during training. A common anti-pattern is using the same set of weights for the entire training run, but different phases call for different needs from each loss:
+
+- Early training: the model is still learning "the output's color and size should match" — the pixel-term weight should be large, perceptual term small
+- Mid training: basic structure is stable, perceptual and GAN terms can be raised to fill texture beyond structure
+- Late training: switch to EMA weights for evaluation, keep loss weights steady so the model fine-tunes
+
+Drawing this schedule:
+
+```mermaid
+graph LR
+    subgraph T1[Early 0~30%]
+        T1L[w_l1 = 1.0<br/>w_vgg = 0.1<br/>w_adv = 0]
+    end
+    subgraph T2[Mid 30%~80%]
+        T2L[w_l1 = 1.0<br/>w_vgg = 1.0<br/>w_adv = 0.05]
+    end
+    subgraph T3[Late 80%~100%]
+        T3L[w_l1 = 1.0<br/>w_vgg = 1.0<br/>w_adv = 0.05<br/>LR cosine decay]
+    end
+
+    T1 -->|warmup vgg, add GAN| T2
+    T2 -->|drop LR, weights unchanged| T3
+
+    style T1 fill:#e3f2fd
+    style T2 fill:#fff3e0
+    style T3 fill:#e8f5e9
+```
+
+Implementation has two styles. The simple style is step-segmented:
+
+```python
+def get_loss_weights(step: int, total: int) -> dict:
+    if step < total * 0.3:
+        return {'l1': 1.0, 'vgg': 0.1, 'adv': 0.0}
+    if step < total * 0.8:
+        return {'l1': 1.0, 'vgg': 1.0, 'adv': 0.05}
+    return {'l1': 1.0, 'vgg': 1.0, 'adv': 0.05}
+```
+
+The more elaborate style linearly interpolates between segments to avoid a "step" in the loss curve when weights change abruptly. Two-stage GAN training (Section 11.11) is an extreme form of this idea: set the adv weight to 0 until convergence, then switch to 0.05.
+
 ## 11.16 Checkpoint and recovery
 
 ### What to save
@@ -706,6 +899,36 @@ The cost of not doing this: you change 5 things and don't know which helped, whi
 - First prove the idea on $128 \times 128$ patches
 - Then move up to $256 \times 256$
 - Only then run full training
+
+## 11.17.5 Reading an end-to-end training log
+
+Stringing all the above concepts together, here is what a typical SR + GAN training log should look like:
+
+```
+[Stage 1: Pretrain G]
+step 1000   | l1 0.0421 | vgg 0.7823 | psnr 24.31 | lr 2.0e-4 | grad 2.31
+step 10000  | l1 0.0287 | vgg 0.6102 | psnr 27.84 | lr 2.0e-4 | grad 1.84
+step 50000  | l1 0.0203 | vgg 0.4891 | psnr 29.12 | lr 1.8e-4 | grad 1.42
+step 200000 | l1 0.0156 | vgg 0.3941 | psnr 30.08 | lr 1.2e-4 | grad 1.08
+[switch to Stage 2: GAN finetune, lr_g=1e-4, lr_d=4e-4]
+step 200100 | l1 0.0158 | vgg 0.3935 | adv 0.6932 | d 1.3867 | grad_g 1.21 | grad_d 0.89
+step 210000 | l1 0.0162 | vgg 0.3811 | adv 0.5421 | d 1.0982 | grad_g 1.35 | grad_d 1.12
+step 250000 | l1 0.0171 | vgg 0.3654 | adv 0.4823 | d 0.9712 | grad_g 1.41 | grad_d 1.08
+step 300000 | l1 0.0179 | vgg 0.3589 | adv 0.4521 | d 0.9234 | grad_g 1.38 | grad_d 1.05
+```
+
+Healthy signs:
+
+- Both l1 and vgg decrease monotonically in Stage 1, with PSNR rising monotonically
+- After switching to Stage 2, l1 rises slightly (around 10%) but vgg continues to drop, meaning the model has shifted from "pixel-close" to "feature-close"
+- The adv loss oscillates between 0.4-0.7 rather than monotonically dropping to 0; the d loss stays near ln(2) ≈ 0.69 without drifting to an extreme — G and D are in dynamic balance
+- Gradient norm stays < 2 with no spikes
+
+Unhealthy signs:
+
+- d loss suddenly drops below 0.05 and does not recover — D has "crushed" G (Symptom 2, lower lr_d or add R1)
+- adv loss suddenly jumps above 5 or becomes NaN — G's outputs have been pushed into an abnormal region by D; restart
+- l1 rises by more than 50% in Stage 2 — adv weight is too large; lower 0.05 to 0.01
 
 ## 11.18 Summary
 

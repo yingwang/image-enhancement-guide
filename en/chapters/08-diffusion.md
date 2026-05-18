@@ -7,6 +7,30 @@
 >
 > This difference becomes a qualitative leap in heavily ill-posed scenarios.
 
+## 8.0 Reading guide
+
+This chapter is the turning point of Part II. Up to here every model has been a discriminative pipeline of "take in one image, output one image", with priors implicitly baked into the weights. Starting from this chapter, the model itself is a full probabilistic generator that can describe "what the natural-image distribution looks like" independently of any specific input condition, and the degraded image $y$ is added as a constraint only during sampling. In other words, the earlier chapters' models learn $f_\theta(y) \approx x$, while the models from this chapter onward learn $p_\theta(x)$ or $p_\theta(x \mid y)$.
+
+So that the equations later don't need to be parsed word by word, the abbreviations that recur in this chapter are listed up front. Those already introduced in Chapter 1 (such as DDPM) are summarized briefly:
+
+- **DDPM** (Denoising Diffusion Probabilistic Model): mentioned in Chapter 1; proposed by Ho et al. 2020, the foundational paradigm of diffusion models, with a fixed forward noising and a learned reverse denoising
+- **DDIM** (Denoising Diffusion Implicit Model): a deterministic reverse sampler from Song et al. 2021, which allows skipping steps, compressing 1000 steps to a few dozen
+- **DPM-Solver** (Diffusion Probabilistic Model Solver): a family of higher-order numerical solvers from Lu et al. 2022 that accelerates sampling using an ODE viewpoint
+- **UniPC** (Unified Predictor-Corrector): a higher-order method that further integrates predictor and corrector
+- **LCM** (Latent Consistency Model): based on consistency distillation, compressing multi-step sampling to 2-4 steps
+- **SDE / ODE** (Stochastic / Ordinary Differential Equation): the reverse diffusion process can be written equivalently as either an SDE or an ODE, with the former carrying a noise term and the latter being deterministic
+- **VLB / ELBO** (Variational Lower Bound / Evidence Lower Bound): the lower bound of the log-likelihood that is optimized when training diffusion models; the DDPM loss is eventually simplified to a weighted MSE form of the ELBO
+- **CFG** (Classifier-Free Guidance): randomly drop the condition during training, and at inference linearly extrapolate between conditional and unconditional predictions, controlling how strongly the generation adheres to the condition
+- **LDM** (Latent Diffusion Model): Rombach et al. 2022 moved diffusion from pixel space to the VAE latent space; Stable Diffusion is its representative implementation
+- **SD / SDXL** (Stable Diffusion / Stable Diffusion XL): two generations of concrete LDM implementations, with UNet parameter counts of about 860M / 2.6B respectively
+- **VAE** (Variational Autoencoder): the pre/post-processing network in LDM that converts between pixels and latent space
+- **CLIP** (Contrastive Language-Image Pretraining): commonly used as the text / image encoder of diffusion models
+- **SDS** (Score Distillation Sampling, introduced by Poole et al. 2022 in DreamFusion): uses a diffusion model as a "score-gradient provider", running gradient descent on external parameters (e.g. a NeRF or another image) along the score direction. In enhancement it occasionally appears as a tool to "score and optimize a specific image with a diffusion model"
+- **LoRA** (Low-Rank Adaptation): a fine-tuning technique that decomposes the weight update into two low-rank matrices $W + AB^\top$; standard for diffusion fine-tuning
+- **SUPIR / StableSR / DiffBIR**: three diffusion-based real-world SR models that recur at the end of this chapter; their detailed structure is left to Chapter 9
+
+The assumed background is still the one listed in Section 1.0 of Chapter 1: comfortable with tensors and basic loss functions, able to read PyTorch, has heard of diffusion models but has not necessarily trained one. This chapter walks through DDPM's forward / reverse / training objective / samplers / latentization / UNet internals / condition-injection paradigms, all so that Chapter 9's condition control and Chapter 10's task-specific models stand on solid ground.
+
 ## 8.1 Why diffusion matters in image enhancement
 
 Recall the perception-distortion trade-off in Section 4.8 of Chapter 4:
@@ -35,54 +59,56 @@ The core idea of diffusion models can be summarized in one sentence:
 
 > **Learn a denoising process** — start from pure noise, remove noise step by step, and end up with an image.
 
-The concrete process:
+To make this more intuitive, the forward noising and reverse denoising chains are drawn below. The forward chain is a fixed stochastic process (no learnable parameters; just keeps adding Gaussian noise to the image according to a pre-defined noise schedule), while the reverse chain is what the neural network has to learn.
 
-```
-Forward (fixed, not learned):
-  x_0 (clean image)
-    ↓ add a bit of noise
-  x_1
-    ↓ add a bit of noise
-  x_2
-    ↓ ...
-  x_T (pure noise, T = 1000)
+```mermaid
+graph LR
+    X0[x_0<br/>clean image] -->|+ε_1| X1[x_1]
+    X1 -->|+ε_2| X2[x_2]
+    X2 -->|...| XT_1[x_{T-1}]
+    XT_1 -->|+ε_T| XT[x_T<br/>≈ pure Gaussian noise]
+    XT -. reverse .-> RT_1[x_{T-1}]
+    RT_1 -. reverse .-> R2[x_2]
+    R2 -. reverse .-> R1[x_1]
+    R1 -. reverse .-> R0[x̂_0<br/>sampled image]
 
-Reverse (learned by the neural network):
-  x_T (pure noise)
-    ↓ remove a bit of noise (predicted by the neural net)
-  x_{T-1}
-    ↓ remove a bit of noise
-  x_{T-2}
-    ↓ ...
-  x_0 (clean image)
+    style X0 fill:#e8f5e9
+    style XT fill:#ffebee
+    style R0 fill:#fff3e0
 ```
 
-Training objective: **given a noisy image at any time step $x_t$, predict the noise that was added**.
+The solid arrows indicate the fixed forward noising process, which adds a small amount of Gaussian noise at every step according to the schedule $\beta_t$; the dashed arrows indicate the reverse denoising process driven by the neural network, which estimates at every step how much noise to remove from the current $x_t$ and returns to $x_{t-1}$. When $T$ is large enough (e.g. 1000), the distribution of $x_T$ is approximately a standard Gaussian with independent components. Walking the entire reverse chain produces a new image $\hat{x}_0$.
 
-This looks strange — why does this generate images? The key lies in two points:
+The training objective is in fact very simple: **given a noisy image at any time step $x_t$, predict the noise that was added**.
 
-1. **A noisy image at any $t$ can be sampled in a single step** — there is no need to repeatedly add noise $T$ times from $x_0$, there is a closed-form formula
-2. **Learning to predict the noise = learning the score function of $p(x_0)$** — and from noise we can reverse back to an image
+At first glance this objective looks odd: how does predicting noise amount to learning to generate images? The key lies in two points:
 
-We will work out the math below.
+1. **A noisy image at any $t$ can be sampled in a single step** — there is no need to repeatedly add noise $T$ times from $x_0$; the forward process has a closed-form formula that lets you jump directly to any $t$, which makes training computationally feasible
+2. **Learning to predict the noise = learning the score function of $p(x_0)$** — the score is $\nabla_x \log p(x)$, the gradient field of the distribution; knowing the score at every point is equivalent to knowing the geometric structure of the distribution, so one can sample from noise back to $p(x)$ via Langevin dynamics or the reverse SDE
+
+We will work out the math of these two points below.
 
 ## 8.3 The math of the forward process
 
-Define the noise schedule $\beta_1, \beta_2, \dots, \beta_T$ ($T = 1000$, $\beta_t$ increases linearly from $10^{-4}$ to $0.02$).
+Define a **noise schedule** $\beta_1, \beta_2, \dots, \beta_T$. The common configuration is $T = 1000$ with $\beta_t$ increasing linearly from $10^{-4}$ to $0.02$; later practice replaces this with a cosine schedule (Nichol & Dhariwal 2021), which decays early-stage signal more gently and gives a measurable quality boost. The linear version is used here to explain the mechanism; cosine is just a different parameter choice within the same framework.
 
-Each step adds noise:
+Each step adds noise according to:
 
 $$
 q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} \cdot x_{t-1}, \beta_t \mathbf{I})
 $$
 
-Meaning: $x_t$ is $x_{t-1}$ shrunk by a small factor (multiplied by $\sqrt{1-\beta_t}$) plus a small amount of Gaussian noise (variance $\beta_t$).
+Meaning: $x_t$ is $x_{t-1}$ shrunk by a small factor (multiplied by $\sqrt{1-\beta_t}$) plus a small amount of Gaussian noise (variance $\beta_t$). The $\sqrt{1-\beta_t}$ factor is there to keep variance conserved — without shrinking, the second moment of $x_t$ would grow over time, eventually far exceeding the scale of $x_0$; shrinking the signal first and adding equal-variance noise keeps the second moment at $O(1)$, which is numerically more stable.
 
-Define $\alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$. The **key property**:
+For shorthand, define $\alpha_t = 1 - \beta_t$, and the cumulative product $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$. This $\bar{\alpha}_t$ is the core quantity that recurs in every subsequent formula; geometrically it is the "fraction of signal retained" from $x_0$ to $x_t$. When $t$ is close to 0, $\bar{\alpha}_t \approx 1$ (almost no noise added); when $t$ is close to $T$, $\bar{\alpha}_t \approx 0$ (the signal is almost completely drowned out).
+
+**Key property**: chaining $q(x_t \mid x_{t-1})$ inductively shows that the marginal $q(x_t \mid x_0)$ from $x_0$ to any $x_t$ is still Gaussian:
 
 $$
 q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t} \cdot x_0, (1 - \bar{\alpha}_t) \mathbf{I})
 $$
+
+Intuitive derivation: the first step gives $x_1 = \sqrt{\alpha_1} x_0 + \sqrt{1-\alpha_1} \epsilon_1$; the second step gives $x_2 = \sqrt{\alpha_2} x_1 + \sqrt{1-\alpha_2}\epsilon_2 = \sqrt{\alpha_2 \alpha_1} x_0 + (\sqrt{\alpha_2(1-\alpha_1)} \epsilon_1 + \sqrt{1-\alpha_2}\epsilon_2)$. Adding the two independent Gaussians at the end, the new variance is the sum $\alpha_2(1-\alpha_1) + (1-\alpha_2) = 1 - \alpha_2 \alpha_1$. Recurring all the way yields $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1-\bar{\alpha}_t} \epsilon$.
 
 This means **given $x_0$, we can sample any $x_t$ in a single step**:
 
@@ -90,7 +116,7 @@ $$
 x_t = \sqrt{\bar{\alpha}_t} \cdot x_0 + \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I})
 $$
 
-This is what makes training efficient — there is no need to actually add noise 1000 times step by step.
+This is what makes training efficient — there is no need to actually add noise 1000 times step by step. In the training loop one just samples a random $t$, constructs $x_t$ and the corresponding $\epsilon$ from the formula above, and uses them for supervision. Without this closed-form path, every training step would have to simulate $t$ noising operations, and the cost of training diffusion models would be completely infeasible.
 
 ```python
 import torch
@@ -126,27 +152,50 @@ class NoiseScheduler:
         return x_t, noise
 ```
 
+### Engineering choice of the noise schedule
+
+The linear schedule $\beta_t \in [10^{-4}, 0.02]$ is the initial choice in the DDPM paper but is not good enough at high resolution. It decays too quickly near $t \to T$, so the early signal is drowned out almost instantly and the model receives little gradient signal in that range. Nichol & Dhariwal 2021 proposed the **cosine schedule**:
+
+$$
+\bar{\alpha}_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos\left(\frac{t/T + s}{1 + s} \cdot \frac{\pi}{2}\right)^2
+$$
+
+where $s \approx 0.008$ is a small offset to avoid the singularity at $t = 0$. The cosine $\bar{\alpha}_t$ is slow at both ends and fast in the middle, putting more sampling effort into the "middle noise levels", which matches the eye's sensitivity to mid-frequency details. SDXL and Imagen both default to cosine.
+
+Going further, the **SNR-based schedule** defines the schedule directly by signal-to-noise ratio $\text{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$, letting $\log \text{SNR}(t)$ decrease linearly in $t$. This is one of the core contributions of EDM (Karras et al. 2022), decoupling "which time step" from "which noise level": the same noise level corresponds to different $t$ under different schedules, but they are completely equivalent in the SNR view. EDM rewrites the entire training / sampling code in the SNR parameterization, and its FID improves by a clear margin over DDPM's original schedule.
+
+Engineering practice:
+
+- Academic DDPM reproduction: linear
+- New models: cosine by default
+- SOTA generation quality: EDM SNR parameterization
+- For enhancement tasks the schedule has relatively small impact; what mainly matters is how the loss is weighted across mid-range $t$
+
 ## 8.4 The reverse process: training objective
 
-In theory the reverse process is $p(x_{t-1} | x_t)$, and what is to be learned is this conditional distribution. But the DDPM paper proved a simplified equivalent objective:
+In theory the reverse process is $p(x_{t-1} | x_t)$, and what is to be learned is this conditional distribution. The full training objective is actually a variational lower bound (VLB / ELBO) of the data log-likelihood $\log p_\theta(x_0)$. Modelling each reverse step as a Gaussian $p_\theta(x_{t-1} \mid x_t) = \mathcal{N}(\mu_\theta(x_t, t), \Sigma_\theta(x_t, t))$ and decomposing $\log p(x_0)$ into a sum of $T$ KL terms — each measuring the distance between the "model reverse Gaussian" and the "true posterior Gaussian $q(x_{t-1} \mid x_t, x_0)$" — yields the long expression that appears in the DDPM paper.
+
+The most valuable engineering contribution of the DDPM paper is the proof that, with appropriate variance choices, this long objective **simplifies** to a unit-weight MSE:
 
 **Train a network $\epsilon_\theta(x_t, t)$ directly to predict the added noise $\epsilon$**.
 
 Training loss:
 
 $$
-\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \|^2 \right]
+\mathcal{L}_{\text{simple}} = \mathbb{E}_{t, x_0, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \|^2 \right]
 $$
 
-This is the simple loss covered in Section 3.6 of Chapter 3.
+This is the simple loss covered in Section 3.6 of Chapter 3. Although the exact weights of the ELBO are dropped, empirically sample quality is actually better (the higher-$t$ terms get "informally" up-weighted, focusing the model on the harder mid-to-high noise range).
+
+Note that three things are randomly sampled in the training process: every batch picks some $x_0$, every sample independently picks a time step $t \sim \text{Uniform}\{1, \dots, T\}$, and every sample independently picks an $\epsilon$. The Monte Carlo estimate of this triple expectation is the loss.
 
 ### Three equivalent prediction targets
 
-The model can predict any one of three quantities, all equivalent:
+The model can predict any one of three quantities, mutually determined by the linear relation $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1-\bar{\alpha}_t} \epsilon$. They are **information-equivalent**; the only difference is the shape of the loss surface:
 
-- **$\epsilon$-prediction**: predict the added noise (the DDPM standard)
-- **$x_0$-prediction**: predict the original image
-- **$v$-prediction**: $v_t = \alpha_t \epsilon - \sigma_t x_0$ (more stable)
+- **$\epsilon$-prediction**: predict the added noise (the DDPM standard). At large $t$ (small $\bar{\alpha}_t$), $x_0$ is almost drowned out by noise, so predicting $\epsilon$ has a relatively better SNR
+- **$x_0$-prediction**: predict the original image directly. At small $t$ ($\bar{\alpha}_t$ close to 1), $x_t$ is essentially $x_0$ with a small perturbation, and predicting $x_0$ is equivalent to mild denoising — the loss scale is more stable
+- **$v$-prediction** (Salimans & Ho 2022): defining $v_t = \sqrt{\bar{\alpha}_t} \epsilon - \sqrt{1-\bar{\alpha}_t} x_0$, this is equivalent to predicting along a rotated direction in the $(\epsilon, x_0)$ plane. Its benefit is that the loss has a consistent magnitude across all $t$, which is especially useful at high resolution
 
 The conversions between them:
 
@@ -179,6 +228,24 @@ How to choose the prediction target during training:
 - **$\epsilon$-pred**: standard for general text-to-image (SD 1.x)
 - **$v$-pred**: more stable for high-resolution training (SD 2.x, SDXL refiner)
 - **$x_0$-pred**: intuitive for enhancement / restoration tasks, since the quantity of interest is the quality of $x_0$
+
+The relations among the three targets can be drawn as a small diagram for reference:
+
+```mermaid
+graph LR
+    XT[x_t<br/>known, network input] --> P{network<br/>predicts which?}
+    P -->|"ε-pred"| EP[ε_θ x_t,t]
+    P -->|"x_0-pred"| X0P[x̂_0 x_t,t]
+    P -->|"v-pred"| VP[v_θ x_t,t]
+    EP -.->|"x̂_0 = x_t - √(1-ᾱ)ε / √ᾱ"| X0P
+    VP -.->|"x̂_0 = √ᾱ x_t - √(1-ᾱ) v"| X0P
+    X0P -.->|"ε = x_t - √ᾱ x_0 / √(1-ᾱ)"| EP
+
+    style XT fill:#e3f2fd
+    style X0P fill:#e8f5e9
+```
+
+The three predictions are just different projections of the same affine relation. At training time the choice changes the angle of the loss; at inference time we recover $\hat{x}_0$ with the corresponding formula for use in the next sampling step.
 
 ## 8.5 A minimal DDPM training loop
 
@@ -227,6 +294,26 @@ This loop looks overly simple. The fundamental reason it works:
 
 ## 8.6 Sampling: DDPM, DDIM, DPM-Solver
 
+After training, the UNet has learned "in which direction $x_t$ at any time step should denoise". Sampling organises this one-step denoising capability into a multi-step process from $x_T$ back to $x_0$. Different samplers differ in "how to walk this path in fewer steps". The figure below places DDPM, DDIM, and DPM-Solver on the same reverse chain:
+
+```mermaid
+graph TD
+    Train[trained ε_θ x_t,t<br/>predicts noise at every step] --> Choice{choose sampler}
+    Choice --> DDPM[DDPM<br/>1000 steps, stochastic]
+    Choice --> DDIM[DDIM<br/>20-50 steps, deterministic]
+    Choice --> Solver[DPM-Solver / UniPC<br/>10-30 steps, high-order ODE]
+    Choice --> LCM[LCM distillation<br/>2-4 steps, consistency model]
+    DDPM --> Out[x̂_0]
+    DDIM --> Out
+    Solver --> Out
+    LCM --> Out
+
+    style Train fill:#e3f2fd
+    style Out fill:#e8f5e9
+```
+
+Note that all these samplers share the **same** set of trained weights and **do not require retraining** (LCM is the exception — it needs consistency distillation). In production it is perfectly reasonable to train DDPM once and pick different samplers at inference based on the SLA.
+
 After training, how do we generate an image from noise?
 
 ### DDPM sampling
@@ -237,29 +324,29 @@ $$
 x_{t-1} = \frac{1}{\sqrt{\alpha_t}} \left( x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}} \epsilon_\theta(x_t, t) \right) + \sigma_t z
 $$
 
-where $z \sim \mathcal{N}(0, \mathbf{I})$ and $\sigma_t$ is a noise term.
+where $z \sim \mathcal{N}(0, \mathbf{I})$ is a Gaussian sampled independently at each step, and $\sigma_t$ is the noise variance chosen by DDPM. The form of this formula is derived from the true posterior $q(x_{t-1} \mid x_t, x_0)$, substituting the predicted $\hat{x}_0 = (x_t - \sqrt{1-\bar{\alpha}_t}\epsilon_\theta) / \sqrt{\bar{\alpha}_t}$ for $x_0$. The randomness across the chain comes from this sequence of $z$ — running DDPM twice from the same starting $x_T$ yields two different samples.
 
-**Problem**: it requires 1000 steps, each with a UNet forward pass — **slow**.
+**Problem**: it requires 1000 steps, each with a UNet forward pass — **slow**. SD 1.5 takes about 30 ms per forward pass on an A100, so 1000 steps is 30 seconds for a single image. Completely unacceptable in production.
 
 ### DDIM sampling
 
-Song et al. showed that the reverse can be made deterministic:
+Song et al. 2021 showed that the reverse can be made deterministic:
 
 $$
 x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_{t-1}} \cdot \epsilon_\theta(x_t, t)
 $$
 
-where $\hat{x}_0$ is the $x_0$ derived from $x_t$ and the predicted noise. This sampling **can skip steps** — there is no need to walk through all 1000 steps; one can pick 50 time steps to sample at.
+where $\hat{x}_0$ is the $x_0$ derived from $x_t$ and the predicted noise (using the `eps_to_x0` from the previous section). Note there is no explicit random term $z$ in the formula — the same starting noise under DDIM always gives the same image, which is the meaning of "deterministic". This sampling **can skip steps**: DDIM rewrites "one step from $t$ to $t-1$" as "one step from $t$ to any smaller $t'$", so at inference one can pick 50 time steps (e.g. 20 evenly spaced of 1000) to walk through the entire reverse chain.
 
-DDIM 50 steps ≈ DDPM 1000 steps in quality, **a 20× speedup**.
+DDIM 50 steps ≈ DDPM 1000 steps in quality, **a 20× speedup**. The deterministic nature has another benefit for editing tasks: one can do DDIM inversion, reversing an existing image back to its corresponding latent noise $x_T$, then forward-sampling again with a modified condition.
 
 ### The DPM-Solver family
 
-Treat the reverse process as an ODE and use higher-order numerical methods to solve it.
+Treat the reverse process as an ODE and use higher-order numerical methods to solve it. Song et al. 2021 showed that the reverse diffusion is strictly equivalent to a probability-flow ODE $dx/dt = f(x, t) - \frac{1}{2} g(t)^2 \nabla_x \log p_t(x)$ where the score is provided by the trained $\epsilon_\theta$. Once it is written as an ODE, decades of numerical-integration techniques become available.
 
-- **DPM-Solver-2**: second-order, ~20 steps reach DDIM 100-step quality
-- **DPM-Solver++**: handles the SDE form
-- **UniPC**: a further-optimized unified predictor-corrector method
+- **DPM-Solver-2** (Lu et al. 2022): second-order Taylor expansion to solve the ODE; ~20 steps reach DDIM 100-step quality
+- **DPM-Solver++**: brings the SDE form (with noise term) into the same framework, more stable for conditional generation
+- **UniPC** (Unified Predictor-Corrector): further integrates predictor and corrector, also using multi-step residual information; a common default in 2024
 
 ```python
 # Use the diffusers samplers
@@ -282,7 +369,7 @@ Engineering practice (the SOTA configuration in 2026):
 
 ## 8.7 LDM: moving diffusion to latent space
 
-This was already introduced in Section 2.4 of Chapter 2. We supplement engineering details here.
+LDM was already introduced from the "representation space" angle in Section 2.4 of Chapter 2. Here we supplement it from the diffusion angle: why moving diffusion to the latent space is the engineering inflection point of this field.
 
 The key observation of LDM (Rombach et al. 2022):
 
@@ -310,7 +397,28 @@ The UNet is the bulk; the VAE is relatively small. This is why SD fine-tuning ma
 
 ## 8.8 The internal structure of the SD UNet
 
-The UNet is the "main network" of a diffusion model. Its structure matters for enhancement tasks — extensions like ControlNet are built on top of this structure.
+The UNet is the "main network" of a diffusion model. Its structure matters for enhancement tasks — extensions like ControlNet are built on top of this structure. To place "the UNet in a denoising step" in the big picture, here is a data-flow diagram of a single sampling step:
+
+```mermaid
+graph LR
+    XT[x_t<br/>latent noise<br/>B,4,h,w] --> UNet
+    T[time step t] --> TEmb[time embedding<br/>sinusoidal + MLP]
+    Cond[condition c<br/>text/image tokens] --> CtxEmb[CLIP encoder]
+    TEmb --> UNet
+    CtxEmb --> UNet
+    UNet[UNet ε_θ<br/>encoder + mid + decoder<br/>cross-attention to c] --> Eps[ε̂ or v̂<br/>B,4,h,w]
+    Eps --> Step[sampler one step<br/>DDIM / DPM-Solver]
+    XT --> Step
+    Step --> XTm1[x_{t-1}<br/>next-step input]
+
+    style XT fill:#e3f2fd
+    style UNet fill:#fff3e0
+    style XTm1 fill:#e8f5e9
+```
+
+Every sampling step repeats this data flow; the only differences are that $t$ decreases and the noise content of $x_t$ shrinks. The condition $c$ (text or image embedding) is the same across all time steps and is consumed repeatedly only in cross-attention.
+
+The overall macro structure of the UNet:
 
 ```
 Input (B, 4, 64, 64) latent
@@ -406,9 +514,9 @@ Cross-attention is the key to text-to-image — text influences the features at 
 
 ## 8.9 Diffusion usage in enhancement tasks
 
-Text-to-image samples from pure noise + a text condition to an image. **Enhancement tasks** sample from pure noise + a degraded image $y$ as the condition to produce $\hat{x}$.
+Text-to-image samples from pure noise + a text condition to an image. **Enhancement tasks** sample from pure noise + a degraded image $y$ as the condition to produce $\hat{x}$. The only change is that the condition $c$ goes from a piece of text to an image (or an image plus a caption); the UNet and the sampler chain remain the same.
 
-A few paradigms for condition injection:
+A few paradigms for condition injection (the detailed engineering implementations are left to Chapter 9; names are listed here so the reader has the full picture):
 
 ### Paradigm 1: concat to the input (the simplest)
 
@@ -430,6 +538,10 @@ Inject some embedding of LR via cross-attention. Representative: DiffBIR uses a 
 Copy a UNet encoder dedicated to processing the conditional input, and add its output to the corresponding layer of the main UNet. Representative: the ControlNet variant of StableSR, SUPIR.
 
 Chapter 9 will discuss these in detail.
+
+### A common misconception
+
+Many engineers who encounter diffusion-based enhancement for the first time assume that the "injection point" of LR determines the model's ceiling, and spend a lot of time tuning the architecture. Empirically, **what actually determines generation quality is (1) whether the training data reflects real degradation, and (2) how tunable the condition control strength is**. The architecture choice (concat vs ControlNet) shifts which end of the fidelity-creativity curve the model lands on, but as long as the training data is reasonable and the conditioning scale is tunable, several paradigms can all reach production quality. This is why this book places Chapter 5 (data synthesis) before Chapter 9 (condition control) — the data ceiling determines the floor.
 
 ## 8.10 Why diffusion can "create something from nothing"
 
@@ -467,6 +579,23 @@ where $w$ is a Wiener process (Brownian motion). The stationary distribution of 
 A diffusion model is not "approximating the ground truth"; it is "walking T steps along the geometry of the natural-image distribution". Each step is guided by the geometry of the distribution, and each step has a random perturbation that prevents results from repeating.
 
 The final output is a point on the distribution — concrete, plausible, random.
+
+## 8.10b An extended use: SDS (Score Distillation Sampling)
+
+SDS, proposed in DreamFusion (Poole et al. 2022), is a representative example of "using a diffusion model in a different way". Originally diffusion is "reverse-sampling from noise to image"; SDS treats it as a **gradient source**: given any parameterizable target $\theta$ (another image, a NeRF, the texture of a 3D mesh), the diffusion model provides on its rendering $x(\theta)$ the gradient of "in which direction should $\theta$ be updated to look more like a natural image":
+
+$$
+\nabla_\theta \mathcal{L}_{\text{SDS}}(\theta) = \mathbb{E}_{t, \epsilon}\left[w(t) (\epsilon_\theta(x_t, t, c) - \epsilon) \cdot \frac{\partial x}{\partial \theta}\right]
+$$
+
+where $x_t = \sqrt{\bar{\alpha}_t} x(\theta) + \sqrt{1-\bar{\alpha}_t}\epsilon$. The noise residual $\epsilon_\theta - \epsilon$ predicted by the diffusion model is back-propagated to $\theta$ via the chain rule. This is equivalent to "the diffusion model telling $x(\theta)$ in which direction to change to be closer to the natural-image distribution"; back-propagation moves $\theta$ along the score direction.
+
+In enhancement SDS is occasionally used as:
+
+- A "diffusion-prior polish" on top of an existing discriminative SR output — treat the output $\hat{x}$ as $\theta$, run a few SDS steps to push it closer to the natural-image manifold learned by diffusion
+- Per-image optimization on the test image for rare tasks without paired training data (old-painting restoration, few-shot satellite SR), using a general diffusion model + SDS
+
+Empirically SDS used directly on SR is unstable, often producing oversaturated and over-textured results; the community later proposed VSD (Variational Score Distillation), CSD (Classifier Score Distillation), and other improvements. This line is not mainstream in enhancement, but it is worth knowing as an example of "what else a diffusion model can be used for".
 
 ## 8.11 Trade-offs: diffusion camp vs discriminative
 
@@ -528,13 +657,31 @@ Do not sample $t$ uniformly. Some $t$ ranges contribute more to the final qualit
 
 ### Classifier-Free Guidance (CFG)
 
-During training, the condition is dropped 10% of the time (a mixture of unconditional and conditional training). At inference:
+CFG (Classifier-Free Guidance) replaces the "classifier-guided diffusion" family (early ADM used an ImageNet classifier for gradient guidance) with a version that does not depend on an external classifier. Ho & Salimans 2022's core recipe: during training, replace the condition $c$ with a null condition $\emptyset$ with some probability (typically 10%), so the same network learns both conditional and unconditional predictions. At inference, linearly extrapolate the two predictions:
 
 $$
 \hat{\epsilon} = \epsilon_\theta(x_t, t, \emptyset) + w \cdot (\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \emptyset))
 $$
 
-$w > 1$ pushes the generation closer to the condition, but too large overfits to it. In enhancement tasks $w$ is typically 1.5-3.0.
+$w > 1$ pushes the generation closer to the condition, but too large makes the result oversaturated, with overly saturated colours and over-textured surfaces. In enhancement tasks $w$ is typically 1.5-3.0; pure text-to-image uses 5-9.
+
+Inference does one extra UNet forward (the unconditional one) per step, roughly doubling cost. The two-pass CFG can be drawn like this:
+
+```mermaid
+graph LR
+    XT[x_t] --> CondPath[UNet x_t,t,c]
+    XT --> UncondPath[UNet x_t,t,∅]
+    Cond[condition c<br/>LR latent / text] --> CondPath
+    Null[null condition ∅] --> UncondPath
+    CondPath --> EC[ε_cond]
+    UncondPath --> EU[ε_uncond]
+    EC --> Mix[ε̂ = ε_uncond + w · ε_cond - ε_uncond]
+    EU --> Mix
+    Mix --> Next[sampler one step]
+
+    style XT fill:#e3f2fd
+    style Mix fill:#fff3e0
+```
 
 ```python
 def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
@@ -546,6 +693,8 @@ def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
     # Weighted combination
     return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 ```
+
+In production the two forwards are batched together — stacked into $(2B, C, H, W)$ and run in one pass, saving one kernel launch. The default implementation in diffusers works this way.
 
 ## 8.13 A diffusion training pipeline for an enhancement task
 
@@ -654,6 +803,35 @@ def diffusion_enhance(unet, vae, scheduler, lr_img,
 Note one key point: **LR must first be upsampled to the target HR size before going through the VAE** — that way the resulting latent has the same size as hr_latent and they can be concatenated directly. If you do `vae.encode(lr_img)` directly, the latent space will be at the LR size (HR/8 is 4× larger than LR/8), and the shapes will not match.
 
 The output resolution is determined by `target_size`, and the image after the VAE decoder is at exactly that size.
+
+## 8.14.1 Training vs inference: a mental model
+
+Putting the training and inference loops side by side reveals an essential difference between diffusion models and the discriminative models of Chapters 6-7:
+
+```mermaid
+graph TD
+    subgraph Train[Training: single-step supervision]
+        T1[sample x_0] --> T2[sample t]
+        T2 --> T3[one-step noising → x_t, ε]
+        T3 --> T4[UNet x_t,t,c → ε̂]
+        T4 --> T5[MSE ε̂, ε]
+        T5 --> T6[backprop, update weights]
+    end
+
+    subgraph Infer[Inference: multi-step sampling]
+        I0[sample x_T ~ N 0,I] --> I1[t = T]
+        I1 --> I2[UNet x_t,t,c → ε̂]
+        I2 --> I3[sampler one step → x_{t-1}]
+        I3 --> I4{t > 1?}
+        I4 -->|yes, t = t-1| I2
+        I4 -->|no| I5[VAE decode → x̂_0]
+    end
+
+    style T5 fill:#e3f2fd
+    style I5 fill:#e8f5e9
+```
+
+Training is single-step supervision — one forward/backward per batch, almost no different from training a regular CNN. Inference is a $T'$-step loop ($T' \in [4, 50]$ depending on the sampler), and every step requires a UNet forward. This asymmetry causes many problems that only surface at inference: a smooth training-loss curve does not imply good sampling quality; one must run the actual sampler on every checkpoint and evaluate (FID, LPIPS, human ratings). This is an iron rule of diffusion-model engineering.
 
 ## 8.15 Summary
 

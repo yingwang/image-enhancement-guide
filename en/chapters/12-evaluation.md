@@ -1,10 +1,37 @@
 # Chapter 12 · Evaluation Methodology
 
-> Chapter 4 discussed **the metrics themselves**—where PSNR/LPIPS/FID each deceive you.
+> Chapter 4 discussed **the metrics themselves**: where PSNR/LPIPS/FID each deceive you.
 >
-> This chapter discusses **how to run an evaluation**—how to design a subjective evaluation, how to compute statistical significance, how to do A/B testing in production.
+> This chapter discusses **how to run an evaluation**: how to design a subjective evaluation, how to compute statistical significance, how to do A/B testing in production.
 >
 > In image enhancement, "running an experiment" itself has a methodology, and most papers do not get this step right.
+
+## 12.0 Reading guide
+
+Chapter 4 pulled each metric apart to discuss its individual biases; this chapter goes one level up: **given a set of metrics, how to organize them into trustworthy experimental conclusions**. The boundary can be drawn this way: Chapter 4 answers "what does PSNR = 32 dB mean", and this chapter answers "is PSNR 32 vs 31 actually better" and "is this gap perceivable by real users".
+
+This chapter assumes the reader has run simple comparison experiments (run two models, compute a PSNR, draw a table) but **has not necessarily designed a user study or live A/B test**. We unpack the three layers of evaluation, several subjective protocols, rater quality control, statistical significance testing, and production A/B testing.
+
+**Abbreviations introduced here.** The abbreviations used in this chapter are listed up front:
+
+- **IQA** (Image Quality Assessment): defined in Chapter 1, used directly here
+- **MOS** (Mean Opinion Score): the average of raters' image-quality scores on a 1-5 Likert scale
+- **DMOS** (Differential MOS): a relative MOS measured against a reference image; equals the reference score minus the test score, in units of "quality loss"
+- **2AFC** (Two-Alternative Forced Choice): a comparison protocol where the rater must pick between A and B
+- **BT.500**: ITU-R's standard for subjective video and image evaluation, the de facto standard in this field
+- **NR-IQA / FR-IQA** (No-Reference / Full-Reference IQA): defined in Chapter 1; NR-IQA is the workhorse for real-world scenarios in this chapter
+- **BRISQUE** (Blind/Referenceless Image Spatial Quality Evaluator): a classic NR-IQA metric based on natural-scene statistics
+- **NIQE** (Natural Image Quality Evaluator): another NR-IQA metric based on natural-scene statistics
+- **PI** (Perceptual Index): a composite NR metric defined by the PIRM 2018 competition, equal to (10 - NRQM + NIQE) / 2
+- **NRQM** (No-Reference Quality Metric): an SR-specific NR metric proposed by Ma et al. 2017
+- **MANIQA / CLIP-IQA / Q-Align**: modern NR-IQA metrics defined in Chapter 1
+- **ICC** (Intraclass Correlation Coefficient): a measure of inter-rater agreement
+- **AMT** (Amazon Mechanical Turk): the classic crowdsourcing platform
+- **IRB** (Institutional Review Board): the institutional ethics review board for human-subject research in academia
+- **SUREAL** (Subjective REcovery Algorithm with Latent classes): Netflix's MOS estimation method
+- **PVD** (Preferred Viewing Distance): the recommended viewing distance specified in BT.500
+
+After reading this chapter you should be able to answer: given a new model, how do I design a set of experiments that runs fast, runs accurately, and stands up to scrutiny in paper / product review; when a user says "I can't see a difference", how do I rebut or concede using data; when a live A/B test shows no difference after two weeks, is the model bad or is the sample too small.
 
 ## 12.1 The three layers of evaluation
 
@@ -29,7 +56,38 @@ Layer 3: Real-world downstream tasks
 
 **The three layers must validate each other**: an automatic-metric improvement that does not show up in subjective evaluation or downstream tasks is suspect.
 
-This chapter focuses on Layer 2 and Layer 3.
+Drawing the three layers and their concrete methods as a taxonomy makes it easier to look up later — each subsequent section is essentially filling in a subtree of the following diagram:
+
+```mermaid
+graph TD
+    Eval[Image enhancement evaluation]
+    Eval --> L1[Layer 1<br/>Automatic metrics]
+    Eval --> L2[Layer 2<br/>Subjective evaluation]
+    Eval --> L3[Layer 3<br/>Downstream tasks / A/B]
+
+    L1 --> FR[FR-IQA full reference<br/>HR ground truth available]
+    L1 --> NR[NR-IQA no reference<br/>no HR ground truth]
+    FR --> FR1[PSNR / SSIM / MS-SSIM]
+    FR --> FR2[LPIPS / DISTS]
+    FR --> FR3[FID / KID distribution-level]
+    NR --> NR1[BRISQUE / NIQE / PI / NRQM]
+    NR --> NR2[MANIQA / CLIP-IQA / Q-Align]
+
+    L2 --> SS[Single stimulus<br/>SS / MOS]
+    L2 --> DS[Double stimulus<br/>DSCQS / DSIS]
+    L2 --> PC[Forced choice<br/>2AFC / PC]
+    L2 --> CV[Continuous evaluation<br/>SSCQE video-specific]
+
+    L3 --> Down[Downstream task metrics<br/>OCR / detection / recognition]
+    L3 --> AB[Production A/B testing<br/>user behavior]
+    L3 --> Bandit[Multi-armed bandit<br/>dynamic traffic allocation]
+
+    style L1 fill:#e8f5e9
+    style L2 fill:#fff3e0
+    style L3 fill:#ffebee
+```
+
+This chapter focuses on Layer 2 and Layer 3; the details of Layer 1 are already covered in Chapter 4.
 
 ## 12.2 MOS: single-image scoring
 
@@ -124,7 +182,33 @@ Rater chooses: A is closer / B is closer / cannot tell
 
 ### Practical recommendation: **more reliable than MOS**
 
-The vast majority of serious paper/product comparisons use 2AFC rather than MOS—unless you are only evaluating the overall quality of one single model.
+The vast majority of serious paper/product comparisons use 2AFC rather than MOS - unless you are only evaluating the overall quality of one single model.
+
+Drawing a complete paired-comparison (PC) experiment from recruitment to conclusion, the flowchart covers every quality-control point in Sections 12.4 - 12.7:
+
+```mermaid
+flowchart TD
+    Start[Recruit raters] --> Train[Training session<br/>5-10 anchors to calibrate scale]
+    Train --> Catch[Inject 5-10 percent catch trials<br/>known correct answers]
+    Catch --> Random[Trial randomization<br/>order / left-right / repeated positions]
+    Random --> Vote[Raters complete 2AFC vote<br/>A wins / B wins / tie]
+
+    Vote --> QC{Quality control}
+    QC -->|catch trial error rate high| Drop[Drop rater]
+    QC -->|response time less than 5 seconds| Drop
+    QC -->|BT.500 β2 outlier| Drop
+    QC -->|test-retest inconsistent| Drop
+    QC -->|pass| Keep[Keep ratings]
+
+    Keep --> Agg[SUREAL joint estimation<br/>q_j / b_i / v_i]
+    Agg --> Stat[Binomial test<br/>+ Bonferroni correction]
+    Stat --> Out[Preference rate + confidence interval<br/>+ report Krippendorff α]
+
+    style Drop fill:#ffebee
+    style Out fill:#e8f5e9
+```
+
+This diagram is referenced throughout later sections - 12.5 on recruitment and quality control corresponds to the left half, 12.6 on agreement metrics and BT.500 outlier detection corresponds to the middle, 12.7 on SUREAL to the lower right, and 12.11 on statistical testing to the final step.
 
 ```python
 def compute_preference_rate(votes: list) -> dict:
