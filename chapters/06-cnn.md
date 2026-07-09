@@ -27,12 +27,12 @@
 
 - **SRCNN**（Super-Resolution Convolutional Neural Network）：2014 年 Dong et al. 提出的三层 CNN 超分网络，第一次把端到端学习用在 SR 上
 - **VDSR**（Very Deep Super-Resolution）：2016 年 Kim et al. 提出，VGG 风的 20 层堆叠 + 残差学习，证明"深"和"残差"两个设计同时引入能大幅涨点
-- **EDSR**（Enhanced Deep Super-Resolution）：2017 年 Lim et al. 提出，把残差块里的 Batch Normalization 移除、把上采样挪到网络末尾，是低层视觉 CNN 的"工程基线"
+- **EDSR**（Enhanced Deep Residual Networks for Single Image Super-Resolution，正文简称 Enhanced Deep Residual）：2017 年 Lim et al. 提出，把残差块里的 Batch Normalization 移除、把上采样挪到网络末尾，是低层视觉 CNN 的"工程基线"
 - **RCAN**（Residual Channel Attention Network）：2018 年 Zhang et al. 提出，把通道注意力引入 SR，并通过残差套残差的结构稳定训练 400+ 层网络
 - **ESRGAN**（Enhanced Super-Resolution GAN）：2018 年 Wang et al. 提出，提出 RRDB 块并用 RaGAN 损失训练，定义了感知派 SR 的视觉标杆
 - **RRDB**（Residual in Residual Dense Block）：ESRGAN 的核心 block，三个 dense block 嵌套 + 三层残差，Real-ESRGAN 至今沿用
 - **Real-ESRGAN**：2021 年的代表性"真实场景"超分模型，第 5 章已详谈，本章关注它沿用的 RRDB backbone
-- **NAFNet**（Non-linear Activation Free Network）：2022 年 Chen et al. 提出，反向简化——移除所有 ReLU/GELU，用门控乘法代替，在去噪/去模糊上反超复杂架构
+- **NAFNet**（Non-linear Activation Free Network）：2022 年 Chen et al. 提出，反向简化，移除所有 ReLU/GELU，用门控乘法代替，在去噪/去模糊上反超复杂架构
 - **CA**（Channel Attention，通道注意力）：给每个通道学一个标量权重并相乘，让模型自适应地放大/抑制不同通道
 - **SE**（Squeeze-and-Excitation）：2018 年提出的 channel attention 通用形式，先 global average pool 把空间压缩为一个标量，再用两层 MLP 算权重
 - **ECA**（Efficient Channel Attention）：2020 年的 channel attention 改进，用 1D 卷积代替两层 MLP，参数从 $O(C^2)$ 降到 $O(k)$
@@ -64,7 +64,7 @@ Transformer 在 2021 年起在低层视觉显身手（SwinIR、Restormer、HAT�
 2. 每个时代的代表网络在解决什么具体问题
 3. 设计自己的 CNN 增强网络时，怎么排序选与不选
 
-为了让后面六七个网络的讨论不至于在脑子里串成一锅粥，先用一张图把这条线整理出来。每一格代表一代的"主推新设计"，每一格的颜色对应它解决的瓶颈类别。
+为了让后面六七个网络的讨论不至于彼此混淆，先用一张图把这条线整理出来。每一格代表一代的"主推新设计"，每一格的颜色对应它解决的瓶颈类别。
 
 ```mermaid
 graph LR
@@ -88,9 +88,9 @@ graph LR
     style NAFNet fill:#e8f5e9
 ```
 
-颜色分组反映"贡献类型"。蓝色一组（SRCNN/VDSR）是"奠基"，把端到端学习和残差学习确立成范式。黄色一组（EDSR/RCAN/RRDB）是"模块创新"，提出可复用的子结构（残差块、CA、Dense block）。红色一组（Real-ESRGAN）的贡献完全在数据 pipeline，不在网络。绿色一组（NAFNet）反向简化，把前几代加进来的东西又拿掉一部分。这条线的最后两格读起来是反向的——这是低层视觉 CNN 时代最值得记住的反潮流故事。
+颜色分组反映"贡献类型"。蓝色一组（SRCNN/VDSR）是"奠基"，把端到端学习和残差学习确立成范式。黄色一组（EDSR/RCAN/RRDB）是"模块创新"，提出可复用的子结构（残差块、CA、Dense block）。红色一组（Real-ESRGAN）的贡献完全在数据 pipeline，不在网络。绿色一组（NAFNet）反向简化，把前几代加进来的东西又拿掉一部分。这条线的最后两格读起来是反向的，这是低层视觉 CNN 时代最值得记住的反潮流故事。
 
-## 6.2 SRCNN（2014）—— 起点
+## 6.2 SRCNN（2014）：起点
 
 第一篇深度学习超分论文。Dong et al. 把传统的稀疏编码超分流程映射成了三层 CNN：
 
@@ -131,12 +131,12 @@ class SRCNN(nn.Module):
 
 - **太浅**：只有 3 层，有效感受野约 13×13，对自然图像里几十像素尺度的结构无法捕捉
 - **先上采样浪费计算**：所有计算都在 HR 尺寸上做，4× SR 时 FLOPs 是 LR 空间的 16 倍
-- **大卷积核（9×9）效率差**：参数多但有效感受野有限，参数预算被首层吃掉一大半
+- **大卷积核（9×9）效率差**：参数多但有效感受野有限，参数预算被首层占去一大半
 - **没有残差**：要直接从输入回归出 HR 的全部像素，优化目标方差大、训练慢
 
 后续的工作都在解决这些问题，可以把 6.3 到 6.7 节看成"一个一个地拆掉 SRCNN 的局限"。
 
-## 6.3 VDSR（2016）—— 深 + 残差
+## 6.3 VDSR（2016）：深 + 残差
 
 Kim et al. 提出 VDSR（Very Deep Super-Resolution），核心两点贡献。
 
@@ -144,7 +144,7 @@ Kim et al. 提出 VDSR（Very Deep Super-Resolution），核心两点贡献。
 
 VGG 风格的堆叠 3×3 卷积。20 层的感受野理论上能覆盖 41×41 的输入区域，比 SRCNN 大很多，能利用更广的上下文。
 
-加深也带来训练难题：直接堆 20 层卷积，梯度容易在反向传播中放大或消失，VGG 时代用的"小学习率 + 仔细初始化"在 SR 任务上仍然不稳定。VDSR 的第二个贡献——残差学习——同时解决了表达能力和优化稳定性两个问题。
+加深也带来训练难题：直接堆 20 层卷积，梯度容易在反向传播中放大或消失，VGG 时代用的"小学习率 + 仔细初始化"在 SR 任务上仍然不稳定。VDSR 的第二个贡献，即残差学习，同时解决了表达能力和优化稳定性两个问题。
 
 ### 残差学习
 
@@ -184,9 +184,9 @@ class VDSR(nn.Module):
 - 没有归一化也没有 scale 系数，深网络下数值容易飘
 - 残差是"整体残差"，没有 block 内残差，深度再增加的话训练稳定性会出问题
 
-## 6.4 EDSR（2017）—— 移除 BN，残差块标准化
+## 6.4 EDSR（2017）：移除 BN，残差块标准化
 
-Lim et al. 提出 EDSR（Enhanced Deep Residual Super-Resolution），是低层视觉的"工程基线"网络。它的几个决定影响了后续所有 CNN 工作。
+Lim et al. 提出 EDSR（Enhanced Deep Residual …），是低层视觉的"工程基线"网络。它的几个决定影响了后续所有 CNN 工作。
 
 ### 决定一：移除 Batch Normalization
 
@@ -196,7 +196,7 @@ ResNet 的标准残差块是 `Conv → BN → ReLU → Conv → BN`。EDSR 论�
 
 **BN 在做什么。** Batch Normalization 把当前 mini-batch 里同一通道的所有像素值合起来，算均值 $\mu$ 和方差 $\sigma^2$，然后做 $\hat{x} = (x - \mu) / \sigma$，最后用可学的 $\gamma, \beta$ 还原一定的尺度自由度。它的物理含义是"把这个通道的激活分布归到零均值单位方差"。
 
-**高层视觉里它为什么好用。** 分类任务的最终目标是 invariant 的——给一只猫加一层全局亮度，仍然是猫。BN 把绝对亮度信息归一化掉，反而让网络去关注真正有区分度的特征。同时大 batch 下 $\mu, \sigma$ 的估计稳定，训练和测试行为一致。
+**高层视觉里它为什么好用。** 分类任务的最终目标是 invariant 的：给一只猫加一层全局亮度，仍然是猫。BN 把绝对亮度信息归一化掉，反而让网络去关注真正有区分度的特征。同时大 batch 下 $\mu, \sigma$ 的估计稳定，训练和测试行为一致。
 
 **低层视觉里它为什么不好用，分四点。**
 
@@ -255,11 +255,11 @@ class UpsampleBlock(nn.Module):
 
 为什么 PixelShuffle 是事实标准，对比另外几种上采样方案。
 
-- **transposed conv**（反卷积）：通过 stride > 1 的反卷积直接学到上采样。问题是当 stride 与 kernel size 不匹配时会产生**棋盘伪影**——每隔 $r$ 个像素亮度有规律的微小起伏，肉眼可见且很难消。
+- **transposed conv**（反卷积）：通过 stride > 1 的反卷积直接学到上采样。问题是当 stride 与 kernel size 不匹配时会产生**棋盘伪影**：每隔 $r$ 个像素亮度有规律的微小起伏，肉眼可见且很难消。
 - **nearest + conv** 或 **bilinear + conv**：先用固定插值放大再卷积。可以工作，但是上采样和后续卷积彻底解耦，模型只能"在已经被插值核形状决定的频域响应基础上微调"，参数效率不高。
 - **PixelShuffle**：通过 $r^2$ 倍通道的卷积学到的 reorder，参数效率最高，没有棋盘伪影（前提是用 ICNR 初始化），且与 LR 空间的卷积主干天然衔接。
 
-实际工程里 PixelShuffle 是**默认选择**。除非有特殊原因——比如部署平台不支持 channel-to-space 操作、或者需要 arbitrary scale 而不是 2/3/4 倍——否则不要用 transposed conv。
+实际工程里 PixelShuffle 是**默认选择**。除非有特殊原因（比如部署平台不支持 channel-to-space 操作、或者需要 arbitrary scale 而不是 2/3/4 倍），否则不要用 transposed conv。
 
 ### 决定三：残差块标准化
 
@@ -345,13 +345,13 @@ graph TD
 
 三张子图按从上到下越来越接近现代设计的顺序排列。蓝色 SRCNN 整条链都跑在 HR 大小上、没有任何 skip。黄色 VDSR 加了一条整体 skip，但仍然在 HR 空间。绿色 EDSR 是现代 SR 的雏形：LR 空间做所有特征提取，末端一次性上采样，每个残差块自带 scale。后面所有更复杂的网络（RCAN、RRDB、NAFNet）骨架都沿用这第三种布局，只是 block 内部更精致。
 
-## 6.5 RCAN（2018）—— 引入注意力
+## 6.5 RCAN（2018）：引入注意力
 
 EDSR 之后的方向之一是把**注意力机制**引入低层视觉。Zhang et al. 的 RCAN（Residual Channel Attention Network）是代表。
 
 ### Channel Attention 是什么
 
-不同通道学到不同的特征——有些通道对**纹理**敏感，有些对**边缘**敏感，有些对**低频颜色**敏感，还有些可能是冗余的。Channel Attention 让模型学一个**通道权重向量**，自动放大重要通道、抑制不重要通道，权重由当前输入特征自适应地决定。
+不同通道学到不同的特征：有些通道对**纹理**敏感，有些对**边缘**敏感，有些对**低频颜色**敏感，还有些可能是冗余的。Channel Attention 让模型学一个**通道权重向量**，自动放大重要通道、抑制不重要通道，权重由当前输入特征自适应地决定。
 
 具体的 Squeeze-and-Excitation 风格 channel attention 分四步：
 
@@ -436,9 +436,9 @@ graph LR
     style CAdetail fill:#fff8e1
 ```
 
-性能：Set5 4× 上约 32.6 dB，比 EDSR 提升约 0.5 dB。在 PSNR 派 SR 上 RCAN 至今仍是一个有力的参考线。
+性能：Set5 4× 上约 32.6 dB，比 EDSR 提升约 0.2 dB。在 PSNR 派 SR 上 RCAN 至今仍是一个有力的参考线。
 
-## 6.6 RRDB（ESRGAN，2018）—— 密集连接
+## 6.6 RRDB（ESRGAN，2018）：密集连接
 
 Wang et al. 在 ESRGAN 里提出 RRDB（Residual in Residual Dense Block）。这是**Real-ESRGAN 至今还在用的 backbone**。
 
@@ -460,7 +460,7 @@ $$
 
 ### RRDB 的具体设计
 
-每个 RRDB 包含 3 个 dense block，每个 dense block 由 5 个 conv + LeakyReLU 层组成。block 内 dense connection，block 间 residual connection，整个 RRDB 外面再一层 residual。也就是说残差出现了三层嵌套——这是名字 "Residual in Residual" 的由来。
+每个 RRDB 包含 3 个 dense block，每个 dense block 由 5 个 conv + LeakyReLU 层组成。block 内 dense connection，block 间 residual connection，整个 RRDB 外面再一层 residual。也就是说残差出现了三层嵌套，这正是名字 "Residual in Residual" 的由来。
 
 ```python
 class DenseBlock(nn.Module):
@@ -528,13 +528,13 @@ graph TD
     style DB fill:#fff8e1
 ```
 
-ESRGAN 整体堆叠 23 个 RRDB，约 1700 万参数。这个网络在 PSNR 指标上比 RCAN 略低，但配合 GAN 训练后**视觉质量**远好于纯 PSNR 优化的 RCAN——这就是 PSNR 派和感知派的分裂，第 4 章 4.8 节已经详谈过。
+ESRGAN 整体堆叠 23 个 RRDB，约 1700 万参数。这个网络在 PSNR 指标上比 RCAN 略低，但配合 GAN 训练后**视觉质量**远好于纯 PSNR 优化的 RCAN，这就是 PSNR 派和感知派的分裂，第 4 章 4.8 节已经详谈过。
 
-Real-ESRGAN 沿用 RRDB 网络，只换数据 pipeline 和训练损失，效果完全脱胎换骨。**这再次验证了第 5 章 5.1 节的结论：数据 > 网络。** 同样的 RRDB，bicubic 数据训出来在真实图像上 PSNR 18.2 dB（几乎不工作），Real-ESRGAN pipeline 数据训出来 23.8 dB（可用）——网络一行代码都没改。
+Real-ESRGAN 沿用 RRDB 网络，只换数据 pipeline 和训练损失，效果完全脱胎换骨。**这再次验证了第 5 章 5.1 节的结论：数据 > 网络。** 同样的 RRDB，用 bicubic 数据训出来的模型在真实图像上几乎不工作，换成 Real-ESRGAN pipeline 合成的数据训练后就变得可用，网络一行代码都没改。
 
-## 6.7 NAFNet（2022）—— 反潮流的简化
+## 6.7 NAFNet（2022）：反潮流的简化
 
-2018-2022 年低层视觉的趋势是"加更多花活"：Transformer block、各种 attention、复杂归一化、混合架构。Chen et al. 的 NAFNet 反过来——**移除一切非必要的东西**，反而做到去噪/去模糊 SOTA。论文标题里的 "Non-linear Activation Free" 直接亮明了反潮流立场。
+2018-2022 年低层视觉的趋势是"叠加更多复杂设计"：Transformer block、各种 attention、复杂归一化、混合架构。Chen et al. 的 NAFNet 反过来，**移除一切非必要的东西**，反而做到去噪/去模糊 SOTA。论文标题里的 "Non-linear Activation Free" 直接亮明了反潮流立场。
 
 ### 移除清单
 
@@ -547,7 +547,7 @@ Real-ESRGAN 沿用 RRDB 网络，只换数据 pipeline 和训练损失，效果�
 
 ### SimpleGate（替代 GELU）
 
-GELU 是 $x \cdot \Phi(x)$（输入乘以高斯 CDF）。NAFNet 注意到这本质是"输入乘以一个门控信号"——$\Phi(x)$ 取值在 0-1 之间，起到 soft gating 的作用。如果门控信号本身可以从特征里自适应地学出来，就不必非要用 $\Phi(x)$ 这种固定函数。
+GELU 是 $x \cdot \Phi(x)$（输入乘以高斯 CDF）。NAFNet 注意到这本质是"输入乘以一个门控信号"：$\Phi(x)$ 取值在 0-1 之间，起到 soft gating 的作用。如果门控信号本身可以从特征里自适应地学出来，就不必非要用 $\Phi(x)$ 这种固定函数。
 
 具体做法是把输入沿通道维一分为二，元素相乘：
 
@@ -564,7 +564,7 @@ class SimpleGate(nn.Module):
         return x1 * x2
 ```
 
-视觉影响：和 GELU 类似的非线性能力，**没有可学参数，且比 GELU 便宜**——只是 chunk + 元素级乘法，没有 erf/exp 的近似计算。代价是通道数减半，所以前置卷积要把通道扩到两倍。
+视觉影响：和 GELU 类似的非线性能力，**没有可学参数，且比 GELU 便宜**：只是 chunk + 元素级乘法，没有 erf/exp 的近似计算。代价是通道数减半，所以前置卷积要把通道扩到两倍。
 
 ### Simplified Channel Attention（SCA）
 
@@ -586,7 +586,7 @@ class SCA(nn.Module):
 - 没有 ReLU
 - 没有 sigmoid（直接相乘，不是归一化的权重）
 
-这种"看起来不对"的设计反而效果好——这是 NAFNet 论文的反直觉发现。直觉上，去掉 sigmoid 之后乘法系数可能任意大、可能为负，看起来训练会不稳。实际表现良好的可能解释是：LayerNorm2d 已经把输入归一化到合理范围，SCA 输出的"权重"加上 LayerNorm 的约束，实际幅度已经被锁住。
+这种"看起来不对"的设计反而效果好，这是 NAFNet 论文的反直觉发现。直觉上，去掉 sigmoid 之后乘法系数可能任意大、可能为负，看起来训练会不稳。实际表现良好的可能解释是：LayerNorm2d 已经把输入归一化到合理范围，SCA 输出的"权重"加上 LayerNorm 的约束，实际幅度已经被锁住。
 
 ### NAFBlock 整体
 
@@ -725,7 +725,7 @@ NAFNet 论文最有意思的点不是它的具体设计，是它的**消融实�
 > 同样的 FLOPs，简单网络和复杂网络效果差不了多少；
 > 复杂网络的"复杂"主要带来训练不稳和部署困难。
 
-这个结论对工程实践影响很大——**生产环境优先选简单 CNN**，除非有明确证据表明复杂网络带来质变。NAFNet 论文里的"简单网络不输复杂网络"也是为什么 2024-2025 年的去噪/去模糊 benchmark 上，NAFNet 仍然是经常出现的 baseline——它不是被超越，而是足够好且容易部署。
+这个结论对工程实践影响很大：**生产环境优先选简单 CNN**，除非有明确证据表明复杂网络带来质变。NAFNet 论文里的"简单网络不输复杂网络"也是为什么 2024-2025 年的去噪/去模糊 benchmark 上，NAFNet 仍然是经常出现的 baseline，它不是被超越，而是足够好且容易部署。
 
 ## 6.8 上采样方法对比
 
@@ -777,13 +777,13 @@ def icnr_init(tensor: torch.Tensor, scale: int = 2):
 
 - **BatchNorm** 沿 $(B, H, W)$ 三个维度求均值方差，每个通道一组统计量。对 batch size 敏感、对训练/测试一致性敏感。
 - **GroupNorm** 把通道分成 $G$ 组，每组在 $(H, W)$ 上求均值方差。batch 无关，batch size 小时比 BN 稳定。
-- **InstanceNorm** 是 GroupNorm 的 $G = C$ 极限——每个通道单独做空间归一化。在风格迁移里好用，因为它能去掉"图像整体颜色风格"；但在去噪/超分里这恰好是要保留的信息。
-- **LayerNorm 2d** 是 GroupNorm 的 $G = 1$ 极限——所有通道一起做"逐像素归一化"。NAFNet/SwinIR/Restormer 都用这种。
+- **InstanceNorm** 是 GroupNorm 的 $G = C$ 极限：每个通道单独做空间归一化。在风格迁移里好用，因为它能去掉"图像整体颜色风格"；但在去噪/超分里这恰好是要保留的信息。
+- **LayerNorm 2d** 是 GroupNorm 的 $G = 1$ 极限：所有通道一起做"逐像素归一化"。NAFNet/SwinIR/Restormer 都用这种。
 
 **为什么 LayerNorm 在 Transformer-based 低层视觉里 OK，而 BN 不行。**
 
-- BN 的归一化跨 batch 维度——同一张图的某个像素在不同 batch 里行为不同，且测试时切到 EMA 统计后行为又变一次
-- LayerNorm 跨 channel 维度——只看当前像素自己的特征向量，每张图独立，每个像素独立
+- BN 的归一化跨 batch 维度：同一张图的某个像素在不同 batch 里行为不同，且测试时切到 EMA 统计后行为又变一次
+- LayerNorm 跨 channel 维度：只看当前像素自己的特征向量，每张图独立，每个像素独立
 
 LayerNorm 对单张图是确定性的，**没有 train-test mismatch**。Transformer block 内部的 attention 已经会把"每个 token 的特征尺度"打散得很厉害，需要一个归一化在每个 block 入口把尺度拉回来，LayerNorm 正好担任这个角色而不引入 BN 的问题。
 
@@ -804,7 +804,7 @@ LayerNorm 对单张图是确定性的，**没有 train-test mismatch**。Transfo
 | **SiLU/Swish** | $x \cdot \sigma(x)$ | 现代默认 |
 | **SimpleGate** | $x_1 \odot x_2$ | NAFNet，0 计算 |
 
-挑几个关键的展开。**LeakyReLU** 的负斜率（典型 0.01 或 0.2）解决了 ReLU 的"死神经元"问题——纯 ReLU 在某个神经元长期输出负值时梯度永远是 0，参数被冻死；LeakyReLU 给负半轴一个小斜率，梯度始终非零。在 GAN 训练里 LeakyReLU 几乎是默认，因为 GAN 的判别器特别容易出现"输出长期为负"的局部模式。
+挑几个关键的展开。**LeakyReLU** 的负斜率（典型 0.01 或 0.2）解决了 ReLU 的"死神经元"问题：纯 ReLU 在某个神经元长期输出负值时梯度永远是 0，参数被冻死；LeakyReLU 给负半轴一个小斜率，梯度始终非零。在 GAN 训练里 LeakyReLU 几乎是默认，因为 GAN 的判别器特别容易出现"输出长期为负"的局部模式。
 
 **GELU** 在 Transformer 里几乎垄断，因为它的曲线在 0 附近平滑过渡（不像 ReLU 那样在 0 点有拐角），让基于 attention 的网络优化更稳定。在纯 CNN 里 GELU 和 ReLU 差异不大，但计算量稍高。
 
@@ -848,11 +848,11 @@ class ECA(nn.Module):
         return x * y
 ```
 
-ECA 的设计前提是"通道间的依赖主要是局部的"——相邻通道有更强的相关性，远处通道关系弱。一个 1D 卷积只看 $k$ 个邻居就够，不需要 SE 那种全连接。在低层视觉的实测里 ECA 和 SE 几乎打平，但参数从 $C^2 / r$ 降到 $k = 3$ 或 $5$。
+ECA 的设计前提是"通道间的依赖主要是局部的"：相邻通道有更强的相关性，远处通道关系弱。一个 1D 卷积只看 $k$ 个邻居就够，不需要 SE 那种全连接。在低层视觉的实测里 ECA 和 SE 几乎打平，但参数从 $C^2 / r$ 降到 $k = 3$ 或 $5$。
 
 ### Spatial Attention 在低层视觉
 
-CBAM 等模块加 spatial attention——让模型学到一个 $(H, W)$ 的权重图，再 broadcast 乘到所有通道上。它在分类、检测里效果不错，但**低层视觉里 spatial attention 收益有限**。原因：
+CBAM 等模块加 spatial attention，让模型学到一个 $(H, W)$ 的权重图，再 broadcast 乘到所有通道上。它在分类、检测里效果不错，但**低层视觉里 spatial attention 收益有限**。原因：
 
 - 低层视觉的输出是逐像素的，任何位置的像素都重要，没有"该忽略"的空间位置
 - spatial attention 的权重图带有平滑性，相当于给输出加了一层低通滤波，反而损害锐度
@@ -862,7 +862,7 @@ CBAM 等模块加 spatial attention——让模型学到一个 $(H, W)$ 的权�
 
 ## 6.12 一个完整的 EDSR-style 模型
 
-把上面的概念拼成一个生产可用的 SR 网络。**这是工程基线**——你做新任务、不知道选什么时，先用这个。
+把上面的概念拼成一个生产可用的 SR 网络。**这是工程基线**：你做新任务、不知道选什么时，先用这个。
 
 ```python
 import torch
@@ -992,15 +992,15 @@ class SRBaseline(nn.Module):
 ## 6.14 小结
 
 1. **CNN 在低层视觉的演进是渐进的**：SRCNN → VDSR（深 + 残差）→ EDSR（无 BN + 末端 PixelShuffle）→ RCAN（CA + 残差套残差）→ RRDB（dense + 三层嵌套残差）→ NAFNet（简化 + 门控）
-2. **残差学习是低层视觉的事实标准**——所有现代网络都用
-3. **Batch Normalization 在低层视觉有害**——破坏尺度、训练-测试失配，移除即可
+2. **残差学习是低层视觉的事实标准**：所有现代网络都用
+3. **Batch Normalization 在低层视觉有害**：破坏尺度、训练-测试失配，移除即可
 4. **PixelShuffle + ICNR 初始化是上采样的事实标准**
-5. **Channel Attention 是有效的小改进**（0.2-0.5 dB），SCA/ECA 是低开销选择
+5. **Channel Attention 是有效的小改进**（约 0.2 dB），SCA/ECA 是低开销选择
 6. **NAFNet 的启示**：低层视觉关键是计算预算分配，不是花架构
 7. **设计新网络的顺序**：定预算 → 深度 > 宽度 → PixelShuffle → 加 SCA → 选损失
 8. **Real-ESRGAN 的成功证明**：用 2018 年的 RRDB + 2021 年的数据 pipeline，效果远超用 2022 年新架构 + 旧数据
 
-CNN 的故事讲到这里。下一章 Transformer 进入低层视觉，会带来一个新维度的思考——**长距离依赖**。CNN 的感受野是局部的，Transformer 的 self-attention 让每个像素都能看到所有其他像素。这在去噪、去模糊、超分上各有不同的工程后果。
+CNN 的故事讲到这里。下一章 Transformer 进入低层视觉，会带来一个新维度的思考：**长距离依赖**。CNN 的感受野是局部的，Transformer 的 self-attention 让每个像素都能看到所有其他像素。这在去噪、去模糊、超分上各有不同的工程后果。
 
 ---
 

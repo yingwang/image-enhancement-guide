@@ -25,7 +25,7 @@
 - **GPEN**（GAN Prior Embedded Network，Yang et al. 2021）：把 StyleGAN 直接嵌进 U-Net decoder，与 GFPGAN 同时代的另一条路线
 - **CodeFormer**（Zhou et al. 2022）：用 VQ-VAE 学到的离散 codebook 作人脸先验，Transformer 预测 code 序列
 - **VQ-VAE**（Vector-Quantized Variational Autoencoder，向量量化变分自编码器）：把连续 latent 离散化为有限 codebook 的自编码器
-- **RestoreFormer / RestoreFormer++**（Wang et al. 2022/2023）：把 cross-attention 直接接到 codebook 上，去掉 CodeFormer 多步预测
+- **RestoreFormer / RestoreFormer++**（Wang et al. 2022/2023）：用 cross-attention 直接连接 LR 特征与 HQ 字典（codebook），是 codebook 路线的另一种取法
 - **ArcFace / FaceNet**：人脸识别网络，输出身份 embedding，常用于身份保留损失
 - **DnCNN**（Denoising CNN，Zhang et al. 2017）：去噪深度学习的开山之作，残差学习 + 高斯噪声
 - **N2N / Noise2Noise**（Lehtinen et al. 2018）：用两次独立采样的噪声图互相做监督，不需要干净图
@@ -46,11 +46,11 @@
 
 ## 10.1 为什么需要任务特化
 
-通用 SR 在自然图像上表现优秀，但放到下面这些场景会翻车：
+通用 SR 在自然图像上表现优秀，但放到下面这些场景会失效：
 
-- **人脸**：通用模型修复出的脸常常**变了样**——眼睛大小不对、鼻形改了、肤色漂移
-- **文字/文档**：通用模型把"日"修复成"目"——结构错了一笔
-- **医疗影像**：通用模型在 X 光/MRI 上加了不存在的"病灶"——可能是事故级错误
+- **人脸**：通用模型修复出的脸常常**变了样**，眼睛大小不对、鼻形改了、肤色漂移
+- **文字/文档**：通用模型把"日"修复成"目"，结构错了一笔
+- **医疗影像**：通用模型在 X 光/MRI 上加了不存在的"病灶"，可能是事故级错误
 - **卫星遥感**：通用模型把多光谱通道当 RGB 处理，光谱信息全错
 - **科学显微镜**：通用模型不理解物理成像过程，重建出非物理结构
 
@@ -121,7 +121,7 @@ $$
 
 关键洞察：
 
-> 人脸潜空间是低维的（StyleGAN W+ 维度与生成分辨率相关：1024px FFHQ 的 StyleGAN2 是 18×512 = 9216 维；512px 是 14×512）。
+> 人脸潜空间是低维的（StyleGAN W+ 维度与生成分辨率相关，层数 = 2·log2(R)−2：1024px FFHQ 的 StyleGAN2 是 18×512 = 9216 维；512px 是 16×512；256px 才是 14×512）。
 > 一张高质量人脸 = 这个低维空间里的一个点。
 >
 > 增强 = 从 LR 推出最合理的 W 向量，再用 StyleGAN 解码出 HR。
@@ -152,7 +152,7 @@ class IdentityLoss(nn.Module):
 
 ### 偏置 3：对齐很重要
 
-人脸有标准的几何结构——双眼水平、鼻子在中间、嘴巴下面。**对齐过的人脸**（face alignment）能让模型用更简单的网络达到同样效果，因为模型不需要学"五官位置可能在哪"。
+人脸有标准的几何结构：双眼水平、鼻子在中间、嘴巴下面。**对齐过的人脸**（face alignment）能让模型用更简单的网络达到同样效果，因为模型不需要学"五官位置可能在哪"。
 
 工程实践：人脸增强模型几乎都先用 face detector + landmark detector 把人脸对齐到固定 crop（通常 512×512），增强完再贴回原图。
 
@@ -176,8 +176,8 @@ HR Face
 
 关键点：
 
-- **StyleGAN2 generator 冻结不训**——已经学到了人脸分布
-- **训练的是 encoder + 一些调制层**——把 LR 信息映射到 StyleGAN 的潜空间和中间特征
+- **StyleGAN2 generator 冻结不训**：它已经学到了人脸分布
+- **训练的是 encoder + 一些调制层**：把 LR 信息映射到 StyleGAN 的潜空间和中间特征
 
 ### CS-SFT（Channel-Split Spatial Feature Transform）
 
@@ -199,7 +199,7 @@ $$
 \mathcal{L} = \lambda_1 \mathcal{L}_1 + \lambda_2 \mathcal{L}_{\text{percep}} + \lambda_3 \mathcal{L}_{\text{adv}} + \lambda_4 \mathcal{L}_{\text{id}} + \lambda_5 \mathcal{L}_{\text{component}}
 $$
 
-其中 $\mathcal{L}_{\text{component}}$ 是"五官局部 GAN 损失"——专门给眼睛、鼻子、嘴单独训判别器，强制每个局部都真实。
+其中 $\mathcal{L}_{\text{component}}$ 是"五官局部 GAN 损失"：专门给眼睛、鼻子、嘴单独训判别器，强制每个局部都真实。
 
 ### GFPGAN 性能与局限
 
@@ -215,7 +215,7 @@ $$
 
 ## 10.4 CodeFormer：codebook 离散化的优势
 
-Zhou et al. 在 2022 年的 CodeFormer 用了不同思路——不依赖 StyleGAN，改用 **VQ-VAE 学到的离散 codebook**。
+Zhou et al. 在 2022 年的 CodeFormer 用了不同思路：不依赖 StyleGAN，改用 **VQ-VAE 学到的离散 codebook**。
 
 ### 核心思想
 
@@ -251,7 +251,7 @@ graph LR
 
 为什么离散化有用？
 
-- **离散化 = 强先验**：模型只能生成 codebook 里"见过"的特征，不会编造无意义的局部。这是离散结构相对连续 W+ 的本质优势：W+ 上任何点 $w$ 都能产生输出，但 codebook 上只有 1024 种合法组合
+- **离散化 = 强先验**：模型只能生成 codebook 里"见过"的特征，不会编造无意义的局部。这是离散结构相对连续 W+ 的本质优势：W+ 上任何点 $w$ 都能产生输出，而 codebook 上每个空间位置只能取 1024 种局部模式之一（整图组合数是 $1024^{h \cdot w}$，但每个位置被限死在这 1024 个离散码里）
 - **Transformer 自然适合预测离散序列**：和 LLM next-token prediction 是同一范式，可以用大量成熟的序列建模技巧
 - **可调"控制强度"**：CodeFormer 提供 $w \in [0, 1]$ 让用户在"严格遵守 LR" vs "充分利用先验"之间调节
 
@@ -280,7 +280,7 @@ def codeformer_inference(model, lr_face, fidelity_weight=0.5):
 | 维度 | GFPGAN | CodeFormer |
 |------|--------|-----------|
 | 先验来源 | StyleGAN2（连续） | VQ codebook（离散） |
-| 推理速度 | 快 | 慢（多步 transformer） |
+| 推理速度 | 快 | 单次前向预测 code 序列，与 GFPGAN 同量级 |
 | Fidelity 可调 | 不可（固定） | 可调 $w$ |
 | 对极端退化 | 容易"变脸" | 离散化让变化受限 |
 | 工程友好度 | 中 | **高** |
@@ -289,9 +289,9 @@ def codeformer_inference(model, lr_face, fidelity_weight=0.5):
 
 ## 10.5 RestoreFormer / RestoreFormer++
 
-Wang et al. 的 RestoreFormer（2022）用 **cross-attention** 直接连接 LR 特征和 codebook，去掉了 CodeFormer 的多步预测，速度快很多。
+Wang et al. 的 RestoreFormer（2022）用 **cross-attention** 直接连接 LR 特征和 HQ 字典（codebook）。它和 CodeFormer 的差别不在"步数"：CodeFormer 是用 Transformer 一次前向预测出整条 code 索引序列再查表，RestoreFormer 则让 LR 特征直接对整个高质量字典做 cross-attention 取用特征，省掉了"预测离散 code 索引"这一环。两者都是单次前向，量级相当。
 
-RestoreFormer++ 进一步优化，是 2023 年人脸修复速度/质量平衡最好的模型。
+RestoreFormer++ 进一步优化，是 2023 年人脸修复速度/质量平衡最好的模型之一。
 
 代码骨架：
 
@@ -317,6 +317,10 @@ class RestoreFormerBlock(nn.Module):
         out, _ = self.attn(query=lr_features, key=codes, value=codes)
         return self.norm(out + lr_features)
 ```
+
+### 从 GAN/codebook 到扩散式盲人脸修复
+
+上面 GFPGAN、CodeFormer、RestoreFormer++ 代表的是 GAN 先验与 codebook 先验这一代人脸修复方法，它们不是终点。2024-25 的主流已经转向扩散式的盲人脸修复：DifFace 把复原表述成从退化图出发的扩散反向过程，PGDiff 在采样中引入面向属性的引导，DR2 先用扩散把退化"洗"到一个可控中间态再复原。它们相对 codebook 路线的共同点是用扩散先验替代离散字典，在严重退化下细节更自然。这条线的细节留到第 18 章，这里只提醒 codebook 不是人脸修复的最后一站。
 
 ## 10.6 老照片修复完整 pipeline
 
@@ -360,7 +364,7 @@ def restore_old_photo(image_path: str, fidelity: float = 0.5):
 
 ### 通用 SR 的失败
 
-通用 SR 学到的是"自然图像的统计先验"——平滑、纹理、自然色彩。这些在文字上完全错误：
+通用 SR 学到的是"自然图像的统计先验"，也就是平滑、纹理、自然色彩。这些在文字上完全错误：
 
 - 通用 SR 把笔画**模糊化** → 字看不清
 - 通用 SR 试图加"自然纹理" → 字边缘出现雾状
@@ -518,9 +522,9 @@ def train_n2n(model, paired_loader, optim, epochs):
 
 医疗诊断里"加一个不存在的病灶"是事故。所以：
 
-- **不允许无约束生成式恢复**——纯 GAN/扩散先验会编造
-- **生成模型可以作为先验**，但**必须配合严格的数据保真约束**（每一步把估计值在已观测的物理空间里强制对齐）—— 学界有大量工作（如 score-based MRI 重建、diffusion+data consistency）属于这类
-- **判别式模型也要小心**——L1 训出来的也可能"加平滑"掩盖病灶
+- **不允许无约束生成式恢复**：纯 GAN/扩散先验会编造
+- **生成模型可以作为先验**，但**必须配合严格的数据保真约束**（每一步把估计值在已观测的物理空间里强制对齐）。学界有大量工作（如 score-based MRI 重建、diffusion+data consistency）属于这类
+- **判别式模型也要小心**：L1 训出来的也可能"加平滑"掩盖病灶
 - **必须有物理约束**：成像物理（CT 的 Radon 变换、MRI 的 k-space 采样）必须建模
 
 ### 物理约束的形式
@@ -537,7 +541,7 @@ $$
 - MRI：FFT + 欠采样掩码
 - 超声：散射 + 衰减模型
 
-可以用**展开网络**（unrolled networks）—— 把传统迭代算法（如 ADMM、共轭梯度）展开成神经网络，每一步既有数据保真项（强制 $\hat{x}$ 与 $y$ 一致），又有先验项（学习的）。
+可以用**展开网络**（unrolled networks）：把传统迭代算法（如 ADMM、共轭梯度）展开成神经网络，每一步既有数据保真项（强制 $\hat{x}$ 与 $y$ 一致），又有先验项（学习的）。
 
 ### 一个简化的展开网络结构
 
@@ -572,7 +576,7 @@ class UnrolledMRIRecon(nn.Module):
         return x
 ```
 
-数据保真步（`mask * y + (1 - mask) * x_kspace`）是关键——模型只能在**未采样**的 k-space 位置自由发挥，已采样的位置必须严格用真实测量值。这从工程上保证了"不编造已观测信号"。
+数据保真步（`mask * y + (1 - mask) * x_kspace`）是关键：模型只能在**未采样**的 k-space 位置自由发挥，已采样的位置必须严格用真实测量值。这从工程上保证了"不编造已观测信号"。
 
 ### 工程实践
 
@@ -618,11 +622,11 @@ class UnrolledMRIRecon(nn.Module):
 - **STORM/PALM 类算法 + 神经网络加速**：超分辨显微镜
 - **Cycle GAN 风格**：从一类显微图迁移到另一类（不依赖配对数据）
 
-通用 SR 模型完全不适用——它们没有衍射极限的概念。
+通用 SR 模型完全不适用：它们没有衍射极限的概念。
 
 ## 10.11 参考引导增强（Reference-based）
 
-到这里讲的所有任务特化都是**单图输入**（single-image / blind）——只有 LR，靠先验补 HR 信息。还有一类被工业界用得很多但学术中文资料几乎没系统讲过的范式：**参考引导**（reference-based / Ref-based），简称 **RefSR / RefIR**。
+到这里讲的所有任务特化都是**单图输入**（single-image / blind）：只有 LR，靠先验补 HR 信息。还有一类被工业界用得很多但学术中文资料几乎没系统讲过的范式：**参考引导**（reference-based / Ref-based），简称 **RefSR / RefIR**。
 
 ### 范式
 
@@ -644,20 +648,21 @@ $$
 ### 代表方法
 
 - **MASA-SR**（CVPR 2021）：cross-attention 在 LR 与 Ref 之间做 patch matching，对错位有鲁棒性
-- **C2-Matching**（CVPR 2021）：把 matching 拆成两步——粗对齐 + 精细 correspondence learning
+- **C2-Matching**（CVPR 2021）：把 matching 拆成两步，先粗对齐再做精细 correspondence learning
 - **DATSR**（ECCV 2022）：deformable attention，处理 Ref 与 LR 的几何变形
-- **AccelIR / RefSR-Lite**：移动端蒸馏版本
 
-核心模块都是 **cross-attention between LR feature and Ref feature**——和第 7 章 Transformer 在低层视觉的注意力一脉相承，只是 Q 来自 LR、K/V 来自 Ref。
+这些方法的骨架偏重，落地到移动端时通常还要再做一轮蒸馏或轻量化改造，不过公认的、专门面向移动端的 RefSR 蒸馏工作目前并不多，具体名字随实现而定，这里不点名。
+
+核心模块都是 **cross-attention between LR feature and Ref feature**，和第 7 章 Transformer 在低层视觉的注意力一脉相承，只是 Q 来自 LR、K/V 来自 Ref。
 
 ### 关键工程问题
 
 参考引导**不是"用 Ref 监督训练"**，而是**推理时也要传 Ref 进来**。这带来一系列工程问题：
 
-1. **Ref 的几何对齐**：Ref 与 LR 视角、缩放、光照可能不同。模型必须 robust 到 misalignment——这是 MASA / DATSR 的核心研究点
+1. **Ref 的几何对齐**：Ref 与 LR 视角、缩放、光照可能不同。模型必须 robust 到 misalignment，这是 MASA / DATSR 的核心研究点
 2. **Ref 缺失的退化 fallback**：用户没传 Ref 怎么办？必须有 single-image fallback 模式（典型做法：训练时随机用 LR 自身上采样图当 fake Ref）
 3. **Ref 选择**：多个候选 Ref 时选哪张？经验是按 CLIP image embedding 相似度选 top-k
-4. **Ref 偏置风险**：如果 Ref 是错的（比如同名不同人），模型会把错误纹理迁移过来——**比无 Ref 时崩得更难看**
+4. **Ref 偏置风险**：如果 Ref 是错的（比如同名不同人），模型会把错误纹理迁移过来，**比无 Ref 时崩得更难看**
 
 ### 工业场景
 
@@ -674,7 +679,7 @@ RefSR 在产品里的实际位置远比论文显示的重要：
 - 用户拍了 100 张同一个人的照片，其中几张高清几张糊
 - 修复糊的那几张时，**用相册里同人脸的高清照作为 Ref**
 - Google Photos / 腾讯相册的"人物修复"功能背后是这条线
-- 注意：这是 blind face restoration（CodeFormer）的工程互补——CodeFormer 用通用人脸先验，RefSR 用**这个人**的先验
+- 注意：这是 blind face restoration（CodeFormer）的工程互补，CodeFormer 用通用人脸先验，RefSR 用**这个人**的先验
 
 **多帧 burst 摄影**：
 
@@ -690,7 +695,7 @@ RefSR 在产品里的实际位置远比论文显示的重要：
 
 ### 与 blind 范式的关系
 
-RefSR 不是 blind/non-blind 的第三种——它是**多输入 blind**：依然不知道 $D$，但有额外信息 Ref 帮你"猜" $x$。这个额外信号在工程上极有价值：
+RefSR 不是 blind/non-blind 的第三种，它是**多输入 blind**：依然不知道 $D$，但有额外信息 Ref 帮你"猜" $x$。这个额外信号在工程上极有价值：
 
 | 范式 | 输入 | 难度 | 质量上限 |
 |------|------|------|---------|
@@ -698,18 +703,18 @@ RefSR 不是 blind/non-blind 的第三种——它是**多输入 blind**：依�
 | Blind 单图 | $y$ | 高 | 中（依赖先验） |
 | **Blind 多图（RefSR）** | $y, \text{Ref}$ | 中 | **更高**（Ref 给真实纹理） |
 
-这就是为什么手机厂商把 RefSR 当作旗舰功能——同样的算力预算下，**Ref 提供的信息比任何单图先验都强**。
+这就是为什么手机厂商把 RefSR 当作旗舰功能：同样的算力预算下，**Ref 提供的信息比任何单图先验都强**。
 
 ### 该不该用 RefSR
 
 工程决策：
 
-- **能拿到 Ref 就用**——质量上限明显高于纯 single-image
+- **能拿到 Ref 就用**：质量上限明显高于纯 single-image
 - **Ref 必须做几何对齐预处理**（光流 / SIFT / cross-attention 自己学）
-- **必须有 single-image fallback**——不能强依赖
-- **要做 Ref 偏置检测**——CLIP 相似度太低就不用 Ref，回退到 single-image
+- **必须有 single-image fallback**：不能强依赖
+- **要做 Ref 偏置检测**：CLIP 相似度太低就不用 Ref，回退到 single-image
 
-学术 benchmark 上 RefSR 看起来比 single-image 好得有限（CUFED5 / WR-SR 这些标准 benchmark 的 Ref 信号本身有限），但**真实多摄手机场景下提升能到 1-2 dB**——这个差距是工业界长期愿意投入这条线的原因。
+学术 benchmark 上 RefSR 看起来比 single-image 好得有限（CUFED5 / WR-SR 这些标准 benchmark 的 Ref 信号本身有限），但**真实多摄手机场景下的提升要明显大得多**，这个差距是工业界长期愿意投入这条线的原因。
 
 ### 论文与代码
 
@@ -777,7 +782,7 @@ RefSR 不是 blind/non-blind 的第三种——它是**多输入 blind**：依�
 
 ## 10.14 小结
 
-1. **通用模型在某些领域必然失败**——人脸、文字、医疗、遥感、显微，各有不同的归纳偏置
+1. **通用模型在某些领域必然失败**：人脸、文字、医疗、遥感、显微，各有不同的归纳偏置
 2. **人脸增强**是最成熟的子领域：StyleGAN 先验 + 身份保留 + 对齐
 3. **GFPGAN** 用 StyleGAN2 generator + CS-SFT 调制，是 2021 经典
 4. **CodeFormer** 用 VQ codebook + Transformer，工程灵活，可调 fidelity
@@ -786,9 +791,9 @@ RefSR 不是 blind/non-blind 的第三种——它是**多输入 blind**：依�
 7. **遥感** 需要多光谱物理 + 大尺度 tile
 8. **显微镜** 必须建模 PSF + 衍射极限
 9. **设计方法论**：识别偏置 → 注入先验 → 专用损失 → 专用评估 → 失败测试
-10. **任务特化是边际收益最大的增强方向**——通用模型只能做到 80 分，特化模型在专门场景可以做到 99 分
+10. **任务特化是边际收益最大的增强方向**：通用模型只能做到 80 分，特化模型在专门场景可以做到 99 分
 
-到这里 Part II 五章全部完成。Part III 进入训练和评估的工程细节——前面章节讲了"用什么"，这两章讲"怎么训得稳、怎么评得准"。
+到这里 Part II 五章全部完成。Part III 进入训练和评估的工程细节：前面章节讲了"用什么"，这两章讲"怎么训得稳、怎么评得准"。
 
 ---
 

@@ -8,7 +8,7 @@
 
 ## 14.0 本章定位与前置知识
 
-视频增强从模型设计角度看，比图像多出一个根本约束：**时间维度**。同一个物体在相邻帧上不仅要清晰，还要在像素层面"接得上"，否则视觉上会出现闪烁、抖动、纹理跳变。第 13 章已经讨论了这个时序一致性是怎么定义的、光流和对齐为什么必要、双向传播为何比单向更稳。本章假设这些基础概念已经在脑子里，重点放在**具体模型如何把这些概念落地成可训练、可部署的网络**。
+视频增强从模型设计角度看，比图像多出一个根本约束：**时间维度**。同一个物体在相邻帧上不仅要清晰，还要在像素层面"接得上"，否则视觉上会出现闪烁、抖动、纹理跳变。第 13 章已经讨论了这个时序一致性是怎么定义的、光流和对齐为什么必要、双向传播为何比单向更稳。本章假设读者已经掌握这些基础概念，重点放在**具体模型如何把这些概念落地成可训练、可部署的网络**。
 
 读完本章你应当能回答下面几个问题：
 
@@ -31,17 +31,17 @@
 - **IconVSR**：BasicVSR 同一篇论文的"info-fused"变体，把多帧信息抽到关键帧供后续传播
 - **BasicVSR++**（2022）：BasicVSR 的升级版，加入二阶传播和 flow-guided deformable alignment
 - **VRT**（Video Restoration Transformer，2022）：把窗口 Transformer 引入 VSR，沿时间轴做 attention
-- **RVRT**（Recurrent Video Restoration Transformer，2023）：VRT 的循环化版本，用循环替代部分长程 attention 来控制计算量
+- **RVRT**（Recurrent Video Restoration Transformer，2022）：VRT 的循环化版本（同为 2022 年提出，NeurIPS 2022），用循环替代部分长程 attention 来控制计算量
 - **DCN**（Deformable Convolutional Network，可变形卷积）：卷积核每个采样位置带一个可学习的偏移，使卷积能"瞄准"非规则位置
 - **RIFE**（Real-time Intermediate Flow Estimation，2022）：直接估计"中间帧到两端"光流的 VFI 方法
 - **IFNet**（Intermediate Flow Network）：RIFE 里专门预测中间帧光流的子网络
 - **FILM**（Frame Interpolation for Large Motion，Google 2022）：多尺度递归光流估计的 VFI 方法，对大位移强
-- **AMT**（All-pairs Multi-field Transforms，2023）：在 RIFE 基础上加 attention，对遮挡更鲁棒
-- **MIMO-UNet**（Multi-Input Multi-Output UNet）：在不同分辨率上独立处理后融合的视频去模糊架构
+- **AMT**（All-pairs Multi-field Transforms，CVPR 2023）：核心是像 RAFT 那样构建 all-pairs 相关体，再用 multi-field（多组光流假设）细化中间流，对大位移与遮挡更鲁棒
+- **MIMO-UNet**（Multi-Input Multi-Output UNet，ICCV 2021）：单图去模糊网络，"multi-input multi-output"指同一张图的多尺度金字塔（不是多帧），本章只借用它的多尺度思想
 - **ProPainter**（ICCV 2023）：当前 SOTA 的视频 inpainting 方法，先补光流再补帧
 - **E2FGVI**（End-to-end Flow-Guided Video Inpainting，CVPR 2022）：端到端的光流引导视频补全
 - **GOP**（Group of Pictures，画面组）：视频编码里以一个 I 帧为起点的若干帧组成的独立解码单元
-- **REDS**（Realistic and Dynamic Scenes）：NTIRE 2019 提出的 VSR 标准数据集，270 个训练 + 30 个测试片段
+- **REDS**（Realistic and Dynamic Scenes）：NTIRE 2019 提出的 VSR 标准数据集，官方划分为 240 训练 + 30 验证 + 30 测试片段（不少 VSR 工作会把训练与验证合并成 270 段一起训练，这是常见 270 口径的来源）
 - **VMAF**（Video Multi-Method Assessment Fusion）：Netflix 2016 推出的视频质量评估指标，融合多个子指标，训练数据是真实人评
 - **FVD**（Fréchet Video Distance）：把 FID 推广到视频的分布距离指标，常用于生成式视频
 - **tOF / tLPIPS**：时序版本的光流一致性 / LPIPS 一致性指标，衡量相邻帧的对齐与感知差异
@@ -72,12 +72,12 @@ VSR 的演进路线和图像 SR 类似但晚两年：
 ```
 2017  VESPCN     - 第一个端到端 VSR
 2018  TDAN       - 隐式对齐（DCN）
+2019  RBPN       - 循环 + 多帧补偿
 2019  EDVR       - 滑动窗口 + DCN 对齐
-2020  RBPN       - 循环 + 多帧补偿
 2021  BasicVSR   - 双向循环 + 显式光流对齐
 2022  BasicVSR++ - 二阶传播 + flow-guided DCN
 2022  VRT        - 时序 Transformer
-2023  RVRT       - 高效循环 Transformer
+2022  RVRT       - 高效循环 Transformer
 ```
 
 **BasicVSR++** 是 2022-2024 年的事实标准，简单、强、快。下面详谈。
@@ -259,8 +259,8 @@ flow + DCN 组合的优势：光流提供物理意义，DCN 提供局部修正�
 
 ### BasicVSR++ 的训练
 
-- **数据集**：REDS (240 个视频片段) + Vimeo-90K + 自合成的退化对
-- **退化**：MM-CelebA 风格的视频退化 + REDS 标配的运动模糊和压缩
+- **数据集**：REDS（240 训练片段）+ Vimeo-90K + 自合成的退化对
+- **退化**：标准 VSR 走 REDS / Vimeo 那套，即高斯模糊 + 双三次下采样合成 LR；若目标是真实退化视频，则改走 RealBasicVSR 的配方，用 Real-ESRGAN 式的二阶退化加 ffmpeg 视频压缩
 - **损失**：主要是 Charbonnier 重建损失（在每一输出帧上）。时序一致性主要靠**双向传播 + flow-guided alignment 的架构归纳偏置**自然涌现，而非显式时序损失项
 - **训练时长**：1.6M 步在 8× A100，约 10 天
 
@@ -274,7 +274,7 @@ VSR 的数据要求比图像 SR 更高：
 
 | 数据集 | 视频数 | 分辨率 | 用途 |
 |-------|-------|-------|------|
-| **REDS** | 270 (训) + 30 (测) | 720P | 通用 VSR 标准 |
+| **REDS** | 240 训 + 30 验 + 30 测 | 720P | 通用 VSR 标准 |
 | **Vimeo-90K** | 64,612 个 7-frame 片段 | 448×256 | 帧插值 + VSR |
 | **Vid4** | 4 个片段 | 720P | 测试 |
 | **UDM10** | 10 个片段 | 1080P | 测试 |
@@ -309,7 +309,7 @@ def synthesize_video_pair(hr_video):
 
 ## 14.5 VRT 与 RVRT：Video Restoration Transformer
 
-Liang et al. 在 2022 年提出 VRT，2023 年改进为 RVRT。这条线把 Transformer 引入 VSR，对应的思路是"放弃 RNN 隐状态那种串行依赖，让所有帧通过注意力机制互相看到"。它的代表性来自两点：在 SOTA benchmark 上常年压过 BasicVSR++ 约 0.5 dB；在实现复杂度和显存压力上也明显更高。
+Liang et al. 在 2022 年提出 VRT，同年又改进为 RVRT（VRT 是 arXiv 2201，RVRT 是 NeurIPS 2022，两者都属于 2022 年）。这条线把 Transformer 引入 VSR，对应的思路是"放弃 RNN 隐状态那种串行依赖，让所有帧通过注意力机制互相看到"。它的代表性来自两点：在 SOTA benchmark 上常年压过 BasicVSR++ 约 0.5 dB；在实现复杂度和显存压力上也明显更高。
 
 ### 核心思想
 
@@ -347,9 +347,17 @@ RVRT 在 VRT 的基础上再加一层"循环"：把整段视频切成若干段�
 
 工程实践 2026 年：
 
-- 离线高质量增强：RVRT 或 VRT
-- 实时/接近实时：BasicVSR++
+- 离线、追求最高质量：优先考虑扩散 / DiT 视频复原（见下一小节）；若只要纯回归式 baseline，仍是 RVRT 或 VRT
+- 实时 / 接近实时：BasicVSR++
 - 端侧：BasicVSR 或更轻量
+
+### 2024-2026：扩散派视频复原成为新的质量上限
+
+把 RVRT 当作视频复原的终点，到 2026 年已经不成立。VRT / RVRT 这条回归式（regression-based）路线有一个共同的天花板：损失函数本质上还是在逼近像素均值，面对严重退化、或需要"无中生有"补细节的真实视频时，输出会偏软、偏保守。2024 年起，前沿明显转向以视频扩散模型为先验的复原路线，思路和第 8 章图像端"用扩散先验做超分"一脉相承，只是把先验换成了带时间维的视频扩散网络。
+
+几条有代表性的工作：Upscale-A-Video（CVPR 2024）把图像潜空间扩散扩展到视频，用时序层加光流引导维持一致性；MGLD-VSR（ECCV 2024）在潜空间用运动引导的扩散做真实世界 VSR；VEnhancer（2024）用一个视频扩散模型统一做超分与插帧的增强。进入 2025 年，STAR 把文生视频扩散模型的强先验引入真实世界 VSR，SeedVR / SeedVR2（其中 SeedVR2 做到一步视频复原）则走扩散 Transformer（DiT）的大模型路线，代表了当前的质量上限。
+
+代价也很清楚，正好对应第 13 章反复强调的两个维度。其一是时序一致性：视频扩散先验的生成性更强，若时序建模不到位，帧间"沸腾"和身份漂移会比回归式模型更明显，所以这些工作的很大一部分精力都花在时序层、光流引导、潜空间传播上。其二是延迟：多步扩散叠上视频这条时间轴，推理成本比 BasicVSR++ 高一到两个数量级，目前基本只能用于离线增强，一步化（如 SeedVR2）是把它推向实时的关键方向。更细的谱系和取舍放在第 18 章讨论，这里只给方向与代表工作。
 
 ## 14.6 帧插值（VFI）
 
@@ -372,7 +380,7 @@ Huang et al. 的 RIFE（Real-time Intermediate Flow Estimation，实时中间流
 - 一个 IFNet 同时输出 $F_{0.5 \to 0}$ 和 $F_{0.5 \to 1}$
 - 用这两个光流分别 warp $F_0$ 和 $F_1$，融合得到 $F_{0.5}$
 
-为什么不直接复用 RAFT、FlowNet 这种通用光流模型？答案是 VFI 真正需要的是"中间帧到两端"的光流（$F_{0.5 \to 0}$ 和 $F_{0.5 \to 1}$），而通用光流模型给的是"前一帧到后一帧"（$F_{0 \to 1}$）。从前者反推后者要做一次反向投影，过程里会引入大量遮挡、孔洞、半像素误差。RIFE 的做法是**直接训练一个网络输出 $F_{0.5 \to \{0, 1\}}$**，省掉反推这一步。
+为什么不直接复用 RAFT、FlowNet 这种通用光流模型？答案是 VFI 真正需要的是"中间帧到两端"的光流（$F_{0.5 \to 0}$ 和 $F_{0.5 \to 1}$），而通用光流模型给的是"前一帧到后一帧"（$F_{0 \to 1}$）。要从后者（通用模型给的 $F_{0 \to 1}$）反推出前者（VFI 真正需要的 $F_{0.5 \to \{0,1\}}$），得做一次反向投影，过程里会引入大量遮挡、孔洞、半像素误差。RIFE 的做法是**直接训练一个网络输出 $F_{0.5 \to \{0, 1\}}$**，省掉反推这一步。
 
 下面把 RIFE 双向流估计 + 加权融合的数据流画清楚：
 
@@ -450,9 +458,9 @@ Reda et al. 的 FILM 用了不同思路，多尺度光流估计 + 渐进合成�
 - **慢速运动**（普通视频）：RIFE 和 FILM 接近
 - **快速运动**（体育、舞蹈）：FILM 优于 RIFE
 
-### AMT（2023）
+### AMT（CVPR 2023）
 
-更新的 SOTA：在 RIFE 基础上加 attention 模块，对**遮挡场景**特别强。
+更新的 SOTA，但它并不是"RIFE 加 attention"这么简单。AMT（All-pairs Multi-field Transforms）的核心是像 RAFT 那样构建 **all-pairs 相关体**来捕捉大范围对应关系，再用 **multi-field**（对同一处给出多组光流假设）做光流细化，最后融合。正因为多组假设加上大范围相关体，它在**大位移和遮挡边界**上比只估一组中间流的 RIFE 更稳。
 
 ### 帧插值的失败模式
 
@@ -482,9 +490,9 @@ EDVR 不只是 VSR 的事实经典，也是视频去模糊的代表：
 - DCN 对齐
 - 时空 attention 融合
 
-### MIMO-UNet（多输入多输出）
+### MIMO-UNet（单图去模糊，这里只借它的多尺度思想）
 
-不同分辨率上独立处理后融合，对不同尺度的模糊都能 cover。
+需要澄清一个常见的误归类：MIMO-UNet（ICCV 2021）其实是**单图去模糊**网络，名字里的"multi-input multi-output"指的是把同一张图做成多尺度金字塔，各尺度分别输入、分别输出再融合，和"多帧"没有关系。之所以在视频去模糊这一节提它，是因为它"在不同分辨率上分别处理不同尺度的模糊、再融合"的多尺度思路可以嫁接到视频去模糊的每一帧上；真正让视频占优势的，仍然是前面说的帧间对齐、从相邻帧借清晰像素。
 
 ### 数据：GoPro 数据集
 
@@ -582,7 +590,7 @@ Step 5: 增强 (VSR + 帧插值到 60 fps)
 4K 60 fps 增强视频
 ```
 
-每个步骤可能用不同模型，整体在 GPU 上跑约 5-10× 实时（5-10 秒 = 1 秒视频）。
+每个步骤可能用不同模型，整体在 GPU 上大约是 0.1-0.2× 实时（处理 1 秒视频需要 5-10 秒），并非快于实时。
 
 ### 例：直播视频增强
 
@@ -651,8 +659,8 @@ def compute_vmaf(reference_video, distorted_video):
 
 ## 14.12 小结
 
-1. **VSR 演进**：滑动窗口（EDVR）→ 双向 Recurrent（BasicVSR++）→ Transformer（RVRT）
-2. **BasicVSR++ 是 2024 年事实标准**：双向循环 + 二阶传播 + flow-guided DCN
+1. **VSR 演进**：滑动窗口（EDVR）→ 双向 Recurrent（BasicVSR++）→ Transformer（VRT / RVRT）→ 扩散 / DiT 视频复原（2024 起，STAR、SeedVR 等）
+2. **BasicVSR++ 是 2022-2024 年回归式 VSR 的事实标准**：双向循环 + 二阶传播 + flow-guided DCN；2024 年后的最高质量已转向扩散派
 3. **VSR 数据要求高**：合成时退化参数对一段视频固定，避免引入不一致
 4. **帧插值（VFI）三巨头**：RIFE（快）、FILM（大位移强）、AMT（遮挡强）
 5. **视频去模糊** 利用相邻帧的清晰副本，这是图像去模糊没有的优势
@@ -662,7 +670,7 @@ def compute_vmaf(reference_video, distorted_video):
 9. **实时增强严格受限**：< 33ms/帧只能用轻量 CNN
 10. **VMAF 是生产视频质量评估的事实标准**
 
-到这里 Part IV 视频两章完成。Part V 进入工程部署——前面讲了模型本身，这部分讲怎么把模型推到生产环境（量化、TensorRT、CoreML、移动端、tile）。
+到这里 Part IV 视频两章完成。Part V 进入工程部署：前面讲了模型本身，这部分讲怎么把模型推到生产环境（量化、TensorRT、CoreML、移动端、tile）。
 
 ---
 

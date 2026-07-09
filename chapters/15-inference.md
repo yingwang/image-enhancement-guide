@@ -181,7 +181,7 @@ PyTorch model (.pt)
   └── 自定义 (Custom)            ← 厂商 SDK
 ```
 
-**ONNX 是事实标准的中间格式**——大多数推理引擎都接受 ONNX。
+**ONNX 是事实标准的中间格式**：大多数推理引擎都接受 ONNX。
 
 ```python
 # 导出 PyTorch 模型到 ONNX
@@ -326,6 +326,8 @@ with torch.no_grad():
 model_int8 = quant.convert(model_prepared)
 ```
 
+时效上要补一句：上面这套 `torch.ao.quantization` 是 eager 模式的老接口，目前仍能用，但 PyTorch 2.x 起官方推荐的路径已经换成 PT2E（PyTorch 2 Export Quantization），它先用 `torch.export` 抓取模型图、再在图上插入量化算子，对带控制流和自定义模块的模型更稳。新项目建议直接从 PT2E 起步。
+
 GPU 上 INT8 量化更复杂，通常通过 TensorRT 或 ONNX Runtime 做。
 
 ## 15.3 NVIDIA GPU 部署：TensorRT
@@ -343,7 +345,7 @@ GPU 上 INT8 量化更复杂，通常通过 TensorRT 或 ONNX Runtime 做。
 
 1. **算子融合更激进**。把 Conv + BN + ReLU + Add 这种连续算子融合成一个 CUDA kernel，省掉中间张量的显存来回和 kernel 启动开销。PyTorch eager 模式做不到，torch.compile 做一部分但保守。
 2. **kernel 自动调优**。同一个 conv 在 NVIDIA 提供的几十个实现里（不同 tile size、不同 layout、不同 tensor core 路径），TensorRT 在你给的输入 shape 上跑 benchmark 选最快的。这个调优结果绑在 plan 文件里，所以 plan 不能跨 GPU 复用 - 在 A100 上 build 的 plan 不能扔到 4090 上跑。
-3. **低精度路径与 tensor core**。FP16 / BF16 / INT8 / FP8 路径下 TensorRT 直接用 Ampere / Hopper 的 tensor core，理论吞吐相比 CUDA core 高 4-8×。PyTorch eager 也用 cuDNN 走 tensor core，但 TensorRT 在更广的算子范围内能用到。
+3. **低精度路径与 tensor core**。FP16 / BF16 / INT8 路径下 TensorRT 直接用 Ampere 及之后的 tensor core，FP8 则要到 Hopper / Ada 这一代才有硬件支持（A100 属 Ampere，并不支持 FP8）；理论吞吐相比 CUDA core 高 4-8×。PyTorch eager 也用 cuDNN 走 tensor core，但 TensorRT 在更广的算子范围内能用到。
 
 代价是构建慢。一个 SDXL UNet 在 A100 上构建 FP16 plan 大约 5-15 分钟（看是否开 `BUILDER_OPTIMIZATION_LEVEL` 高档），INT8 加校准更慢，可达 30+ 分钟。所以 plan 应当作为 CI 产物缓存，不是每次启动现 build。
 
@@ -486,18 +488,18 @@ mlmodel.save("model.mlpackage")
 
 工程后果：**为 ANE 设计模型必须用受限算子集**：
 
-- ✓ Conv2d (3×3, 5×5)
-- ✓ ReLU / LeakyReLU / GELU
-- ✓ BatchNorm
-- ✓ PixelShuffle
-- ✗ Custom CUDA kernels
-- ✗ Dynamic shapes (受限)
-- ✗ 复杂 attention（部分支持）
+- **支持**：Conv2d（3×3、5×5）
+- **支持**：ReLU / LeakyReLU / GELU
+- **支持**：BatchNorm
+- **部分支持**：PixelShuffle（iOS 17+ 部分支持，且有尺寸限制；iOS 16 会 fallback，详见 15.5.2）
+- **部分支持**：动态形状（支持但受限，固定输入尺寸最稳）
+- **部分支持**：复杂 attention（原生支持有限，通常要拆成基础算子或做近似）
+- **不支持**：自定义算子 / 自定义层（Apple ANE 不运行 CUDA，任何不在白名单内的自定义层都会 fallback 到 CPU/GPU）
 
 实测：
 
 - Real-ESRGAN 在 iPhone 14 ANE 上 720P 输入 ~80ms
-- CoreFormer 同设备 ~150ms
+- 一个更重的 Transformer 类 SR 模型（示意）同设备 ~150ms
 
 ### CoreML 的 4-bit 量化
 
@@ -531,7 +533,7 @@ INT8 量化把 FP32/FP16 的 tensor 映射到 INT8。映射的"分辨率"（scal
 
 **为什么低层视觉必须 per-channel weight：**
 
-底层视觉的 conv weight 不同 output channel 之间幅度差异**比分类任务大得多**——一些通道学纹理（小幅度），一些学结构（大幅度）。per-tensor 用同一个 scale 时，小幅度通道被量化到几个 INT8 分级，精度严重损失，**视觉上表现为格点/色斑伪影**。
+底层视觉的 conv weight 不同 output channel 之间幅度差异**比分类任务大得多**：一些通道学纹理（小幅度），一些学结构（大幅度）。per-tensor 用同一个 scale 时，小幅度通道被量化到几个 INT8 分级，精度严重损失，**视觉上表现为格点/色斑伪影**。
 
 实测对比（Real-ESRGAN，DIV2K val）：
 
@@ -561,9 +563,9 @@ cto.linear_quantize_weights(
 
 ### 15.5.2 ANE fallback 到 CPU 的延迟悬崖
 
-ANE 算子典型耗时是 **几百 μs**（亚毫秒级）。一旦遇到不支持算子，CoreML 会把那一段子图 fallback 到 GPU 或 CPU，**单算子延迟跳到 ms 级**——10× 甚至 100× 跳变。
+ANE 算子典型耗时是 **几百 μs**（亚毫秒级）。一旦遇到不支持算子，CoreML 会把那一段子图 fallback 到 GPU 或 CPU，**单算子延迟跳到 ms 级**，出现 10× 甚至 100× 的跳变。
 
-更糟的是 fallback 不是单算子的事：**ANE 与 CPU/GPU 之间的 tensor 切换本身有数 ms 开销**（数据要在不同 memory pool 之间拷贝）。一个 30 层网络如果有 3 个 fallback 算子，可能产生 6 次 ANE↔CPU 切换，每次切换几 ms——总延迟从 30ms 跳到 100ms+。
+更糟的是 fallback 不是单算子的事：**ANE 与 CPU/GPU 之间的 tensor 切换本身有数 ms 开销**（数据要在不同 memory pool 之间拷贝）。一个 30 层网络如果有 3 个 fallback 算子，可能产生 6 次 ANE↔CPU 切换，每次切换几 ms，总延迟从 30ms 跳到 100ms+。
 
 **必须做的事**：
 
@@ -591,7 +593,7 @@ mlmodel = ct.convert(traced, ..., compute_units=ct.ComputeUnit.CPU_AND_NE)
 
 3. **PixelShuffle 是 SR 的高频陷阱**：iOS 16 ANE 不支持 PixelShuffle，会 fallback。iOS 17+ 部分支持但有尺寸限制（输入通道必须 ≤ 256）。如果是 iOS 16 兼容性需求，**用 transposed conv 或 nearest+conv 代替 PixelShuffle**。
 
-4. **LayerNorm 在 ANE 上动态形状会 fallback**：固定 spatial size 的 LayerNorm OK，输入尺寸动态时可能 fallback。SR 模型如果对外承诺动态分辨率，**用 GroupNorm（ANE 友好）替代 LayerNorm**。
+4. **LayerNorm 在 ANE 上动态形状可能 fallback**：固定 spatial size 的 LayerNorm 一般没问题，输入尺寸动态时有可能 fallback。这里要给个限定：Apple 官方的 ANE-optimized Transformer 恰恰用的是经过优化的 LayerNorm，所以"LayerNorm 不友好"并不是绝对结论，是否成立取决于具体实现和形状是否固定。如果 SR 模型对外承诺动态分辨率、且实测到 LayerNorm 触发 fallback，可以试着换成对形状不敏感的 GroupNorm，但要以 profile 结果为准，不要默认 GroupNorm 一定更快。
 
 ### 15.5.3 Reshape / Permute 的隐式 layout 转换
 
@@ -604,34 +606,34 @@ ANE 内部有偏好的 tensor layout（NCHW vs 内部专用），某些 reshape/
 工程实践：
 
 - **训练时就用 ANE 友好的 channel 数**（4/8/16/32 倍数）
-- **避免 4K 输入的 permute**——必须做时拆 tile 再 permute
+- **避免 4K 输入的 permute**：必须做时拆 tile 再 permute
 - **用 `coremltools.compression.experimental.ane_optimize`**（iOS 18+）让转换器自动重排算子顺序减少 layout 切换
 
 ### 15.5.4 高通 SNPE / 联发科 NeuroPilot 的现实
 
-Android 端 NPU 的兼容性**比 ANE 更碎**——同一个 ONNX 模型在不同芯片上表现差几个量级。
+Android 端 NPU 的兼容性**比 ANE 更碎**：同一个 ONNX 模型在不同芯片上表现差几个量级。
 
 **高通 SNPE（Snapdragon NPU）**：
 
 - HTP backend（Hexagon Tensor Processor）跑 INT8 极快（旗舰 SoC 比 GPU 快 5×）
-- **算子白名单比 ANE 还窄**——SNPE 8.x 仍不直接支持 GroupNorm（要拆成 reshape + LN）、PixelShuffle、复杂 attention
+- **算子白名单比 ANE 还窄**：SNPE 2.x 仍不直接支持 GroupNorm（要拆成 reshape + LN）、PixelShuffle、复杂 attention（另外要留意，SNPE 这套工具链后来已并入 Qualcomm AI Engine Direct，即 QNN，新项目多数直接用 QNN）
 - INT8 量化对 SDK 版本敏感：SNPE 1.x 时代的 PTQ 流程在 2.x 重写过，老脚本不兼容
 - **必跑工具**：`snpe-onnx-to-dlc` 转换后用 `--debug 3` 看每个 layer 的 backend 分配，类似 ANE dump
 
 **联发科 NeuroPilot（天玑 APU）**：
 
-- APU 性能在天玑 9300+/9400 旗舰上接近 SDM 8 Gen 3 HTP，中端芯片差距大
-- **算子兼容性比 SNPE 更碎**——同一个模型在天玑 8000 系列和 9000 系列行为不同
+- APU 性能在天玑 9400 / 9500 这代旗舰上接近骁龙 8 Elite 的 HTP，中端芯片差距大
+- **算子兼容性比 SNPE 更碎**：同一个模型在天玑 8000 系列和 9000 系列行为不同
 - 转换工具 `neuropilot-converter`，量化校准数据要 200+ 张代表性图
 
-**工程结论**：Android 端发版前**必须在 3-4 个代表 SoC 上 profile**（SDM 8 Gen 3 / 天玑 9300 / Exynos 2400 / 中端机型如 SDM 7s Gen 2），不能只跑旗舰。
+**工程结论**：Android 端发版前**必须在 3-4 个代表 SoC 上 profile**（以某代旗舰为例，骁龙 8 Elite / 天玑 9400 / Exynos 2500，再加一款中端机型如骁龙 7s Gen 3），不能只跑旗舰。
 
 ### 15.5.5 端侧部署的 profile 流程
 
 把上面所有点串起来的工程流程：
 
 ```
-1. 训练时就考虑 NPU 友好（GroupNorm 替 LayerNorm、PixelShuffle 替代品、channel 数 8/16 倍数）
+1. 训练时就考虑 NPU 友好（按 profile 结果决定是否用 GroupNorm 替 LayerNorm、给 PixelShuffle 备好替代品、channel 数取 8/16 倍数）
    ↓
 2. 导出 ONNX，转 CoreML / TFLite / DLC
    ↓
@@ -648,36 +650,34 @@ Android 端 NPU 的兼容性**比 ANE 更碎**——同一个 ONNX 模型在不�
 8. 失败案例集回归测试
 ```
 
-不做这个流程，"端侧实时增强"基本只是 demo——上线必崩。
+不做这个流程，"端侧实时增强"基本只是 demo，上线必崩。
 
 ## 15.6 Android / 嵌入式：TFLite + NNAPI
 
-Android 设备的事实标准：
+Android 设备的事实标准是 TFLite（TensorFlow Lite，2024 年 9 月起官方更名为 LiteRT，接口基本兼容）。
+
+早期常见的 `ONNX → onnx-tf → .pb → TFLite` 路径到 2024-2026 已不推荐：`onnx-tf`（onnx-tensorflow）基本停止维护，中间的 `.pb` 转换在稍复杂的模型上很脆弱。现在有两条更稳的路，一条是 Google 官方的 **ai-edge-torch**，把 PyTorch 模型直接转成 TFLite / LiteRT，不再绕 ONNX 和 TensorFlow；另一条是社区的 **onnx2tf**，从 ONNX 直转、对算子布局的处理更好。
 
 ```python
-# 通过 ONNX → TFLite 转换 (用 onnx-tf)
-import onnx
-from onnx_tf.backend import prepare
+# 推荐路径 A: PyTorch 直转 LiteRT (Google 官方 ai-edge-torch)
+import ai_edge_torch
+import torch
 
-onnx_model = onnx.load("model.onnx")
-tf_rep = prepare(onnx_model)
-tf_rep.export_graph("model.pb")
+model = build_model().eval()
+sample = (torch.randn(1, 3, 256, 256),)
+edge_model = ai_edge_torch.convert(model, sample)
+edge_model.export("model.tflite")     # 产物即 TFLite / LiteRT
 
-# 然后用 tf converter 转 TFLite
-import tensorflow as tf
-
-converter = tf.lite.TFLiteConverter.from_saved_model("model.pb")
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.target_spec.supported_types = [tf.float16]   # 或 INT8
-tflite_model = converter.convert()
-
-with open("model.tflite", "wb") as f:
-    f.write(tflite_model)
+# 推荐路径 B: 已有 ONNX 时用 onnx2tf 直转, 避开 onnx-tf 的 .pb 中转
+#   $ pip install onnx2tf
+#   $ onnx2tf -i model.onnx -o saved_model   # 输出含 fp32/fp16/int8 多个 .tflite
 ```
+
+量化与半精度仍在转换器里配置（float16 或 INT8），逻辑和早期 TensorFlow 转换器一致，只是入口换成了 ai-edge-torch / onnx2tf。
 
 NNAPI（Android 8+）能把 TFLite 模型路由到设备 NPU，但兼容性差异大（不同芯片厂商支持的算子集不同）。
 
-实践：**Android 端常用厂商专用 SDK**——高通的 SNPE、联发科的 NeuroPilot、华为的 HiAI。
+实践：**Android 端常用厂商专用 SDK**：高通的 SNPE、联发科的 NeuroPilot、华为的 HiAI。
 
 ## 15.7 模型蒸馏与剪枝：极致轻量
 
@@ -686,7 +686,7 @@ NNAPI（Android 8+）能把 TFLite 模型路由到设备 NPU，但兼容性差�
 本节讲蒸馏，但要先把它放在更大的"模型压缩"语境里。让一个训好的模型变小有三条常见路径，工程上经常混用：
 
 1. **量化**（15.2.5 节）：把 FP32/FP16 权重 / 激活降到 INT8 / INT4，模型大小线性减小，速度看硬件。不改变模型结构。
-2. **剪枝**（pruning）：去掉对输出贡献小的权重 / 通道 / 层。结构剪枝（structured pruning，按通道 / 头剪）能直接减少 FLOPs 与显存；非结构剪枝（unstructured，按单个权重剪）压缩率高但要专门硬件支持稀疏算子才有速度收益。低层视觉里**通道剪枝**最常用 - 训练时给每个 conv 通道加 L1 正则 → 训完按通道幅度排序 → 剪掉幅度最小的 k% → 在剩余通道上微调几个 epoch。Real-ESRGAN-Mini 的瘦身路径之一就是通道剪枝 + 蒸馏组合。
+2. **剪枝**（pruning）：去掉对输出贡献小的权重 / 通道 / 层。结构剪枝（structured pruning，按通道 / 头剪）能直接减少 FLOPs 与显存；非结构剪枝（unstructured，按单个权重剪）压缩率高但要专门硬件支持稀疏算子才有速度收益。低层视觉里**通道剪枝**最常用 - 训练时给每个 conv 通道加 L1 正则 → 训完按通道幅度排序 → 剪掉幅度最小的 k% → 在剩余通道上微调几个 epoch。把一个重型 SR 压到端侧可跑的 compact 版本，常见路径之一就是通道剪枝 + 蒸馏组合。
 3. **蒸馏**（distillation）：训一个全新的小学生模型从头模仿大教师的输出 / 中间特征。学生结构可以与教师完全不同（这是和剪枝最大的区别），所以能换 backbone、换算子、换层数。
 
 三者可以叠加：蒸馏出小学生 → 通道剪枝 → INT8 量化 → 进端侧。每一步独立看损失都可控（蒸馏掉 ~5% 质量、剪枝掉 ~2%、量化掉 ~3%），叠加后整体掉 ~10% 但模型大小可能从 60MB 压到 3MB，速度提升 10×+。这是端侧实时增强能成立的根本原因。
@@ -718,8 +718,8 @@ def distillation_loss(student_out, teacher_out, hr_target):
 
 代表项目：
 
-- **Real-ESRGAN-Mini**：1.5M 参数蒸馏版，性能 ESRGAN 70%
-- **SwinIR-Lite**：用 Swin Transformer 蒸馏到纯 CNN
+- **SRVGGNetCompact（realesr-general-x4v3）**：Real-ESRGAN 官方的轻量版本，用几层普通卷积替代 RRDB，参数量百万级，是端侧与实时场景常用的 compact SR 网络
+- **重型 backbone 蒸馏到纯 CNN**：把 SwinIR / RRDB 这类重模型当教师，蒸馏出 SRVGGNetCompact 式的纯卷积学生（各家常给学生起"某某-Lite"之类的内部名，但并无统一的公开实现）
 
 ## 15.8 LCM / Turbo 蒸馏（扩散通用）
 
@@ -756,7 +756,7 @@ sequenceDiagram
     Note over O: 总延迟 ≈ N × T_unet + T_vae<br/>线性依赖 N
 ```
 
-把这张图刻在脑子里之后再看后面的优化路径：
+把这张时序图记牢之后，再看后面的优化路径：
 
 - **DDIM → DPM-Solver++ / UniPC**：相同质量下 50 步降到 15-20 步。算法换名，单步耗时不变，靠采样器把"少几步也能收敛"做出来。
 - **LCM / Turbo 蒸馏**：进一步把步数压到 4-8 步。本质是教学生网络"从任意 t 一步直接预测 x_0"。
@@ -764,8 +764,6 @@ sequenceDiagram
 - **正交优化**：U-Net 内部 Flash Attention 把 attention kernel 融合、TensorRT 编译把 conv/attn 算子融合到底层 kernel、FP16/BF16 把单 forward 耗时再砍一半。这些与"减步数"是叠加生效的。
 
 这就是为什么本章把"蒸馏减步数"和"通用 TensorRT/编译/半精度"分两条线讲：它们解决的是不同维度的瓶颈，可以同时上。
-
-### 核心思想
 
 ### 扩散采样器选择：DDIM / DPM-Solver / UniPC 的速度-质量取舍
 
@@ -819,7 +817,7 @@ output = pipe(prompt, image=lr_image, num_inference_steps=4, guidance_scale=1.5)
 
 ### 单步扩散 SR：把 SUPIR 路线送进生产环境
 
-LCM-LoRA 是**通用**的扩散加速方案。专门为 SR 任务训练的**单步扩散 SR**（OSEDiff / TSD-SR / AdcSR / SinSR，详见第 18.6 节）走得更远——直接训出**1 步**采样的学生网络：
+LCM-LoRA 是**通用**的扩散加速方案。专门为 SR 任务训练的**单步扩散 SR**（OSEDiff / TSD-SR / AdcSR / SinSR，详见第 18.6 节）走得更远，直接训出**1 步**采样的学生网络：
 
 | 路线 | 推理步数 | 单张 A100 延迟 | 质量与 SUPIR 对比 |
 |------|---------|---------------|------------------|
@@ -827,13 +825,13 @@ LCM-LoRA 是**通用**的扩散加速方案。专门为 SR 任务训练的**单�
 | LCM-LoRA + SUPIR | 4-8 步 | 1-2 秒 | LPIPS +1-3% |
 | OSEDiff / TSD-SR | **1 步** | **0.3-0.8 秒** | LPIPS ±2% |
 
-**为什么这件事很重要**：50 步扩散 SR 完全不能进端侧、进直播流、进交互式编辑。1 步扩散 SR 第一次让"扩散派质量"和"实时延迟"在同一个系统里成立——这是 2025 年起 SUPIR 在生产环境逐步被取代的根本原因。
+**为什么这件事很重要**：50 步扩散 SR 完全不能进端侧、进直播流、进交互式编辑。1 步扩散 SR 第一次让"扩散派质量"和"实时延迟"在同一个系统里成立，这是 2025 年起 SUPIR 在生产环境逐步被取代的根本原因。
 
 工程提示：
 
 - LCM-LoRA 是**最低成本**的扩散加速（训一个 LoRA），但 4 步质量在 SR 任务上仍弱于专门蒸馏的 1 步模型
 - 新项目要做"扩散派 SR"，**默认从 OSEDiff / TSD-SR 起步，而不是先上 SUPIR**
-- 这条线的端侧部署（手机 NPU 上跑 OSEDiff）目前仍在边界——SDXL UNet 即使 1 步也 2-3GB，端侧需要进一步压缩 UNet（蒸馏到更小的 backbone）
+- 这条线的端侧部署（手机 NPU 上跑 OSEDiff）目前仍在边界：SDXL UNet 即使 1 步也 2-3GB，端侧需要进一步压缩 UNet（蒸馏到更小的 backbone）
 
 ## 15.9 Tile 推理：处理大图
 
@@ -982,7 +980,7 @@ graph TB
 
 ## 15.10 流式视频处理
 
-视频处理时不能等整段视频加载完，要**流式**——逐帧处理逐帧输出。
+视频处理时不能等整段视频加载完，要**流式**：逐帧处理、逐帧输出。
 
 ```python
 class StreamingVideoEnhancer:
@@ -1016,11 +1014,11 @@ class StreamingVideoEnhancer:
 - **隐状态管理**：循环模型的隐状态在长视频里要重置
 - **边界处理**：场景切换时隐状态要清空
 
-工程实践：实时视频增强的 SOTA 大多用因果（causal）模型——只看历史不看未来。
+工程实践：实时视频增强的 SOTA 大多用因果（causal）模型，只看历史不看未来。
 
 ## 15.11 实时视频增强工程
 
-15.10 节讲了流式架构的概念。但**"流式"和"实时"是两件不同的事**——流式是数据流形态，实时是延迟约束。这一节讲实时视频增强（直播 / 视频会议 / 短视频实时滤镜 / VR 透视增强）的具体工程问题，这些在论文里几乎不存在但产品里逃不掉。
+15.10 节讲了流式架构的概念。但**"流式"和"实时"是两件不同的事**：流式是数据流形态，实时是延迟约束。这一节讲实时视频增强（直播 / 视频会议 / 短视频实时滤镜 / VR 透视增强）的具体工程问题，这些在论文里几乎不存在但产品里逃不掉。
 
 ### 15.11.1 延迟预算
 
@@ -1034,11 +1032,11 @@ class StreamingVideoEnhancer:
 | VR / AR 透视 | 90 fps | 11 ms / 帧 | < 5 ms |
 | 离线"看上去实时" | 30 fps | 100ms / 帧（提前 3 帧 buffer） | < 80 ms |
 
-工程结论：**视频会议和 VR 这两个场景几乎排除任何扩散模型**——单步扩散 SR 在 A100 上 0.3-0.8 秒，比预算高 1-2 个数量级。这两个场景是 NAFNet / 蒸馏 BasicVSR / 量化版 Restormer 的领地。
+工程结论：**视频会议和 VR 这两个场景几乎排除任何扩散模型**：单步扩散 SR 在 A100 上 0.3-0.8 秒，比预算高 1-2 个数量级。这两个场景是 NAFNet / 蒸馏 BasicVSR / 量化版 Restormer 的领地。
 
 ### 15.11.2 帧间稳定性 vs 延迟
 
-第 13 章讲过时序一致性。**实时场景下双向滑动窗口（BasicVSR++ 用未来帧）拿不到未来帧**——所有 SOTA VSR 论文的指标在因果设定下都会跌 0.5-1 dB。
+第 13 章讲过时序一致性。**实时场景下双向滑动窗口（BasicVSR++ 用未来帧）拿不到未来帧**：所有 SOTA VSR 论文的指标在因果设定下都会跌 0.5-1 dB。
 
 工程上几种妥协：
 
@@ -1046,7 +1044,7 @@ class StreamingVideoEnhancer:
 - **纯因果模型**：质量上限低但延迟最低
 - **混合**：因果模型主路径 + 一帧未来作为 oracle hint（VR 场景几乎不可行，直播 / 视频会议可考虑）
 
-实战经验：**视频会议选纯因果，直播选 1-2 帧 buffer**——观众感受不到 33-66ms 的固定 buffer，但能明显感受到时序闪烁。
+实战经验：**视频会议选纯因果，直播选 1-2 帧 buffer**：观众感受不到 33-66ms 的固定 buffer，但能明显感受到时序闪烁。
 
 ### 15.11.3 场景切换检测：RNN 隐状态重置
 
@@ -1076,7 +1074,7 @@ I P P P P P P P I P P P P P P P I ...
 └─── GOP 1 ───┘ └─── GOP 2 ───┘
 ```
 
-I 帧（关键帧）独立解码，P/B 帧依赖前后帧。增强 pipeline 的隐状态重置应该**在 I 帧边界对齐**，而不是检测到 scene cut 才重置——因为：
+I 帧（关键帧）独立解码，P/B 帧依赖前后帧。增强 pipeline 的隐状态重置应该**在 I 帧边界对齐**，而不是检测到 scene cut 才重置，原因有三：
 
 1. 编码器在 scene cut 时通常会插入 I 帧
 2. 沿 I 帧重置可以让上下游解码器和增强器同步
@@ -1086,11 +1084,11 @@ I 帧（关键帧）独立解码，P/B 帧依赖前后帧。增强 pipeline 的�
 
 ### 15.11.5 丢帧策略与温度限制
 
-实时系统**永远会过载**——CPU/GPU/NPU 在某些时段达不到目标延迟。预案：
+实时系统**永远会过载**：CPU/GPU/NPU 在某些时段达不到目标延迟。预案：
 
 - **快速降级**：检测到延迟超过预算 → 切到更小的模型 / 跳帧 / 降低分辨率
-- **丢帧策略**：丢哪一帧？最好丢 P 帧（B 帧不能丢，因为它是 reference；I 帧不能丢，因为后续 P/B 依赖）
-- **热降级**（thermal throttling）：手机持续 30+ 分钟会触发 thermal limit，CPU/GPU 频率被强制降到 50%。增强模型必须有"温度感知"——温度 > 阈值时切到更轻量分支
+- **丢帧策略**：丢哪一帧？优先丢 B 帧（经典 GOP 里 B 帧通常是非参考帧，丢掉不影响其它帧解码）；尽量不丢 P 帧（P 是参考帧，丢一个会连累它之后的整段 GOP，直到下一个 I 帧）；绝不丢 I 帧（整段 GOP 的解码基准）
+- **热降级**（thermal throttling）：手机持续 30+ 分钟会触发 thermal limit，CPU/GPU 频率被强制降到 50%。增强模型必须有"温度感知"：温度 > 阈值时切到更轻量分支
 
 ```python
 class ThermalAwareEnhancer:
@@ -1105,20 +1103,20 @@ class ThermalAwareEnhancer:
         return self.full(frame)
 ```
 
-视频会议产品里 thermal-aware 切换是必做的——否则用户开会 20 分钟手机过热卡顿，差评率飙升。
+视频会议产品里 thermal-aware 切换是必做的，否则用户开会 20 分钟手机过热卡顿，差评率飙升。
 
 ### 15.11.6 A/V 同步
 
-增强加上的延迟必须和音频对齐——人对 lipsync 误差敏感的阈值是 ±40ms。两条原则：
+增强加上的延迟必须和音频对齐：人对 lipsync 误差敏感的阈值是 ±40ms。两条原则：
 
 1. **增强器引入的固定延迟**告诉音频管线，让它把音频也 delay 一致量
-2. **不要让增强延迟抖动**——如果模型推理延迟 15-25ms 跳变，lipsync 会"漂"。p99 延迟必须 < p50 + 5ms，否则需要更激进的 scheduling
+2. **不要让增强延迟抖动**：如果模型推理延迟 15-25ms 跳变，lipsync 会"漂"。p99 延迟必须 < p50 + 5ms，否则需要更激进的 scheduling
 
 WebRTC / RTSP 的 SDK 都有 audio delay buffer 接口，把增强器的端到端延迟（含 buffer）注册进去即可。
 
 ### 15.11.7 Encoder-aware 增强
 
-最后一个被忽视的优化：**增强后的图要被编码器再压一次**。如果增强器把高频细节加上去，编码器会把它们当噪声压掉——白做。
+最后一个被忽视的优化：**增强后的图要被编码器再压一次**。如果增强器把高频细节加上去，编码器会把它们当噪声压掉，这一步增强等于没做。
 
 工程对策：
 
@@ -1126,7 +1124,7 @@ WebRTC / RTSP 的 SDK 都有 audio delay buffer 接口，把增强器的端到�
 - **bitrate-aware 增强**：低码率（< 2 Mbps）时降低高频强度，避免 banding；高码率（> 8 Mbps）时全开
 - **避免引入棋盘格 / 块状伪影**：H.264 对块边界的伪影特别敏感，会把 artifact 进一步压糟
 
-这条经常被忽视——纯 PSNR 视角下增强器越锐越好，但编码后 PSNR 反而可能跌。**直播 / 视频会议产品做 A/B 测试要看编码后的指标，不是模型直接输出。**
+这条经常被忽视：纯 PSNR 视角下增强器越锐越好，但编码后 PSNR 反而可能跌。**直播 / 视频会议产品做 A/B 测试要看编码后的指标，不是模型直接输出。**
 
 ### 小结：实时视频增强的工程清单
 
@@ -1135,7 +1133,7 @@ WebRTC / RTSP 的 SDK 都有 audio delay buffer 接口，把增强器的端到�
 [ ] 因果性：选纯因果还是允许小 buffer
 [ ] 场景切换检测：直方图 / 帧差 / GOP I 帧
 [ ] GOP-aware：与编码器同步重置 RNN
-[ ] 丢帧策略：丢 P 帧不丢 I/B
+[ ] 丢帧策略：优先丢 B 帧，尽量不丢 P，绝不丢 I
 [ ] 热感知：thermal_state → 切换轻量分支
 [ ] A/V 同步：固定延迟 + 控制抖动
 [ ] Encoder-aware：训练数据加目标编码 pipeline
@@ -1270,8 +1268,8 @@ class InferenceMonitor:
 ## 15.16 小结
 
 1. **不同平台不同优化栈**：A100 用 TensorRT，Apple 用 CoreML，Android 用 TFLite + 厂商 SDK
-2. **ONNX 是事实标准中间格式**——大多数推理引擎都接受
-3. **torch.compile 是 PyTorch 2.0 起的免费午餐**——加几行代码加速 1.5-2×
+2. **ONNX 是事实标准中间格式**：大多数推理引擎都接受
+3. **torch.compile 是 PyTorch 2.0 起的免费午餐**：加几行代码加速 1.5-2×
 4. **FP16/BF16 推理**几乎无损，应当默认开启
 5. **INT8 量化**对低层视觉精度敏感，谨慎使用
 6. **TensorRT FP16 + INT8 加速 4-6×**，NVIDIA 部署的事实标准
@@ -1284,7 +1282,7 @@ class InferenceMonitor:
 13. **实时视频增强工程**：延迟预算、GOP-aware reset、热感知降级、A/V 同步、encoder-aware；少任意一项做不出能上线的产品
 14. **生产监控**：延迟分布、失败率、质量指标
 
-下一章看真实场景案例——把前面所有章节的内容应用到具体的产品场景。
+下一章看真实场景案例：把前面所有章节的内容应用到具体的产品场景。
 
 ---
 

@@ -1,14 +1,14 @@
 # 第 9 章 · 扩散的条件控制
 
-> 第 8 章讲了扩散模型的基础——给定噪声、预测去噪。
+> 第 8 章讲了扩散模型的基础：给定噪声、预测去噪。
 >
-> 但影像增强任务的关键不在去噪能力，在**怎么让扩散模型听话**——既利用它的生成能力（创造合理细节），又严格遵守 LR 输入（不偏离原图）。
+> 但影像增强任务的关键不在去噪能力，在**怎么让扩散模型听话**：既利用它的生成能力（创造合理细节），又严格遵守 LR 输入（不偏离原图）。
 >
 > 这一章是过去三年这个领域最活跃的工程战场。
 
 ## 9.0 阅读须知
 
-这一章紧接着第 8 章。第 8 章把扩散模型的"生成器"部分讲清楚了：给定一个潜空间噪声 $x_T$，UNet + 采样器能采出一张符合自然图像分布的 $\hat{x}_0$。但这只是"无条件生成"——结果可以是任何图。增强任务要做的是**条件生成**：给定退化图 $y$，从 $p(x \mid y)$ 里采样出与 $y$ 内容一致、质量更高的 $\hat{x}$。本章讲怎么把 $y$ 这个条件接进扩散过程，以及不同接法在 fidelity（保真）和 creativity（生成自由度）之间如何取舍。
+这一章紧接着第 8 章。第 8 章把扩散模型的"生成器"部分讲清楚了：给定一个潜空间噪声 $x_T$，UNet + 采样器能采出一张符合自然图像分布的 $\hat{x}_0$。但这只是"无条件生成"：结果可以是任何图。增强任务要做的是**条件生成**：给定退化图 $y$，从 $p(x \mid y)$ 里采样出与 $y$ 内容一致、质量更高的 $\hat{x}$。本章讲怎么把 $y$ 这个条件接进扩散过程，以及不同接法在 fidelity（保真）和 creativity（生成自由度）之间如何取舍。
 
 读这一章前，假设你已经熟悉第 8 章的：
 
@@ -21,15 +21,15 @@
 
 - **SDEdit**（Stochastic Differential Editing，Meng et al. 2022）：把 $y$ 加噪到中间时间步，再用无条件扩散反向去噪，得到"被引导的随机样本"。最便宜的条件方案，零额外训练
 - **SR3**（Super-Resolution via Repeated Refinement，Saharia et al. 2022）：早期用 input concat 把 LR 接入扩散 UNet 的代表
-- **StableSR**（Wang et al. 2023）：基于 SD 的真实场景超分，引入 CFW、time-aware 条件
-- **DiffBIR**（Lin et al. 2023）：Blind Image Restoration with Diffusion，CLIP image cross-attention + ControlNet
+- **StableSR**（Wang et al. 2023）：基于 SD 的真实场景超分，在冻结 SD 上挂一个 time-aware encoder，特征经 SFT 注入 UNet，解码端用 CFW。既不是 input concat 也不是 ControlNet，属独立范式
+- **DiffBIR**（Lin et al. 2023）：Blind Image Restoration with Diffusion，两阶段设计。Stage-1 用 SwinIR 类网络去退化，Stage-2 用 IRControlNet（ControlNet 式并联）注入冻结 SD，不走 CLIP image cross-attention
 - **SUPIR**（Yu et al. 2024）：SDXL + ControlNet + LLaVA prompt，2024 年 real-world SR 的代表
 - **ControlNet**（Zhang & Agrawala 2023）：复制 UNet encoder + zero conv，扩散条件控制的事实标准
 - **T2I-Adapter**（Mou et al. 2023）：比 ControlNet 更轻量的条件适配器
 - **IP-Adapter**（Image Prompt Adapter，Ye et al. 2023）：把图像作为 prompt 注入扩散，解耦 cross-attention
 - **PnP / Plug-and-Play**（Tumanyan et al. 2023）：训练自由的扩散控制方法，靠 inversion + 特征注入做编辑
 - **null-text inversion**（Mokady et al. 2023）：DDIM inversion 的精度增强，常用于编辑任务
-- **CFW**（Controllable Feature Warping）：StableSR 提出的推理时可调融合
+- **CFW**（Controllable Feature Wrapping）：StableSR 提出的推理时可调融合，源自 CodeFormer 的可控特征变换，与光流/形变无关
 - **ZeroSFT**（Zero Spatial Feature Transform）：SUPIR 用的特征调制变体
 - **LoRA**（Low-Rank Adaptation）：低秩微调，常和 ControlNet 一起出现
 - **LCM**（Latent Consistency Model）：第 8 章介绍过的 4 步采样蒸馏方法
@@ -38,7 +38,7 @@
 
 ## 9.1 核心问题：fidelity vs creativity
 
-第 8 章末尾讲过扩散的"无中生有"能力——这是它的优势，也是它的危险。
+第 8 章末尾讲过扩散的"无中生有"能力，这既是它的优势，也是它的危险。
 
 放大同一张老人脸 LR 图，扩散模型可能：
 
@@ -60,11 +60,13 @@
 
 | 范式 | 注入位置 | 代表方法 | 训练成本 | 控制强度 |
 |------|---------|---------|---------|---------|
-| **Input Concat** | UNet 输入通道 | SR3、StableSR v1 | 低（改输入） | 中 |
-| **Cross-Attention** | UNet 内部 attention | DiffBIR | 中（训 cross-attn） | 弱（语义级） |
-| **ControlNet** | UNet 中间层加和 | StableSR v2、SUPIR | 高（复制 encoder） | 强 |
+| **Input Concat** | UNet 输入通道 | SR3 | 低（改输入） | 中 |
+| **Cross-Attention** | UNet 内部 attention | IP-Adapter | 中（训 cross-attn） | 弱（语义级） |
+| **ControlNet** | UNet 中间层加和 | SUPIR、DiffBIR | 高（复制 encoder） | 强 |
 | **IP-Adapter** | 解耦 cross-attention | 风格/身份保持 | 中 | 中 |
 | **Tile + ControlNet** | 局部条件 | 大图增强 | （推理 trick） | 强 |
+
+StableSR 不在上表任何一行：它既不是 input concat 也不是 ControlNet，而是在冻结 SD 上挂一个 time-aware encoder、特征经 SFT 注入 UNet、解码端用 CFW 的独立范式，9.8 节单独讲。
 
 除此之外还有两类**训练自由**的方法，靠在采样过程动手脚而不重训权重：
 
@@ -91,7 +93,7 @@ graph LR
 
 SDEdit 的关键参数是中间时间步 $t^*$：$t^*$ 越大噪声加得越狠，模型自由度越高（生成端走更远，可能改变内容）；$t^*$ 越小越保留输入结构（接近恒等映射）。这两个极端正是后面 9.3 节 fidelity-creativity 谱的两端，只不过 SDEdit 通过一个数值就能滑动。
 
-**没有哪个范式全胜**——选哪个看任务和预算。下面这张图把五种范式的注入位置画在同一张 UNet 上，便于对比：
+**没有哪个范式全胜**：选哪个看任务和预算。下面这张图把五种范式的注入位置画在同一张 UNet 上，便于对比：
 
 ```mermaid
 graph LR
@@ -127,7 +129,7 @@ graph LR
 - 老照片修复 → 中等（结构保留，细节生成）
 - 艺术放大、4K 直播创意增强 → 高 creativity（视觉冲击为主）
 
-这一章讲的所有技术都是为了**让用户能在这条曲线上选点**——不仅训练时选，**推理时也能调**。
+这一章讲的所有技术都是为了**让用户能在这条曲线上选点**：不仅训练时选，**推理时也能调**。
 
 ## 9.4 范式一：Input Concat
 
@@ -162,7 +164,7 @@ with torch.no_grad():
 unet.conv_in = new_conv
 ```
 
-后 4 通道初始化为 0 让训练初期 UNet 行为接近原模型——LR 信号慢慢起作用。
+后 4 通道初始化为 0 让训练初期 UNet 行为接近原模型，LR 信号慢慢起作用。
 
 ### Input Concat 的优缺点
 
@@ -178,11 +180,11 @@ unet.conv_in = new_conv
 - 不容易调"控制强度"
 - 对 LR 的尊重度不够（高 t 时，UNet 更"自由发挥"）
 
-**StableSR v1** 用这种简单形式，效果不错但 fidelity 不够强，所以 v2 转向 ControlNet。
+**SR3**（Saharia et al. 2022）是这种简单形式的早期代表：效果不错，但 fidelity 不够强，深层信息容易被稀释，后来的真实场景方法大多转向 ControlNet 或独立的 side-encoder 注入（如 StableSR）。
 
 ## 9.5 范式二：Cross-Attention 注入
 
-不在输入层注入，在 UNet 内部的 cross-attention 注入——把 LR 通过某个 image encoder 编成 token，作为 cross-attention 的 KV。
+不在输入层注入，在 UNet 内部的 cross-attention 注入：把 LR 通过某个 image encoder 编成 token，作为 cross-attention 的 KV。
 
 最常见的 image encoder：CLIP。流程：
 
@@ -223,9 +225,9 @@ UNet 的 cross-attention 不变（参考第 8 章 8.8 节），只是 KV 来源�
 - 高 fidelity SR（CLIP embedding 丢失了像素级信息）
 - 文档/小字增强（结构信息靠 patch token 不够）
 
-**DiffBIR**（2023）用 CLIP image encoder 注入语义条件，配合 ControlNet 注入结构条件——两者结合，是这个方向的代表设计。
+把图像编码成 token 走 cross-attention，这一路最干净的落地是 9.6b 要讲的 IP-Adapter（解耦式图像 prompt）。这里需要澄清一个常见误解：DiffBIR（Lin et al. 2023）常被说成"CLIP image cross-attention + ControlNet"，其实它不走图像 cross-attention。DiffBIR 是两阶段设计，靠 ControlNet 式的结构注入，归在下一节的 ControlNet 路线里讲。
 
-## 9.6 范式三：ControlNet —— 这一章的主角
+## 9.6 范式三：ControlNet（本章主角）
 
 Zhang & Agrawala (2023) 的 ControlNet 是扩散控制的**事实标准**。它的核心设计：
 
@@ -234,7 +236,7 @@ Zhang & Agrawala (2023) 的 ControlNet 是扩散控制的**事实标准**。它�
 主 UNet 完全不动（保留预训练权重），ControlNet 是一个**外挂**。这种设计的优势：
 
 1. **保留预训练知识**：主 UNet 的所有能力（包括 text-to-image 的语义理解）不变
-2. **训练参数比全量微调小**：ControlNet 复制主 UNet 的 encoder + mid block，可训练参数约为主 UNet 的 0.4–0.5×（SD 1.5 上 ControlNet ≈ 360M vs 主 UNet ≈ 860M）。但**显存开销不可控**——前向时主 UNet 仍要全量参与算 skip features，反向只有 ControlNet 那部分有梯度。SDXL 上单卡训 ControlNet 实测仍要 40GB+，不是 LoRA 那种"小成本"
+2. **训练参数比全量微调小**：ControlNet 复制主 UNet 的 encoder + mid block，可训练参数约为主 UNet 的 0.4–0.5×（SD 1.5 上 ControlNet ≈ 360M vs 主 UNet ≈ 860M）。但**显存开销不可控**：前向时主 UNet 仍要全量参与算 skip features，反向只有 ControlNet 那部分有梯度。SDXL 上单卡训 ControlNet 实测仍要 40GB+，不是 LoRA 那种"小成本"
 3. **可以堆叠**：多个 ControlNet 同时作用（一个管 LR、一个管 edge map、一个管 depth map）
 
 ### ControlNet 的具体结构
@@ -294,9 +296,9 @@ graph LR
 - zero conv 把每层 ControlNet 输出收敛回 0，让训练初期主 UNet 行为不变；这一点和 LoRA 把适配器初始化为 0 矩阵是同一思想
 - ControlNet 输出加到主 UNet 的 **skip connection** 上（不是替换、不是 cross-attention），所以主 UNet 拿到的是"自己的 skip 特征 + 一点条件偏移"，对预训练知识破坏最小
 
-### Zero Convolution —— 核心 trick
+### Zero Convolution：核心 trick
 
-ControlNet 输出加到主 UNet 之前，过一个 **zero-initialized 1×1 conv**——初始权重全为 0。
+ControlNet 输出加到主 UNet 之前，过一个 **zero-initialized 1×1 conv**，初始权重全为 0。
 
 为什么这个细节重要？
 
@@ -324,7 +326,7 @@ $$
 h_m' = h_m + Z(h_c)
 $$
 
-其中 $Z$ 是 zero conv。初始 $Z(h_c) = 0$，$h_m' = h_m$ —— 模型行为不变。训练让 $Z$ 学到非零权重后，控制信号开始作用。
+其中 $Z$ 是 zero conv。初始 $Z(h_c) = 0$，$h_m' = h_m$，模型行为不变。训练让 $Z$ 学到非零权重后，控制信号开始作用。
 
 ### 简化的 ControlNet 实现
 
@@ -465,7 +467,20 @@ def forward_with_controlnet(unet, controlnet, x_t, lr_img, t, context):
 
 数据规模：ControlNet 论文用了几十万到几百万张图。增强任务的 ControlNet 通常用第 5 章的合成 pipeline 生成训练数据。
 
-## 9.6b 范式四：IP-Adapter —— 解耦的图像 prompt
+### DiffBIR：两阶段的 ControlNet 式复原
+
+DiffBIR（Lin et al. 2023）是把 ControlNet 思路用到盲图像复原的代表，它常被误当作 cross-attention 方法，这里放到 ControlNet 一节澄清。它的设计是两阶段：
+
+- **Stage-1（去退化）**：先用一个 SwinIR 类的回归网络把 LR 的退化（噪声、压缩、模糊）大致清掉，得到一张结构干净但偏平滑的中间图。这一步只负责"去脏"，不负责补细节。
+- **Stage-2（生成细节）**：把 Stage-1 的输出作为条件，通过 IRControlNet（一个为复原任务训练的 ControlNet 式并联分支）注入冻结的 SD，让扩散先验补回高频纹理。
+
+关键点是 DiffBIR 全程不使用 CLIP image encoder，也不走图像 cross-attention，结构注入完全靠 ControlNet 式的并联加和。所以它属于本节的 ControlNet 路线，而不是 9.5 的 cross-attention 路线。
+
+### 注入机制与骨干的耦合
+
+需要提醒一句：本节讲的 ControlNet、以及 9.4/9.5 的 concat 与 cross-attention 注入，都是围绕 **UNet 骨干**设计的（复制 encoder、加到 skip、替换 conv_in）。换成 DiT 骨干（SD3、Flux 这一代）之后，条件控制的落地方式并不相同，通常是把控制 token 拼进序列或用专门的 conditioning block，而非复制 encoder 加 skip。这条留到第 18 章展开，这里只提示不要把 UNet 时代的注入机制直接照搬到 DiT 上。
+
+## 9.6b 范式四：IP-Adapter（解耦的图像 prompt）
 
 IP-Adapter (Ye et al. 2023) 解决一个 ControlNet 不太好做的问题：**用一张参考图当作"风格 / 身份 prompt"**，不直接控制每个像素的结构，而是控制"这张生成的图整体看起来像参考图"。
 
@@ -529,19 +544,19 @@ class IPAdapterCrossAttn(nn.Module):
 
 IP-Adapter 在工程上和第 10 章的 RefSR 极为接近：都是"LR + Ref → HR"的多输入扩散增强。区别是 RefSR 的 cross-attention 通常做 patch-level matching（Ref 的局部纹理 → 主图的对应区域），IP-Adapter 把 Ref 全局编成一个 token 序列，控制偏向全局风格 / 身份。生产里这两种思路常常同时存在，并不互斥。
 
-## 9.7 SUPIR（2024）—— 当前 SR SOTA 的设计
+## 9.7 SUPIR（2024）：当前 SR SOTA 的设计
 
 SUPIR 把多个工程技巧叠加，达到 2024 年 real-world SR 的 SOTA。值得详细看一下它的组合逻辑。
 
 ### 组件 1：SDXL 作为基础
 
-SDXL 是 SD 的更大版本（2.6B 参数 UNet），生成能力比 SD 1.5 强一个数量级。SUPIR 用 SDXL 作为基础保证生成质量。
+SDXL 是 SD 的更大版本（2.6B 参数 UNet），生成质量显著强于 SD 1.5。SUPIR 用 SDXL 作为基础保证生成质量。
 
 ### 组件 2：ControlNet 注入 LR
 
-类似上面讲的 ControlNet，把 LR 通过 ControlNet 注入。但 SUPIR 用了一个变体——**ZeroSFT**（Zero Spatial Feature Transform）：
+类似上面讲的 ControlNet，把 LR 通过 ControlNet 注入。但 SUPIR 用了一个变体，即 **ZeroSFT**（Zero Spatial Feature Transform）：
 
-ZeroSFT 是一种特征调制——在 ControlNet 输出加到主 UNet 之前，做一个空间相关的仿射变换：
+ZeroSFT 是一种特征调制：在 ControlNet 输出加到主 UNet 之前，做一个空间相关的仿射变换：
 
 $$
 h' = h \odot (1 + \gamma) + \beta
@@ -551,48 +566,50 @@ $$
 
 ### 组件 3：LLaVA prompt
 
-SUPIR 用 LLaVA（一个 VLM）给 LR 自动生成文字描述，作为 SDXL 的文本条件。这让模型有"语义先验"——知道这是猫还是狗，能生成对应的细节。
+SUPIR 用 LLaVA（一个 VLM）给 LR 自动生成文字描述，作为 SDXL 的文本条件。这让模型有"语义先验"：知道这是猫还是狗，能生成对应的细节。
 
-### 组件 4：自适应噪声
+### 组件 4：EDM 噪声调度
 
-不从纯噪声开始采样，而是从一个**带 LR 信息的噪声**开始：
+SUPIR 建立在 SDXL 上，采样遵循 EDM（Karras et al. 2022）的 σ 空间参数化与预条件，而不是 DDPM 那套离散时间步。
+
+这里要澄清一个常见误传：有的资料把"从中间时间步 $T' < T$ 起采样、跳过最高步"当成 SUPIR 的组件。这其实是 SDEdit（以及 StableSR 的 time-aware 注入）的做法，即把 $y$ 加噪到中间步再反向去噪，用来减少步数、保留更多输入结构：
 
 $$
-x_T^{\text{init}} = \sqrt{\bar{\alpha}_T'} \cdot \text{Encode}(y) + \sqrt{1 - \bar{\alpha}_T'} \cdot \epsilon
+x_{t^*}^{\text{init}} = \sqrt{\bar{\alpha}_{t^*}} \cdot \text{Encode}(y) + \sqrt{1 - \bar{\alpha}_{t^*}} \cdot \epsilon,\quad t^* < T
 $$
 
-其中 $T' < T$。这相当于"跳过最高时间步"，从中间开始。优势：减少推理步数 + 保留更多 LR 结构。
+SUPIR 本身不靠这个"跳步"技巧，它从常规起点采样，再用下面组件 5 的 restoration guidance 控制保真。
 
 ### 组件 5：Restoration-Guided Sampling
 
-每一步采样后，用一个 restoration loss（比如 LPIPS to LR-upsampled）把 $\hat{x}_0$ 拉回靠近 LR。这是个推理时的技巧，不需要重新训练。
+这是 SUPIR 真正的采样特色。每一步采样后，用一个 restoration 项（把 $\hat{x}_0$ 与 LR 的一致性作为引导）把预测拉回靠近 LR，抑制过度生成。这是个推理时的技巧，不需要重新训练。
 
 ### SUPIR 综合效果
 
 - 在严重退化的真实老照片上视觉效果远超所有判别式 SR
-- LPIPS 比 ESRGAN 低 30%+
-- 但 PSNR 比 HAT 低 7-8 dB（perception-distortion trade-off 选了 perception 端）
-- 速度慢（30-50 步推理），单张 1K 图需要 5-10 秒（A100）
+- 感知指标（LPIPS）明显优于 ESRGAN
+- 但保真指标（PSNR）低于 HAT，这是 perception-distortion trade-off 选了 perception 端的必然代价（真实盲 SR 上这个差距通常在 2-4 dB 量级，具体看退化强度）
+- 速度慢（30-50 步推理），单张 1K 图在 A100 上是数秒量级
 
-## 9.8 StableSR（2023）—— 简化版本
+## 9.8 StableSR（2023）：独立范式
 
-Wang et al. 的 StableSR 是 SUPIR 之前的代表，思路简化但工程实践友好。
+Wang et al. 的 StableSR 是 SUPIR 之前的代表，思路简化但工程实践友好。它的注入方式既不是 input concat 也不是 ControlNet，而是自成一路：在冻结的 SD 上挂一个 time-aware encoder，编码 LR 得到多尺度特征，特征通过 SFT（spatial feature transform）注入 UNet；解码端再用 CFW 做可调融合。下面分别看两个关键设计。
 
-### 关键设计：CFW（Controllable Feature Warping）
+### 关键设计：CFW（Controllable Feature Wrapping）
 
-让用户在推理时调节"质量 vs 保真"。具体：在解码 latent 到像素之前，加一层 warping：
+CFW 的全称是 Controllable Feature Wrapping，源自 CodeFormer 的可控特征变换，和光流、几何形变没有关系。它让用户在推理时调节"质量 vs 保真"：在把 latent 解码到像素时，用一个系数 $w$ 把 LR 的编码特征融进解码器特征。
 
 $$
-\hat{x}_0 = (1 - w) \cdot \text{Decode}(z) + w \cdot \text{Decode}(\text{warp}(z, y))
+\hat{x}_0 = \text{Decode}\big(\,\text{CFW}\big(z,\ E(y);\ w\big)\,\big)
 $$
 
-$w \in [0, 1]$ 是用户可调的参数：
+其中 $E(y)$ 是 LR 经编码器得到的特征，$\text{CFW}(\cdot;w)$ 按系数 $w$ 把它包裹进解码器特征。$w \in [0, 1]$ 是用户可调的参数：
 
 - $w = 0$：纯生成（高质量但低保真）
 - $w = 1$：完全保真（接近 LR）
 - $w = 0.5$：平衡
 
-这种用户可调设计在生产环境是 plus——同一个模型可以服务不同需求的用户。
+这种用户可调设计在生产环境是加分项：同一个模型可以服务不同需求的用户。
 
 ### Time-aware Condition
 
@@ -600,7 +617,7 @@ StableSR 还有一个细节：条件注入的强度和时间步相关。早期�
 
 ## 9.9 Tile 推理：处理大图
 
-扩散模型训练时通常在 $256 \times 256$ 或 $512 \times 512$ 的 patch 上。但实际增强任务可能要处理 4K 甚至 8K 图。**直接全图推理会爆显存**——而且模型从没在那么大尺寸上见过，效果可能崩。
+扩散模型训练时通常在 $256 \times 256$ 或 $512 \times 512$ 的 patch 上。但实际增强任务可能要处理 4K 甚至 8K 图。**直接全图推理会爆显存**，而且模型从没在那么大尺寸上见过，效果可能崩。
 
 解决：**tile-based 推理**。
 
@@ -665,13 +682,13 @@ def tile_diffusion_inference(
 
 ### Shared Noise（共享噪声）
 
-更高级的 trick：所有 tile **共享同一个噪声起点**——把全图的噪声 latent 先生成出来，每个 tile 推理时用对应位置的 noise。这样 tile 之间的"随机性方向"一致，边界更连续。
+更高级的 trick：所有 tile **共享同一个噪声起点**：把全图的噪声 latent 先生成出来，每个 tile 推理时用对应位置的 noise。这样 tile 之间的"随机性方向"一致，边界更连续。
 
 这是 Multi-Diffusion / SyncDiffusion 等工作的思路。
 
 ### ControlNet Tile 模型
 
-专门为 tile 推理训练的 ControlNet 模型——在训练时就用各种 tile 配对训练（包括小尺寸和大尺寸的混合），让模型对 tile 边界更鲁棒。
+专门为 tile 推理训练的 ControlNet 模型：在训练时就用各种 tile 配对训练（包括小尺寸和大尺寸的混合），让模型对 tile 边界更鲁棒。
 
 工程实践：4K+ 图增强**几乎全部用 tile + blend**，没有更好的方案。
 
@@ -687,8 +704,8 @@ negative_prompt = "blurry, low quality, jpeg artifacts, oversmooth, plastic skin
 
 通过 CFG 让生成结果**远离** negative prompt 描述的特征。实测影响：
 
-- 不写 negative prompt：~5% 概率出现轻度伪影
-- 加合理 negative prompt：伪影概率降到 ~1%
+- 不写 negative prompt：偶尔出现轻度伪影
+- 加合理 negative prompt：伪影出现的概率明显下降
 
 成本：几乎为零（推理时多一次 UNet 前向）。
 
@@ -720,7 +737,18 @@ negative_prompt = "blurry, low quality, jpeg artifacts, oversmooth, plastic skin
 }
 ```
 
-这些参数最好让用户可调——同一个模型不同用户对 fidelity 偏好不同。
+这些参数最好让用户可调：同一个模型不同用户对 fidelity 偏好不同。
+
+### 少步/一步蒸馏扩散 SR
+
+上表和前面的 SUPIR、StableSR 都默认扩散 SR 要跑 30-50 步，单张 1K 图要数秒。这条"扩散必然慢"的旧叙事到 2024-25 已经不成立。通过一致性蒸馏、对抗蒸馏、分数蒸馏等技术，一批工作把 SUPIR 级的质量压到了 1-4 步：
+
+- **OSEDiff**（One-Step Effective Diffusion，基于 SD 2.1）：把真实场景 SR 蒸馏成单步，推理只跑一次 UNet 前向
+- **SinSR**：从 ResShift 蒸馏出单步扩散 SR
+- **AddSR**：用对抗蒸馏在少步下兼顾锐度与保真
+- **TSD-SR**（CVPR 2025，基座 SD3）：把 DiT 骨干的扩散 SR 压到少步
+
+工程含义：如果延迟是硬约束，不必再默认"扩散就慢"而退回 CNN。少步蒸馏 SR 在质量与速度上已经是一个可选项，端侧之外的实时/近实时场景可以优先评估。这条线属于快速演进的方向，更细的谱系和取舍留到第 18 章。
 
 ## 9.12 训练 vs 推理：关键差异
 
@@ -742,7 +770,7 @@ negative_prompt = "blurry, low quality, jpeg artifacts, oversmooth, plastic skin
 - CFG / negative prompt
 - ControlNet conditioning scale 可调
 
-工程含义：**实验时的训练表现和生产时的推理表现可能不一致**——很多问题（tile artifact、CFG 失稳、长序列采样误差累积）只在推理时暴露。这是扩散增强工程的特殊难点。
+工程含义：**实验时的训练表现和生产时的推理表现可能不一致**：很多问题（tile artifact、CFG 失稳、长序列采样误差累积）只在推理时暴露。这是扩散增强工程的特殊难点。
 
 ## 9.13 选型决策表
 
@@ -751,26 +779,28 @@ negative_prompt = "blurry, low quality, jpeg artifacts, oversmooth, plastic skin
 | 场景 | 推荐范式 | 代表方法 |
 |------|---------|---------|
 | 严重退化、强生成 | SDXL ControlNet + LLaVA prompt | SUPIR |
-| 中等退化、可调节 | SD 1.5 ControlNet + CFW | StableSR |
-| 语义保持优先 | CLIP image cross-attn + ControlNet | DiffBIR |
+| 中等退化、可调节 | SD + time-aware encoder + SFT 注入 + CFW | StableSR |
+| 语义保持优先 | 两阶段：预去退化 + IRControlNet | DiffBIR |
 | 内容保持（不变身份） | IP-Adapter + ControlNet | 自定义组合 |
-| 快速推理 | LCM 蒸馏 + ControlNet | LCM-LoRA + Tile |
+| 快速推理（少步） | 蒸馏到 1-4 步的扩散 SR | OSEDiff / SinSR / AddSR / TSD-SR |
 | 端侧 | **不推荐扩散**（用 CNN） | — |
 | 4K+ 大图 | ControlNet Tile + Multi-Diffusion | Tile workflow |
 | 视频 | 还在研究中 | 第 13 章 |
 
 ## 9.14 小结
 
-1. **条件控制是扩散增强的工程核心** —— 比基础扩散重要得多
+1. **条件控制是扩散增强的工程核心**：比基础扩散重要得多
 2. **五种范式**：concat、cross-attention、ControlNet、IP-Adapter、Tile + ControlNet
-3. **ControlNet 是事实标准** —— 复制 encoder + zero conv，保留预训练权重
-4. **Zero conv 让训练初期模型行为不变**——这是 ControlNet 训练稳定的关键
-5. **SUPIR 的多组件叠加**：SDXL + ControlNet + ZeroSFT + LLaVA prompt + 自适应噪声
-6. **Tile + Blend 是大图的唯一方案**，用 shared noise + ControlNet Tile 减少边界伪影
-7. **推理参数对最终效果影响巨大** —— guidance_scale、conditioning_scale、num_steps、start_noise 都要调
-8. **训练和推理差异大**——很多问题只在推理时暴露，必须做生产级测试
+3. **ControlNet 是事实标准**：复制 encoder + zero conv，保留预训练权重
+4. **Zero conv 让训练初期模型行为不变**，这是 ControlNet 训练稳定的关键
+5. **StableSR 与 DiffBIR 各成一路**：StableSR 是 time-aware encoder + SFT 注入 + CFW 的独立范式，DiffBIR 是两阶段的 ControlNet 式复原，都不是 cross-attention 方法
+6. **SUPIR 的多组件叠加**：SDXL + ControlNet + ZeroSFT + LLaVA prompt + restoration-guided sampling
+7. **Tile + Blend 是大图的唯一方案**，用 shared noise + ControlNet Tile 减少边界伪影
+8. **少步/一步蒸馏让扩散 SR 不再必然慢**：OSEDiff、SinSR、AddSR、TSD-SR 把 SUPIR 级质量压到 1-4 步
+9. **推理参数对最终效果影响巨大**：guidance_scale、conditioning_scale、num_steps、start_noise 都要调
+10. **训练和推理差异大**，很多问题只在推理时暴露，必须做生产级测试
 
-到这里 Part II 走过 CNN → Transformer → 扩散基础 → 扩散控制四章。下一章是这部分的最后一章——任务特化模型，讲人脸、文档、医疗等不同任务用了哪些归纳偏置。
+到这里 Part II 走过 CNN → Transformer → 扩散基础 → 扩散控制四章。下一章是这部分的最后一章，即任务特化模型，讲人脸、文档、医疗等不同任务用了哪些归纳偏置。
 
 ---
 

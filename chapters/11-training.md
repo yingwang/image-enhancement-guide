@@ -161,7 +161,7 @@ optimizer = torch.optim.AdamW(
 
 ### Linear Warmup
 
-训练前期 LR 从 0 线性涨到目标值。**必须**在 Transformer 和扩散训练里用——否则前几步可能直接发散。
+训练前期 LR 从 0 线性涨到目标值。**必须**在 Transformer 和扩散训练里用，否则前几步可能直接发散。
 
 ```python
 def linear_warmup(step: int, warmup_steps: int, target_lr: float) -> float:
@@ -334,7 +334,7 @@ torch.nn.utils.clip_grad_norm_(
 
 ## 11.7 EMA：扩散和高质量 GAN 必备
 
-**EMA**（Exponential Moving Average，指数移动平均）维护一份模型权重的指数移动平均。直觉上理解：训练权重每步都被梯度推一点，方向会抖；EMA 权重是这些抖动权重的一个低通滤波结果，更稳定，往往也更"靠近"真正的最优区域中心。
+**EMA**（Exponential Moving Average，指数移动平均）维护一份模型权重的指数移动平均。直觉上理解：训练权重每步都被梯度推一点，方向不断抖动；EMA 权重是这些抖动权重的一个低通滤波结果，更稳定，往往也更"靠近"真正的最优区域中心。
 
 数学定义：
 
@@ -415,7 +415,7 @@ for batch in loader:
 
 ### 哪些层不能用低精度
 
-- **VAE encoder/decoder**：扩散里 VAE 通常用 FP32 或 FP16，不要用 BF16（数值精度不够）
+- **VAE encoder/decoder**：扩散里 VAE 用 FP32 或 BF16，不要用 FP16。SD/SDXL 的 VAE 在 FP16 下会数值溢出、解出黑图（社区因此有专门的 fp16-fix VAE），而 BF16 的指数位宽和 FP32 一致，是安全的低精度替代
 - **softmax**：在 Transformer 里 softmax 用 FP32 更稳，diffusers/transformers 自动处理
 - **Loss 计算**：可以 FP32
 
@@ -563,7 +563,7 @@ g_loss = l1_loss + 1.0 * vgg_loss + 0.05 * adv_loss
 直接联合训练（all-in-one）的问题：
 
 - GAN loss 早期梯度大、噪声大，会破坏像素一致性
-- 模型还没学到基本恢复能力，GAN 强行推它"生成细节"会输出鬼东西
+- 模型还没学到基本恢复能力，GAN 强行推它"生成细节"会输出杂乱失真的结果
 - 损失加权不容易调到合适
 
 ESRGAN、Real-ESRGAN、BSRGAN 等都用两阶段策略。**这是事实标准**，不要尝试创新省一阶段。
@@ -593,7 +593,7 @@ graph TD
     style Final fill:#e8f5e9
 ```
 
-这张图里有几个工程经验值得记住。**先用大权重的像素项把 G 训到能"接近"GT 的位置**，再让 GAN 项小幅度推它去补细节。如果一上来就把 adv 权重设到 1.0，G 还没学到基本恢复，就被 D 拉去模仿"看起来像真图"的高频纹理，结果是输出非常锐利但和 GT 完全不对应。**R1 系数 10.0 与 adv 系数 0.05 的比例**是 Karras et al. 在 StyleGAN2 里给的经验值，低层视觉直接沿用即可。
+这张图里有几个工程经验值得记住。**先用大权重的像素项把 G 训到能"接近"GT 的位置**，再让 GAN 项小幅度推它去补细节。如果一上来就把 adv 权重设到 1.0，G 还没学到基本恢复，就被 D 拉去模仿"看起来像真图"的高频纹理，结果是输出非常锐利但和 GT 完全不对应。这里两个系数的来源要分开说：**R1 系数 γ=10 出自 StyleGAN2**（Karras et al.），而 **0.05 的对抗权重来自 ESRGAN / Real-ESRGAN 系**的超分配方，StyleGAN2 本身并没有这一像素-对抗混合项。两个数字来路不同，只是在低层视觉 GAN finetune 里常被一起沿用。
 
 ## 11.12 扩散训练的特殊性
 
@@ -616,7 +616,7 @@ def importance_sampling_t(B, num_steps=1000):
 
 ```python
 def min_snr_weight(t, alphas_cumprod, gamma=5.0):
-    """Min-SNR 加权, SDXL 标配。"""
+    """Min-SNR 加权 (Hang et al. 2023), 部分扩散训练采用, 非 SDXL 官方配置。"""
     snr = alphas_cumprod[t] / (1 - alphas_cumprod[t])
     return torch.minimum(snr, torch.full_like(snr, gamma)) / snr
 ```
@@ -634,7 +634,19 @@ loss = (min_snr_weight(t, alphas_cumprod).view(-1, 1, 1, 1) *
 
 - **新训练**：v-prediction 更稳定
 - **基于 SD 1.5 finetune**：保留原 eps-prediction
-- **基于 SD 2.x / SDXL refiner**：v-prediction
+- **基于 SD 2.x 的 -v 模型（768-v）**：v-prediction。注意 SDXL base 与 SDXL refiner 都是 eps-prediction，不要归到这一档
+
+### Flow matching / rectified flow 目标
+
+上面 eps / v-prediction 与 DDPM 那套离散加噪调度，是 SD 1.5 到 SDXL 这一代的默认参数化。到 SD3、Flux 这一代，训练目标已经换成了 flow matching（rectified flow）。这里补一段它和 eps / v-pred 的区别，以及它对 loss weighting 的影响。
+
+flow matching 不再把训练目标写成"预测噪声 $\epsilon$"或"预测 velocity $v$"，而是在数据 $x_0$ 与噪声 $x_1$ 之间取一条（通常是直线的）插值路径 $x_t = (1-t)\,x_0 + t\,x_1$，让网络回归这条路径上的速度场。对直线路径来说速度场是常量 $x_1 - x_0$，于是目标就是：
+
+$$
+\mathcal{L}_{\text{FM}} = \mathbb{E}_{t,\,x_0,\,x_1}\big\|\,v_\theta(x_t, t) - (x_1 - x_0)\,\big\|^2
+$$
+
+它和 eps-prediction 在数学上可以互相换算，但两点工程差异值得记住。第一，时间被参数化成连续的 $t \in [0,1]$，采样不再是 DDPM 的离散时间步，而是像 SD3 那样用 logit-normal 分布把训练重心压到中间时间；第二，也是对本章更相关的一点：为 eps / v-pred 设计的那套基于 SNR 的 loss weighting（比如 Min-SNR）不能原样搬过来。直线路径的 flow matching 在均匀或 logit-normal 的时间采样下，各时间点的目标尺度已经比较均衡，通常不再额外乘 SNR 相关权重，而是靠时间采样分布本身来做隐式的加权。换句话说，在流匹配里"该给哪些时间更多训练信号"这件事从损失权重挪到了时间采样上。细节留到第 18 章，这里只需要知道：迁到 SD3 / Flux 基座时，eps 时代的 weighting 经验不能直接照抄。
 
 ### 大模型多卡（FSDP）
 
@@ -668,12 +680,14 @@ model = FSDP(
 # Real-ESRGAN 风格 SR
 loss = l1 + 1.0 * vgg + 0.1 * adv
 
-# Restormer 风格去噪
-loss = charb + 0.05 * fft + 0.001 * tv
+# Restormer 风格去噪 (原文就是单一 Charbonnier, 不带额外项)
+loss = charb
 
-# SUPIR 风格扩散
+# SUPIR 风格扩散 (latent_lpips / clip 这两项是示意配比, 非官方公开配方)
 loss = simple_loss + 0.1 * latent_lpips + 0.01 * clip
 ```
+
+需要说明：Restormer 原文的去噪损失就是单一的 Charbonnier（L1 的平滑变体），并没有 fft / tv 这类附加项；上面 SUPIR 那行的 `latent_lpips` 与 `clip` 权重只是把"扩散 + 感知辅助项"的思路写成一个示意起点，不是论文公开的确切配方。真正落地时以你复现的开源实现为准。
 
 ### 启发式调参方法
 
@@ -777,7 +791,7 @@ log_image_grid(sample_outputs, step=step)
 | 输出全黑/白 | 数据归一化错（[-1,1] vs [0,1]）| 检查 dataloader 输出 |
 | 某个 epoch 后突然崩 | LR schedule 出错 | 看 lr 曲线是否合理 |
 | GAN D loss = 0 | D 过强 | 加 SpectralNorm + R1 |
-| GAN 输出鬼东西 | G 没 pretrain | 先 pretrain G |
+| GAN 输出杂乱失真 | G 没 pretrain | 先 pretrain G |
 | 训练 1 epoch 极慢 | 数据加载瓶颈 | 增 num_workers，用 LMDB |
 
 ## 11.15.5 Loss balancing 调度
@@ -869,7 +883,7 @@ def auto_resume(ckpt_dir, model, optimizer, scheduler, ema, scaler):
     return 0
 ```
 
-这是长训练（几天甚至几周）的必备——总会遇到机器重启、CUDA OOM、网络断、电源故障。
+这是长训练（几天甚至几周）的必备：总会遇到机器重启、CUDA OOM、网络断、电源故障。
 
 ## 11.17 工程经验：从一个能跑通的基线开始
 
@@ -921,7 +935,7 @@ step 300000 | l1 0.0179 | vgg 0.3589 | adv 0.4521 | d 0.9234 | grad_g 1.38 | gra
 
 - Stage 1 的 l1 与 vgg 都在单调下降，PSNR 单调上升
 - 切到 Stage 2 后 l1 略微回升（约 10%）但 vgg 继续下降，意味着模型从"像素接近"转向"特征接近"
-- adv loss 在 0.4-0.7 之间震荡而不是单调下降到 0，d loss 在 ln(2) ≈ 0.69 附近不极端漂移，说明 G 与 D 在动态平衡
+- adv loss 在 0.4-0.7 之间震荡而不是单调下降到 0，d loss 从 2ln(2) ≈ 1.386 起步、缓慢下探（本例降到 0.92 左右）而不极端漂移，说明 G 与 D 在动态平衡。这里 d loss 用的是"真假两项求和"的 BCE 约定，均衡点在 2ln(2) 而非 ln(2)（后者是生成器那一路 adv 的均衡值）
 - 梯度 norm 始终 < 2，没有出现 spike
 
 不健康的几个迹象：
@@ -942,7 +956,7 @@ step 300000 | l1 0.0179 | vgg 0.3589 | adv 0.4521 | d 0.9234 | grad_g 1.38 | gra
 8. **Checkpoint 频繁保存 + 自动恢复**，长训练的生存技能
 9. **从基线开始** + **overfit 验证** + **一次改一处**，是工程经验最浓缩的三条
 
-到这里 Part III 的训练章节完成。下一章讲评估方法论——客观指标的局限我们已经在第 4 章讲过，第 12 章重点是**怎么做主观评测**和**怎么在生产环境做 A/B 测试**。
+到这里 Part III 的训练章节完成。下一章讲评估方法论：客观指标的局限我们已经在第 4 章讲过，第 12 章重点是**怎么做主观评测**和**怎么在生产环境做 A/B 测试**。
 
 ---
 

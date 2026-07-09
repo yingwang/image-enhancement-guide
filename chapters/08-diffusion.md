@@ -2,8 +2,8 @@
 
 > 这是这本书最核心的范式转变。
 >
-> 第 6-7 章的所有模型都是**判别式**——给定 $y$ 输出唯一 $\hat{x}$。
-> 这一章开始的扩散模型是**生成式**——给定 $y$ 输出 $p(x | y)$，可以采样出多个合理的 $\hat{x}$。
+> 第 6-7 章的所有模型都是**判别式**：给定 $y$ 输出唯一 $\hat{x}$。
+> 这一章开始的扩散模型是**生成式**：给定 $y$ 输出 $p(x | y)$，可以采样出多个合理的 $\hat{x}$。
 >
 > 这个差别在 ill-posed 严重的场景下是质变的。
 
@@ -37,19 +37,19 @@
 
 > ill-posed 问题上 distortion（PSNR）和 perception（FID/LPIPS）不可同时最优。
 
-判别式模型在 distortion 端走到了极致——HAT 在 Set5 4× 上 33.4 dB。但它们在 perception 端有天花板：
+判别式模型在 distortion 端走到了极致：HAT 在 Set5 4× 上 33.4 dB。但它们在 perception 端有天花板：
 
 - 给定一张糊得厉害的人脸 LR，"最可能"的 $\hat{x}$ 是平均脸（多个合理 $x$ 的均值）
 - 判别式模型必须输出**一个**确定的 $\hat{x}$，所以输出平均脸
-- 平均脸**视觉上糊**——它在 PSNR 上最优，在感知上不真实
+- 平均脸**视觉上糊**：它在 PSNR 上最优，在感知上不真实
 
 扩散模型直接攻击这个问题：
 
 > 我不输出**一个** $\hat{x}$，我学习 $p(x | y)$ 的整个分布，然后从这个分布**采样**一个具体的 $\hat{x}$。
 
-每个采样出的 $\hat{x}$ 都是分布上的一个具体点——是一张**具体的脸**而不是平均脸，视觉上真实但和真值未必像素级一致。
+每个采样出的 $\hat{x}$ 都是分布上的一个具体点，是一张**具体的脸**而不是平均脸，视觉上真实但和真值未必像素级一致。
 
-这就是为什么 SUPIR 在严重退化的老照片上效果惊艳，但 PSNR 比 HAT 低 5+ dB——它走的是 perception-distortion 曲线的另一端。
+这就是为什么 SUPIR 在严重退化的老照片上效果惊艳，但 PSNR 比 HAT 低 5+ dB，它走的是 perception-distortion 曲线的另一端。
 
 这一章讲清扩散模型怎么工作、为什么它适合增强任务、以及具体怎么用。
 
@@ -57,7 +57,7 @@
 
 扩散模型的核心思想可以一句话概括：
 
-> **学一个去噪过程**——从纯噪声开始，一步步去除噪声，最后得到一张图。
+> **学一个去噪过程**：从纯噪声开始，一步步去除噪声，最后得到一张图。
 
 为了让这件事更直观，下面把前向加噪与反向去噪两条链画出来。前向是一个固定的随机过程（没有可学的参数，只是按一个事先定好的 noise schedule 不断给图像加高斯噪声），反向才是神经网络要学的部分。
 
@@ -83,8 +83,8 @@ graph LR
 
 第一眼看这个目标会觉得奇怪：预测噪声怎么会等于学会生成图像？关键在两点：
 
-1. **任意 $t$ 的加噪图可以一步采样**——不需要从 $x_0$ 一步步加 $T$ 次，前向过程有一条解析公式让你直接跳到任意 $t$，这一点让训练在计算上可行
-2. **学会了预测噪声 = 学会了 $p(x_0)$ 的 score function**——score 是 $\nabla_x \log p(x)$，是分布对自变量的梯度场，知道每个点的 score 等价于知道分布的几何结构，从而可以用 Langevin 动力学或反向 SDE 从噪声采样出符合 $p(x)$ 的样本
+1. **任意 $t$ 的加噪图可以一步采样**：不需要从 $x_0$ 一步步加 $T$ 次，前向过程有一条解析公式让你直接跳到任意 $t$，这一点让训练在计算上可行
+2. **学会了预测噪声 = 学会了 $p(x_0)$ 的 score function**：score 是 $\nabla_x \log p(x)$，是分布对自变量的梯度场，知道每个点的 score 等价于知道分布的几何结构，从而可以用 Langevin 动力学或反向 SDE 从噪声采样出符合 $p(x)$ 的样本
 
 下面把这两点对应的数学讲清。
 
@@ -98,7 +98,7 @@ $$
 q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} \cdot x_{t-1}, \beta_t \mathbf{I})
 $$
 
-含义：$x_t$ 是 $x_{t-1}$ 缩小一点（乘 $\sqrt{1-\beta_t}$）再加一点高斯噪声（方差 $\beta_t$）。乘 $\sqrt{1-\beta_t}$ 是为了让方差守恒——如果只加噪不缩小，$x_t$ 的二阶矩会一直涨，最终远超 $x_0$ 的尺度；先把信号缩小再加上等量的方差，整体二阶矩保持在 $O(1)$，数值上更稳定。
+含义：$x_t$ 是 $x_{t-1}$ 缩小一点（乘 $\sqrt{1-\beta_t}$）再加一点高斯噪声（方差 $\beta_t$）。乘 $\sqrt{1-\beta_t}$ 是为了让方差守恒：如果只加噪不缩小，$x_t$ 的二阶矩会一直涨，最终远超 $x_0$ 的尺度；先把信号缩小再加上等量的方差，整体二阶矩保持在 $O(1)$，数值上更稳定。
 
 为了简化记号，定义 $\alpha_t = 1 - \beta_t$，再定义累积量 $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$。这个 $\bar{\alpha}_t$ 是后面所有公式里反复出现的核心量，几何意义是从 $x_0$ 到 $x_t$ 累积下来的"信号保留比例"。当 $t$ 接近 0 时 $\bar{\alpha}_t \approx 1$（几乎没加噪），当 $t$ 接近 $T$ 时 $\bar{\alpha}_t \approx 0$（信号几乎全淹没）。
 
@@ -116,7 +116,7 @@ $$
 x_t = \sqrt{\bar{\alpha}_t} \cdot x_0 + \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I})
 $$
 
-这是训练能高效进行的关键——不需要真的一步步加 1000 次噪声。训练循环里只要随机采一个 $t$，按上式直接构造 $x_t$ 和对应的 $\epsilon$，就能拿来做监督。如果没有这条解析路径，每一步训练都要先模拟 $t$ 次加噪，扩散模型的训练成本会高到完全不可行。
+这是训练能高效进行的关键：不需要真的一步步加 1000 次噪声。训练循环里只要随机采一个 $t$，按上式直接构造 $x_t$ 和对应的 $\epsilon$，就能拿来做监督。如果没有这条解析路径，每一步训练都要先模拟 $t$ 次加噪，扩散模型的训练成本会高到完全不可行。
 
 ```python
 import torch
@@ -160,15 +160,17 @@ $$
 \bar{\alpha}_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos\left(\frac{t/T + s}{1 + s} \cdot \frac{\pi}{2}\right)^2
 $$
 
-其中 $s \approx 0.008$ 是一个小偏移，避免 $t = 0$ 时分母奇异。cosine 的 $\bar{\alpha}_t$ 在两端慢、中间快，让训练在"中间噪声水平"那一段花更多采样，匹配了人眼对 mid-frequency 细节的敏感度。SDXL、Imagen 都默认 cosine。
+其中 $s \approx 0.008$ 是一个小偏移，避免 $t = 0$ 时分母奇异。cosine 的 $\bar{\alpha}_t$ 在两端慢、中间快，让训练在"中间噪声水平"那一段花更多采样，匹配了人眼对 mid-frequency 细节的敏感度。Imagen 默认用 cosine；但并非所有大模型都用它，例如 SDXL 用的是 scaled_linear（$\beta$ 从 0.00085 到 0.012，即在 $\sqrt{\beta}$ 上线性插值再平方），仍属线性 $\beta$ 一系而不是 cosine。
 
-更进一步，**SNR-based schedule** 直接按信噪比 $\text{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$ 定义 schedule，让 $\log \text{SNR}(t)$ 在 $t$ 上线性下降。这是 EDM (Karras et al. 2022) 的核心贡献之一，让"什么时间步"和"什么噪声水平"解耦：同一个噪声水平在不同 schedule 下对应的 $t$ 不一样，但在 SNR 视角下完全等价。EDM 的整套训练 / 采样代码都基于 SNR 参数化重写，性能在 FID 上比 DDPM 原版 schedule 提升一个台阶。
+更进一步，**SNR-based schedule** 直接按信噪比 $\text{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$ 定义 schedule。让 $\log \text{SNR}(t)$ 在 $t$ 上线性下降的这种连续时间参数化，出自 Kingma 等人的 VDM（Variational Diffusion Models，2021），它把"什么时间步"和"什么噪声水平"解耦：同一个噪声水平在不同 schedule 下对应的 $t$ 不一样，但在 SNR 视角下完全等价。
+
+另一条相关但不同的路线是 EDM（Karras et al. 2022），注意不要把它和 log-SNR 线性调度混为一谈。EDM 不在 $\bar{\alpha}_t$ 框架里谈 schedule，而是直接在噪声标准差 $\sigma$ 空间做参数化：给网络加一组预条件（preconditioning）系数、训练时按 lognormal 分布采样 $\sigma$、采样时用二阶 Heun 求解器。它在 FID 上比 DDPM 原版 schedule 提升一个台阶，但核心贡献是 $\sigma$ 空间的这套设计本身，而不是 log-SNR 线性调度。
 
 工程实践：
 
 - 学术复现 DDPM 用线性
 - 训新模型默认 cosine
-- 追求 SOTA 生成质量用 EDM SNR 参数化
+- 追求 SOTA 生成质量用 EDM 的 $\sigma$ 空间参数化
 - 增强任务里 schedule 影响相对小，主要是中等 $t$ 区域的 loss 权重决定结果质量
 
 ## 8.4 反向过程：训练目标
@@ -226,7 +228,7 @@ def x0_to_eps(x_t, x0_pred, alpha_cumprod_t):
 训练采样目标的选择：
 
 - **$\epsilon$-pred**：通用文生图标配（SD 1.x）
-- **$v$-pred**：高分辨率训练更稳（SD 2.x, SDXL refiner）
+- **$v$-pred**：高分辨率训练更稳（代表是 SD 2.x-v，即 SD 2.0/2.1 的 768 分辨率 v 版本；注意 SDXL 的 base 与 refiner 用的都是 $\epsilon$-pred，不是 v-pred）
 - **$x_0$-pred**：增强/恢复任务直观，关心的就是 $x_0$ 质量
 
 把三种目标的关系画成一个小图，便于对照：
@@ -246,6 +248,8 @@ graph LR
 ```
 
 三种预测之间只是同一个仿射变换的不同投影，训练时改的是 loss 的角度，推理时再用对应公式还原成 $\hat{x}_0$ 用于下一步采样。
+
+这里还应点出一条更新的主线：$\epsilon$ / $x_0$ / $v$ 三种目标都建立在 DDPM 的离散加噪框架上，而 2024 年之后的 SD3、FLUX 这一代已经改用 flow matching / rectified flow 的参数化，网络预测的是连接噪声与数据的直线路径上的速度场（velocity），训练目标从"预测噪声"变成"预测流速"。它与 $v$-prediction 精神相近但框架不同，本章不展开，第 18 章会作为新一代基座的默认参数化专门讨论。
 
 ## 8.5 一个最小的 DDPM 训练循环
 
@@ -324,7 +328,7 @@ $$
 x_{t-1} = \frac{1}{\sqrt{\alpha_t}} \left( x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}} \epsilon_\theta(x_t, t) \right) + \sigma_t z
 $$
 
-其中 $z \sim \mathcal{N}(0, \mathbf{I})$ 是每一步独立采的高斯，$\sigma_t$ 是 DDPM 选定的噪声方差。这个公式的形式是从真实后验 $q(x_{t-1} \mid x_t, x_0)$ 推出来的，再把里面的 $x_0$ 用预测的 $\hat{x}_0 = (x_t - \sqrt{1-\bar{\alpha}_t}\epsilon_\theta) / \sqrt{\bar{\alpha}_t}$ 代入。整条链上的随机性来自这一连串 $z$ 的采样——同样一个起始噪声 $x_T$ 走两遍 DDPM 会得到不同的样本。
+其中 $z \sim \mathcal{N}(0, \mathbf{I})$ 是每一步独立采的高斯，$\sigma_t$ 是 DDPM 选定的噪声方差。这个公式的形式是从真实后验 $q(x_{t-1} \mid x_t, x_0)$ 推出来的，再把里面的 $x_0$ 用预测的 $\hat{x}_0 = (x_t - \sqrt{1-\bar{\alpha}_t}\epsilon_\theta) / \sqrt{\bar{\alpha}_t}$ 代入。整条链上的随机性来自这一连串 $z$ 的采样：同样一个起始噪声 $x_T$ 走两遍 DDPM 会得到不同的样本。
 
 **问题**：要走 1000 步，每步一次 UNet 前向，**慢**。SD 1.5 在 A100 上单步前向约 30ms，跑满 1000 步是 30 秒，单张图。生产环境完全不可接受。
 
@@ -336,7 +340,7 @@ $$
 x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_{t-1}} \cdot \epsilon_\theta(x_t, t)
 $$
 
-其中 $\hat{x}_0$ 是从 $x_t$ 和预测噪声反推的 $x_0$（用上节的 `eps_to_x0`）。注意公式里没有显式的随机项 $z$——同一个起始噪声经过 DDIM 总是给出同一张图，这是 DDIM 的"确定性"含义。这个采样**可以跳步**：DDIM 把"从 $t$ 到 $t-1$ 的一步"重写成了"从 $t$ 到任意更小的 $t'$ 的一步"，因此推理时可以只挑 50 个时间步（比如均匀地从 1000 里取 20 个间隔）走完整个反向链。
+其中 $\hat{x}_0$ 是从 $x_t$ 和预测噪声反推的 $x_0$（用上节的 `eps_to_x0`）。注意公式里没有显式的随机项 $z$：同一个起始噪声经过 DDIM 总是给出同一张图，这是 DDIM 的"确定性"含义。这个采样**可以跳步**：DDIM 把"从 $t$ 到 $t-1$ 的一步"重写成了"从 $t$ 到任意更小的 $t'$ 的一步"，因此推理时可以只挑 50 个时间步（比如均匀地从 1000 里取 20 个间隔）走完整个反向链。
 
 DDIM 50 步 ≈ DDPM 1000 步质量，**20× 加速**。确定性这件事在编辑任务上还有一个额外好处：可以做 DDIM inversion，从已有图像反推它对应的潜噪声 $x_T$，然后修改条件再正向采样回去。
 
@@ -367,13 +371,15 @@ scheduler.set_timesteps(num_inference_steps=20)
 - **生产部署**：DPM-Solver++ 2M，20 步
 - **极致速度**：LCM (Latent Consistency Models) 蒸馏后，4 步
 
+少步蒸馏这条线在 LCM 之外还有两支值得知道：一支是对抗蒸馏，用一个判别器把少步学生的输出逼近真实分布，代表是 ADD（Adversarial Diffusion Distillation，即 SDXL-Turbo）；另一支是分布匹配蒸馏 DMD / DMD2，用分布层面的匹配目标把多步教师压到一到几步。它们都能把采样步数压到个位数甚至一步，细节留到第 18 章。
+
 ## 8.7 LDM：扩散搬到潜空间
 
 第 2 章 2.4 节已经从"表征空间"的角度介绍过 LDM。这里从扩散的角度补一遍：为什么把扩散搬到潜空间是改变这个领域的工程节点。
 
 LDM (Rombach et al. 2022) 的关键观察：
 
-> 像素空间的扩散在大量计算"高频细节"上浪费——这些细节可以用一个 VAE 解码器后处理生成。
+> 像素空间的扩散在大量计算"高频细节"上浪费：这些细节可以用一个 VAE 解码器后处理生成。
 >
 > 让 UNet 只在**潜空间**做扩散，把高频细节交给 VAE 解码器。
 
@@ -397,7 +403,7 @@ UNet 是大头，VAE 相对小。这就是为什么 SD finetune 主要训 UNet�
 
 ## 8.8 SD UNet 内部结构
 
-UNet 是扩散模型的"主网络"。它的结构对增强任务很重要——后面 ControlNet 等扩展都建立在这个结构上。为了把"UNet 在去噪步里的位置"放回大图，先用一张数据流图把单步采样画出来：
+UNet 是扩散模型的"主网络"。它的结构对增强任务很重要，后面 ControlNet 等扩展都建立在这个结构上。为了把"UNet 在去噪步里的位置"放回大图，先用一张数据流图把单步采样画出来：
 
 ```mermaid
 graph LR
@@ -468,7 +474,7 @@ class ResBlock(nn.Module):
         return h + self.skip(x)
 ```
 
-时间嵌入注入是扩散模型独有的——同一个网络要处理 1000 个不同时间步，需要知道当前是哪一步。
+时间嵌入注入是扩散模型独有的：同一个网络要处理 1000 个不同时间步，需要知道当前是哪一步。
 
 ### Spatial Transformer：cross-attention 入口
 
@@ -510,7 +516,7 @@ class SpatialTransformer(nn.Module):
         return x + self.proj_out(h)
 ```
 
-cross-attention 是文生图的关键——文本通过 cross-attention 影响每个空间位置的特征。这个机制在第 9 章会被复用到增强任务的条件控制。
+cross-attention 是文生图的关键：文本通过 cross-attention 影响每个空间位置的特征。这个机制在第 9 章会被复用到增强任务的条件控制。
 
 ## 8.9 增强任务里的扩散用法
 
@@ -527,21 +533,25 @@ def prepare_input(noisy_latent, lr_latent):
     return torch.cat([noisy_latent, lr_latent], dim=1)
 ```
 
-代表：StableSR (2023) 用这种简单形式。
+代表：SR3（Saharia et al. 2021，把 LR 上采样后与噪声图在通道维 concat）以及 LDM 论文里的 LDSR。
 
 ### 范式二：cross-attention（语义条件）
 
-把 LR 的某种 embedding 通过 cross-attention 注入。代表：DiffBIR 用 CLIP image embedding。
+把某种图像 embedding 通过 cross-attention 注入 UNet。代表是 IP-Adapter 风格的做法：用图像编码器把参考图（或 LR）编码成一组 token，接到 UNet 的 cross-attention 上，与文本 token 并列消费。
 
 ### 范式三：ControlNet（结构条件）
 
-复制一份 UNet encoder，专门处理条件输入，输出加到主 UNet 的对应层。代表：StableSR 的 ControlNet 变体、SUPIR。
+复制一份 UNet encoder，专门处理条件输入，输出加到主 UNet 的对应层。代表：DiffBIR（两阶段：Stage-1 用 SwinIR 类恢复网络去退化，Stage-2 用 IRControlNet 这种 ControlNet 式并联模块把恢复图作为条件注入冻结 SD，不用 CLIP image encoder）、SUPIR（SDXL 上挂 ZeroSFT + ControlNet 式适配器）。
+
+### 范式四：trainable side-encoder + 特征注入（StableSR 一类）
+
+StableSR 既不是 input-concat 也不是 ControlNet：它在冻结的 SD 上外挂一个 time-aware encoder，把 LR 特征经 SFT（spatial feature transform）注入 UNet，解码端再用 CFW（Controllable Feature Wrapping）在保真与质量之间做可控取舍。它自成一类，也不存在所谓 v1/v2 之分。
 
 第 9 章会详谈。
 
 ### 一个常见的误解
 
-很多第一次接触扩散增强的工程师以为 LR 的"注入位置"决定了模型上限，于是花大量时间调架构。实测上，**真正决定生成质量的是 (1) 训练数据是否反映真实退化，(2) 条件控制强度的可调性**。架构选择（concat vs ControlNet）影响的是 fidelity-creativity 的曲线偏向哪一端，但只要训练数据合理、有可调的 conditioning scale，几种范式都能做到产品级。这也是为什么本书把第 5 章（数据合成）放在第 9 章（条件控制）之前——数据上限决定下限。
+很多第一次接触扩散增强的工程师以为 LR 的"注入位置"决定了模型上限，于是花大量时间调架构。实测上，**真正决定生成质量的是 (1) 训练数据是否反映真实退化，(2) 条件控制强度的可调性**。架构选择（concat vs ControlNet）影响的是 fidelity-creativity 的曲线偏向哪一端，但只要训练数据合理、有可调的 conditioning scale，几种范式都能做到产品级。这也是为什么本书把第 5 章（数据合成）放在第 9 章（条件控制）之前：数据上限决定下限。
 
 ## 8.10 扩散为什么能"无中生有"
 
@@ -552,7 +562,7 @@ def prepare_input(noisy_latent, lr_latent):
 判别式：一次前向，输出确定的 $\hat{x}$。
 扩散：$T$ 次前向，每一次都从一个随机分布采样。每一次采样都是"这一步该往哪个方向走"的随机选择。
 
-这个随机性意味着同样的 LR 输入可以生成不同的 $\hat{x}$——每个都是合理的。
+这个随机性意味着同样的 LR 输入可以生成不同的 $\hat{x}$，每个都是合理的。
 
 ### 2. 学到了 score function
 
@@ -578,7 +588,7 @@ $$
 
 扩散模型不是在"逼近真值"，而是在"沿着自然图像分布的几何结构走 T 步"。每一步都被分布的几何引导，每一步都有随机扰动让生成结果不重复。
 
-最终输出是分布上的一个点——具体的、合理的、随机的。
+最终输出是分布上的一个点：具体的、合理的、随机的。
 
 ## 8.10b 一个扩展用法：SDS（Score Distillation Sampling）
 
@@ -612,7 +622,7 @@ $$
 | 控制 | 只能改训练数据 | **可加 prompt / control** |
 | 显存占用 | 低 | 高 (2-4×) |
 
-**没有谁全胜**——这两类模型在不同应用场景各有优势：
+**没有谁全胜**：这两类模型在不同应用场景各有优势：
 
 - **法医证据增强**：判别式（不允许编造）
 - **学术 benchmark PSNR 比赛**：判别式
@@ -694,13 +704,13 @@ def classifier_free_guidance(model, x_t, t, condition, guidance_scale=2.0):
     return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 ```
 
-工程实践里把这两次前向 batch 起来一起跑——拼成 $(2B, C, H, W)$ 走一次，省一次 kernel launch 开销。Diffusers 的默认实现就是这样。
+工程实践里把这两次前向 batch 起来一起跑，拼成 $(2B, C, H, W)$ 走一次，省一次 kernel launch 开销。Diffusers 的默认实现就是这样。
 
 ## 8.13 一个增强任务的扩散训练流程
 
-把上面的概念串成一个增强任务的训练循环。下面用的是**最简单的 latent concat 方案**——把 LR 上采样到 HR 尺寸后过 VAE，得到的 lr_latent 与 hr_latent 同 spatial 大小，直接 concat 进 UNet 输入通道。这个路线接近 LDM 论文里 LDSR 的做法，理解扩散增强训练的最小骨架够用。
+把上面的概念串成一个增强任务的训练循环。下面用的是**最简单的 latent concat 方案**：把 LR 上采样到 HR 尺寸后过 VAE，得到的 lr_latent 与 hr_latent 同 spatial 大小，直接 concat 进 UNet 输入通道。这个路线接近 LDM 论文里 LDSR 的做法，理解扩散增强训练的最小骨架够用。
 
-需要说明：**SUPIR / StableSR 不是这么做的**。它们都用 ControlNet / 时序 feature injection 把 LR 信号加到主 UNet 的 skip 上（StableSR 用 time-aware encoder，SUPIR 用 ZeroSFT + ControlNet），主 UNet 权重大部分不动。input concat 这条路最大的弱点是 fidelity 偏弱、对 LR 输入分布敏感；生产上做扩散 SR 推荐看第 9 章的 ControlNet 路线。
+需要说明：**SUPIR / StableSR 不是这么做的**。它们都不走 input concat，而是把 LR 信号通过独立的编码或控制模块注入冻结的主 UNet（StableSR 用 time-aware encoder + SFT 注入，SUPIR 用 ZeroSFT + ControlNet 式适配器），主 UNet 权重大部分不动。input concat 这条路最大的弱点是 fidelity 偏弱、对 LR 输入分布敏感；生产上做扩散 SR 推荐看第 9 章的 ControlNet 路线。
 
 ```python
 def train_diffusion_enhancement(
@@ -798,7 +808,7 @@ def diffusion_enhance(unet, vae, scheduler, lr_img,
     return hr_img.clamp(0, 1)
 ```
 
-注意一个关键点：**LR 必须先被上采样到目标 HR 尺寸再过 VAE**——这样得到的 latent 与 hr_latent 同样大小，可以直接 concat。如果直接 `vae.encode(lr_img)`，得到的潜空间是 LR 大小（HR/8 比 LR/8 大 4×），shape 不匹配。
+注意一个关键点：**LR 必须先被上采样到目标 HR 尺寸再过 VAE**，这样得到的 latent 与 hr_latent 同样大小，可以直接 concat。如果直接 `vae.encode(lr_img)`，得到的潜空间是 LR 大小（HR/8 比 LR/8 大 4×），shape 不匹配。
 
 输出分辨率由 `target_size` 决定，VAE 解码后的图就是这个尺寸。
 
@@ -829,11 +839,11 @@ graph TD
     style I5 fill:#e8f5e9
 ```
 
-训练是单步监督——一个 batch 一个 forward/backward，与训普通 CNN 几乎没差别。推理却是 $T'$ 步循环（$T' \in [4, 50]$，看采样器），每一步都要跑一次 UNet。这个不对称性导致很多问题只在推理阶段暴露：训练 loss 下降得很好不等于采样质量好，必须在每个 checkpoint 上跑实际采样评估（FID、LPIPS、人评）。这是扩散模型工程的一条铁律。
+训练是单步监督：一个 batch 一个 forward/backward，与训普通 CNN 几乎没差别。推理却是 $T'$ 步循环（$T' \in [4, 50]$，看采样器），每一步都要跑一次 UNet。这个不对称性导致很多问题只在推理阶段暴露：训练 loss 下降得很好不等于采样质量好，必须在每个 checkpoint 上跑实际采样评估（FID、LPIPS、人评）。这是扩散模型工程的一条铁律。
 
 ## 8.15 小结
 
-1. **扩散是从判别式到生成式的范式转变**——输出不是唯一 $\hat{x}$，是 $p(x|y)$ 的采样
+1. **扩散是从判别式到生成式的范式转变**：输出不是唯一 $\hat{x}$，是 $p(x|y)$ 的采样
 2. **前向加噪 + 反向去噪**：训练目标是预测加进去的噪声
 3. **任意时间步可以一步采样**：不需要 1000 次加噪，有解析公式
 4. **三种预测目标等价**（$\epsilon$ / $x_0$ / $v$），选哪个看任务
@@ -844,7 +854,7 @@ graph TD
 9. **扩散的"无中生有"= 学到 score function + 多步随机采样**
 10. **trade-off**：扩散视觉真实感强但 PSNR 低、慢、显存高
 
-下一章讲条件控制——把 LR 注入扩散 UNet 有几种范式（concat、cross-attention、ControlNet、IP-Adapter），各自适合什么场景。
+下一章讲条件控制，把 LR 注入扩散 UNet 有几种范式（concat、cross-attention、ControlNet、IP-Adapter），各自适合什么场景。
 
 ---
 

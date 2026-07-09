@@ -77,7 +77,7 @@
 这两个目标在工程上**部分冲突**：
 
 - 让模型生成更多细节 → 同一物体在不同帧的细节可能不一致 → 闪烁
-- 让模型在时序上更稳定 → 容易输出"安全模糊"（safe blur），细节被抹掉 → PSNR 升 LPIPS 降但主观差
+- 让模型在时序上更稳定 → 容易输出"安全模糊"（safe blur），细节被抹掉 → PSNR 可能升，但 LPIPS 与主观都变差（过度平滑会让 LPIPS 升高，而 LPIPS 与主观感受方向一致，所以这不是"指标好但主观差"，而是感知指标与主观一起变差）
 
 视频增强的工程难点正是**同时优化这两个目标**。从研究路径上看，过去十年大致经历了三个阶段：第一阶段（2015 前后）只关心空间质量，时序问题被忽略；第二阶段（2017-2020）把光流和 warping 显式引入网络，开始系统性处理时序；第三阶段（2021 至今）转向循环网络与跨帧注意力，把时序信息隐式编码进特征传播路径。第 14 章会沿着这条路径讲具体模型。
 
@@ -114,6 +114,8 @@ $$
 $$
 I_x u + I_y v + I_t = 0
 $$
+
+这里要提醒一处记号冲突：式中的 $I_t$ 沿用光流文献的传统写法，指图像对时间的偏导数 $\partial I / \partial t$，和本章开头记号约定里"第 $t$ 帧图像"的 $I_t$ 并不是同一个量，只是恰好写成了同一个符号；$I_x$、$I_y$ 则是对空间坐标 $x$、$y$ 的偏导。
 
 这是一个像素一个方程、两个未知数（$u, v$）的欠定系统，是为什么"估光流"本身就是一个 ill-posed 问题，需要额外约束（局部平滑、稀疏假设、神经网络先验）才能解出来。
 
@@ -226,9 +228,9 @@ def warp_with_flow(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
 
 实现上的几个坑：
 
-- **gradient flow**：`grid_sample` 对 `image` 可微，但默认情况下对 `grid`（也就是光流）不可微。如果你想在 warping 里反传光流梯度（端到端训练光流网络），需要设 `align_corners` 与正确的归一化方式，并确认 PyTorch 版本支持双向梯度。
+- **gradient flow**：`grid_sample` 对 `image` 和 `grid`（也就是光流）默认都是可微的，grid 的梯度默认就有，不需要额外开关，这正是光流网络、STN（空间变换网络）这类模块能端到端训练的前提。真正需要留意的是两点：一是二阶梯度（对 grid 再求一次导，部分版本支持得并不完整），二是边界与归一化，即 `padding_mode` 与 `align_corners` 决定了归一化坐标的定义，进而影响梯度算得对不对。
 - **padding_mode**：默认 `zeros` 会让出界位置变黑，损失上会被算作"完全不同"。视频任务里通常用 `border`（边缘复制）或 `reflection`。
-- **bilinear vs bicubic**：grid_sample 默认 bilinear，速度快但锐利度低；bicubic 更锐利但显存翻倍。
+- **bilinear vs bicubic**：grid_sample 默认 bilinear，速度快但锐利度低；bicubic 更锐利，但它每个输出点要取 4×4=16 个邻域抽头，而 bilinear 只取 2×2=4 个，主要代价是算力约 4×，显存基本不变，并不会翻倍。
 - **多次 warp 的累积误差**：每次 warp 都会有亚像素插值损失，对一段视频反复 warp（比如双向循环里前向再后向）会让细节越来越糊。这是为什么 BasicVSR 这类模型用"特征级 warping"而不是"像素级 warping"。
 
 Warping 是视频增强里反复使用的基础操作 - 用它来对齐相邻帧、做时序聚合、做时序一致性损失、做帧插值的初始预测。后面所有节会反复用到它。
@@ -599,7 +601,7 @@ EDVR 等模型用 **DCN（Deformable Convolution Network，可变形卷积）** 
 def temporal_lpips_warped(frames: torch.Tensor, flows: list,
                           lpips_fn) -> float:
     """
-    frames: (T, C, H, W) — 已增强后的视频帧
+    frames: (T, C, H, W), 已增强后的视频帧
     flows: 长度 T-1, 每个是 (1, 2, H, W) 的前向光流 t -> t+1
     返回: 相邻帧 (运动补偿后) 之间的平均 LPIPS。越小越一致。
 
@@ -672,13 +674,16 @@ def temporal_lpips_warped(frames: torch.Tensor, flows: list,
 - 推荐用 NVDEC 硬件解码：NVIDIA GPU 内置的视频解码单元，比 CPU 解码快十倍以上
 
 ```python
-# 用 torchvision.io 硬件解码 (PyTorch 2.0+)
-import torchvision
+# torchvision.io.VideoReader 的解码接口在 2024 年后已标记弃用,
+# 官方推荐迁移到 TorchCodec (同样基于 FFmpeg, 支持 NVDEC GPU 硬件解码)。
+from torchcodec.decoders import VideoDecoder
 
-reader = torchvision.io.VideoReader("video.mp4", "video", num_threads=4)
-for frame in reader:
-    pts = frame['pts']
-    img = frame['data']
+# 关键: 只有显式指定 device="cuda" 才会真正走 NVDEC 硬件解码;
+# 缺省 device="cpu" 时, 即便代码看着"用了 GPU 库", 实际仍是 CPU 解码。
+decoder = VideoDecoder("video.mp4", device="cuda")
+for frame in decoder:
+    data = frame.data          # 已解码并驻留在 GPU 上的张量 (C, H, W)
+    pts = frame.pts_seconds    # 显示时间戳
     # 处理...
 ```
 
