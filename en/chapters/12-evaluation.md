@@ -1,853 +1,316 @@
-# Chapter 12 · Evaluation Methodology
+# Chapter 12 · Evaluation Methodology and Benchmarking
 
-> Chapter 4 discussed **the metrics themselves**: where PSNR/LPIPS/FID each deceive you.
+> While Chapter 4 dissected the mathematical properties and blind spots of objective metrics (PSNR, LPIPS, FID), this chapter examines experimental design: structuring human subjective trials, computing statistical significance, and running production A/B tests.
 >
-> This chapter discusses **how to run an evaluation**: how to design a subjective evaluation, how to compute statistical significance, how to do A/B testing in production.
->
-> In image enhancement, "running an experiment" itself has a methodology, and most papers do not get this step right.
+> In image restoration engineering, empirical validation is only as reliable as the evaluation methodology behind it.
 
-## 12.0 Reading guide
+## 12.0 Reading Notes
 
-Chapter 4 pulled each metric apart to discuss its individual biases; this chapter goes one level up: **given a set of metrics, how to organize them into trustworthy experimental conclusions**. The boundary can be drawn this way: Chapter 4 answers "what does PSNR = 32 dB mean", and this chapter answers "is PSNR 32 vs 31 actually better" and "is this gap perceivable by real users".
+This chapter formalizes the verification protocols required to establish statistically sound conclusions in low-level vision.
 
-This chapter assumes the reader has run simple comparison experiments (run two models, compute a PSNR, draw a table) but **has not necessarily designed a user study or live A/B test**. We unpack the three layers of evaluation, several subjective protocols, rater quality control, statistical significance testing, and production A/B testing.
+Key objectives:
 
-**Abbreviations introduced here.** The abbreviations used in this chapter are listed up front:
+- Master the three-tier evaluation hierarchy: Automated Objective Metrics, Standardized Subjective Human Studies, and Downstream Task Verification.
+- Understand Two-Alternative Forced Choice (2AFC) protocols, Mean Opinion Score (MOS) standardization, and the ITU-R BT.500 laboratory testing standard.
+- Implement inter-rater reliability testing (Krippendorff's $\alpha$, Intraclass Correlation Coefficient ICC, and Cohen's $\kappa$) and outlier rejection via SUREAL.
+- Apply parametric and non-parametric hypothesis testing (paired $t$-tests, Wilcoxon signed-rank tests, binomial tests with Bonferroni corrections).
+- Build production A/B testing pipelines and failure-mode regression test suites.
 
-- **IQA** (Image Quality Assessment): defined in Chapter 1, used directly here
-- **MOS** (Mean Opinion Score): the average of raters' image-quality scores on a 1-5 Likert scale
-- **DMOS** (Differential MOS): a relative MOS measured against a reference image; equals the reference score minus the test score, in units of "quality loss"
-- **2AFC** (Two-Alternative Forced Choice): a comparison protocol where the rater must pick between A and B
-- **BT.500**: ITU-R's standard for subjective video and image evaluation, the de facto standard in this field
-- **NR-IQA / FR-IQA** (No-Reference / Full-Reference IQA): defined in Chapter 1; NR-IQA is the workhorse for real-world scenarios in this chapter
-- **BRISQUE** (Blind/Referenceless Image Spatial Quality Evaluator): a classic NR-IQA metric based on natural-scene statistics
-- **NIQE** (Natural Image Quality Evaluator): another NR-IQA metric based on natural-scene statistics
-- **PI** (Perceptual Index): a composite NR metric defined by the PIRM 2018 competition, equal to (10 - NRQM + NIQE) / 2
-- **NRQM** (No-Reference Quality Metric): an SR-specific NR metric proposed by Ma et al. 2017
-- **MANIQA / CLIP-IQA / Q-Align**: modern NR-IQA metrics defined in Chapter 1
-- **ICC** (Intraclass Correlation Coefficient): a measure of inter-rater agreement
-- **AMT** (Amazon Mechanical Turk): the classic crowdsourcing platform
-- **IRB** (Institutional Review Board): the institutional ethics review board for human-subject research in academia
-- **SUREAL** (Subjective REcovery Algorithm with Latent classes): Netflix's MOS estimation method
-- **PVD** (Preferred Viewing Distance): the recommended viewing distance specified in BT.500
+**Prerequisites.** Image quality assessment fundamentals from Chapter 4 and basic statistical hypothesis testing.
 
-After reading this chapter you should be able to answer: given a new model, how do I design a set of experiments that runs fast, runs accurately, and stands up to scrutiny in paper / product review; when a user says "I can't see a difference", how do I rebut or concede using data; when a live A/B test shows no difference after two weeks, is the model bad or is the sample too small.
+**Key Terminology Introduced in This Chapter:**
 
-## 12.1 The three layers of evaluation
-
-Any serious enhancement evaluation should cover three layers:
-
-```
-Layer 1: Automatic metrics
-  PSNR / SSIM / LPIPS / DISTS / FID / NIQE
-  Pros: fast, reproducible, cheap
-  Cons: limited correlation with human eye (covered in Chapter 4)
-
-Layer 2: Subjective human evaluation
-  MOS / 2AFC / preference test
-  Pros: reflects real visual experience
-  Cons: slow, expensive, noisy
-
-Layer 3: Real-world downstream tasks
-  A/B test / user behavior / downstream recognition accuracy
-  Pros: directly reflects value
-  Cons: requires deployment, limited data
-```
-
-**The three layers must validate each other**: an automatic-metric improvement that does not show up in subjective evaluation or downstream tasks is suspect.
-
-Drawing the three layers and their concrete methods as a taxonomy makes it easier to look up later — each subsequent section is essentially filling in a subtree of the following diagram:
+- **MOS** (Mean Opinion Score): Subjective rating average collected on a 5-point Likert scale.
+- **2AFC** (Two-Alternative Forced Choice): Psychophysical comparative protocol where raters make a binary choice between two paired candidate images.
+- **ITU-R BT.500**: International telecommunication standard specifying physical viewing conditions, display calibration, and rating procedures for visual media.
+- **Krippendorff's $\alpha$**: Statistical coefficient measuring inter-rater agreement across arbitrary numbers of observers and data types.
+- **ICC** (Intraclass Correlation Coefficient): Metric evaluating scoring consistency across multiple raters on continuous evaluation scales.
+- **SUREAL** (Subjective Recovery Algorithm with Latent Variables): Maximum likelihood estimation framework (Netflix) that decouples observer bias and inconsistency from true image quality scores.
 
 ```mermaid
 graph TD
-    Eval[Image enhancement evaluation]
-    Eval --> L1[Layer 1<br/>Automatic metrics]
-    Eval --> L2[Layer 2<br/>Subjective evaluation]
-    Eval --> L3[Layer 3<br/>Downstream tasks / A/B]
+    Eval[Restoration Evaluation Framework] --> L1[Layer 1: Automated Objective Metrics]
+    Eval --> L2[Layer 2: Standardized Human Subjective Trials]
+    Eval --> L3[Layer 3: Downstream Task & Production A/B]
 
-    L1 --> FR[FR-IQA full reference<br/>HR ground truth available]
-    L1 --> NR[NR-IQA no reference<br/>no HR ground truth]
-    FR --> FR1[PSNR / SSIM / MS-SSIM]
-    FR --> FR2[LPIPS / DISTS]
-    FR --> FR3[FID / KID distribution-level]
-    NR --> NR1[BRISQUE / NIQE / PI / NRQM]
-    NR --> NR2[MANIQA / CLIP-IQA / Q-Align]
+    L1 --> FR[Full-Reference FR-IQA: PSNR / SSIM / LPIPS / DISTS]
+    L1 --> NR[No-Reference NR-IQA: MANIQA / CLIP-IQA / MUSIQ]
+    L1 --> Dist[Distributional: FID / KID]
 
-    L2 --> SS[Single stimulus<br/>SS / MOS]
-    L2 --> DS[Double stimulus<br/>DSCQS / DSIS]
-    L2 --> PC[Forced choice<br/>2AFC / PC]
-    L2 --> CV[Continuous evaluation<br/>SSCQE video-specific]
+    L2 --> SS[Single-Stimulus Absolute Scoring: MOS / BT.500]
+    L2 --> PC[Paired Comparison: 2AFC Forced Choice]
+    L2 --> StatQC[Quality Control: Catch Trials & SUREAL Filtering]
 
-    L3 --> Down[Downstream task metrics<br/>OCR / detection / recognition]
-    L3 --> AB[Production A/B testing<br/>user behavior]
-    L3 --> Bandit[Multi-armed bandit<br/>dynamic traffic allocation]
+    L3 --> TaskEval[Downstream Benchmarks: OCR / Face Rec / mAP]
+    L3 --> LiveAB[Production A/B Testing & Bandit Allocation]
+    L3 --> FailBank[Curated Failure Case Regression Suite]
 
     style L1 fill:#e8f5e9
     style L2 fill:#fff3e0
     style L3 fill:#ffebee
 ```
 
-This chapter focuses on Layer 2 and Layer 3; the details of Layer 1 are already covered in Chapter 4.
+## 12.1 The Three-Tier Evaluation Hierarchy
 
-## 12.2 MOS: single-image scoring
-
-MOS (Mean Opinion Score) is the most classic form of subjective evaluation.
-
-### Procedure
-
-1. Show the rater an image (the enhancement model's output)
-2. The rater scores on a 5-level Likert scale:
+Comprehensive model evaluation requires concurrent verification across three distinct operational layers:
 
 ```
-1 - Bad (severe artifacts/blur)
-2 - Poor (clear problems)
-3 - Fair (usable but not good)
-4 - Good (high quality)
-5 - Excellent (flawless)
+Layer 1: Automated Objective Metrics
+  PSNR, SSIM, LPIPS, DISTS, FID, MANIQA
+  Characteristics: High throughput, deterministic, zero marginal cost.
+  Limitation: Moderate correlation with human visual preference under severe generative hallucinations.
+
+Layer 2: Standardized Subjective Human Trials
+  MOS, 2AFC, ITU-R BT.500 protocols
+  Characteristics: Direct reflection of human psychophysical perception.
+  Limitation: Labor-intensive, susceptible to rater noise and demographic bias.
+
+Layer 3: Downstream Task Benchmarking & Production A/B Testing
+  Downstream accuracy (OCR CER, ArcFace verification, detection mAP) and live user behavior (like rates, retention)
+  Characteristics: Direct measurement of practical operational utility.
+  Limitation: Requires production infrastructure or task-specific validation sets.
 ```
 
-3. Multiple raters score the same image independently; take the average
-
-### Pros
-
-- **Simple**: raters need no professional training
-- **Scalable**: scoring an image takes seconds, can cover many samples
-- **Task-agnostic**: can compare models across tasks
-
-### Cons
-
-- **Inconsistent scales**: rater A's 4 ≠ rater B's 4 (A is strict, B is lenient)
-- **No reference comparison**: looking at an isolated image, the rater may not know "is this a 4 or a 5"
-- **High data noise**: standard deviation is often ±0.5 points
-
-### Tricks for raising MOS SNR
-
-1. **At least 5-10 raters per image**, take the average to reduce per-rater bias
-2. **Calibration samples**: place a few images of known quality up front (HR ground truth gets 5, severe blur gets 1) so the rater calibrates their own scale
-3. **Z-score normalization**: subtract each rater's own mean and divide by their own std before merging
-
-```python
-import numpy as np
-
-def normalize_mos_scores(scores: dict) -> dict:
-    """
-    scores: {rater_id: {image_id: score}}
-    returns: {image_id: normalized average}
-    """
-    # Z-score each rater's scores
-    normalized = {}
-    for rater, ratings in scores.items():
-        s = np.array(list(ratings.values()))
-        mean, std = s.mean(), s.std() + 1e-8
-        normalized[rater] = {img: (sc - mean) / std for img, sc in ratings.items()}
-
-    # Average across raters
-    image_scores = {}
-    for rater_dict in normalized.values():
-        for img, sc in rater_dict.items():
-            image_scores.setdefault(img, []).append(sc)
-    return {img: np.mean(scs) for img, scs in image_scores.items()}
-```
-
-### MOS is recommended for
-
-- Overall quality evaluation
-- Quality distribution across multiple samples of a single model
-- Cross-task comparison (**not recommended**—different tasks have different baselines)
-
-## 12.3 2AFC: forced choice
-
-2AFC (Two-Alternative Forced Choice) makes raters **directly compare** two candidates.
-
-### Procedure
-
-```
-Show the reference image (HR ground truth)
-Show candidate A (output of model 1)
-Show candidate B (output of model 2)
-Rater chooses: A is closer / B is closer / cannot tell
-```
-
-### Pros
-
-- **Forced comparison**: humans are far more sensitive to "A vs B" than to "absolute scores"
-- **Less data noise**: no need to calibrate scales
-- **Simple statistics**: directly compute preference rate (A's win rate)
-
-### Cons
-
-- **Only pairwise**: 5 models means $\binom{5}{2} = 10$ pairs, each pair with multiple images
-- **No absolute score**: you know A is better than B but not by how much
-- **Order bias**: raters may prefer the option on the left (must randomize)
-
-### Practical recommendation: **more reliable than MOS**
-
-The vast majority of serious paper/product comparisons use 2AFC rather than MOS - unless you are only evaluating the overall quality of one single model.
-
-Drawing a complete paired-comparison (PC) experiment from recruitment to conclusion, the flowchart covers every quality-control point in Sections 12.4 - 12.7:
+## 12.2 Psychophysical Protocols: MOS vs. 2AFC
 
 ```mermaid
 flowchart TD
-    Start[Recruit raters] --> Train[Training session<br/>5-10 anchors to calibrate scale]
-    Train --> Catch[Inject 5-10 percent catch trials<br/>known correct answers]
-    Catch --> Random[Trial randomization<br/>order / left-right / repeated positions]
-    Random --> Vote[Raters complete 2AFC vote<br/>A wins / B wins / tie]
+    Start[Recruit Rater Panel] --> Train[Calibration Phase: Anchor Samples]
+    Train --> Catch[Inject 10% Gold Standard Catch Trials]
+    Catch --> Rand[Randomize Trial Order & Spatial Position]
+    Rand --> Vote[Collect 2AFC Forced-Choice Responses]
 
-    Vote --> QC{Quality control}
-    QC -->|catch trial error rate high| Drop[Drop rater]
-    QC -->|response time less than 5 seconds| Drop
-    QC -->|BT.500 β2 outlier| Drop
-    QC -->|test-retest inconsistent| Drop
-    QC -->|pass| Keep[Keep ratings]
+    Vote --> QC{Automated Quality Audit}
+    QC -->|Failed Catch Trials| Drop[Reject Observer Data]
+    QC -->|Response Time < 2.0s| Drop
+    QC -->|ITU-R BT.500 Outlier| Drop
+    QC -->|Passed Audit| Keep[Accept Observer Data]
 
-    Keep --> Agg[SUREAL joint estimation<br/>q_j / b_i / v_i]
-    Agg --> Stat[Binomial test<br/>+ Bonferroni correction]
-    Stat --> Out[Preference rate + confidence interval<br/>+ report Krippendorff α]
+    Keep --> Agg[SUREAL MLE Latent Score Recovery]
+    Agg --> Stat[Hypothesis Testing: Binomial / Wilcoxon]
+    Stat --> Out[Report Preference Rates, CIs, & Krippendorff α]
 
     style Drop fill:#ffebee
     style Out fill:#e8f5e9
 ```
 
-This diagram is referenced throughout later sections - 12.5 on recruitment and quality control corresponds to the left half, 12.6 on agreement metrics and BT.500 outlier detection corresponds to the middle, 12.7 on SUREAL to the lower right, and 12.11 on statistical testing to the final step.
+### 1. Mean Opinion Score (MOS)
+
+Observers view single images in isolation and assign an absolute scalar rating:
+- $1$: Bad (severe degradation, non-functional)
+- $2$: Poor (substantial visible artifacts)
+- $3$: Fair (acceptable quality, noticeable softening)
+- $4$: Good (high fidelity, minor imperceptible flaws)
+- $5$: Excellent (pristine detail, indistinguishable from high-resolution ground truth)
+
+To eliminate individual observer rating biases, raw scores $s_{ij}$ (rater $i$ on image $j$) are normalized via $Z$-score transformation:
+
+$$
+z_{ij} = \frac{s_{ij} - \mu_i}{\sigma_i + \epsilon}
+$$
+
+### 2. Two-Alternative Forced Choice (2AFC)
+
+In comparative model evaluation, 2AFC protocols yield significantly higher signal-to-noise ratios than single-stimulus MOS. Observers are presented with two candidate outputs $(A, B)$ alongside the conditioning input (or reference ground truth) and forced to select the superior reconstruction.
 
 ```python
-def compute_preference_rate(votes: list) -> dict:
-    """
-    votes: list of (model_a, model_b, winner)
-    returns: {(a, b): a_win_rate}
-    """
-    from collections import defaultdict
-    counts = defaultdict(lambda: {'a_wins': 0, 'b_wins': 0, 'tie': 0, 'total': 0})
+import numpy as np
+from collections import defaultdict
 
-    for a, b, winner in votes:
-        key = tuple(sorted([a, b]))   # normalize direction
-        counts[key]['total'] += 1
+def calculate_preference_win_rates(votes: list) -> dict:
+    """Computes pairwise win rates and preference percentages from 2AFC trial logs.
+
+    votes: list of tuples (model_a, model_b, selected_winner)
+    """
+    records = defaultdict(lambda: {'wins_a': 0, 'wins_b': 0, 'ties': 0, 'total': 0})
+
+    for model_a, model_b, winner in votes:
+        pair_key = tuple(sorted([model_a, model_b]))
+        records[pair_key]['total'] += 1
+
         if winner == 'tie':
-            counts[key]['tie'] += 1
-        elif winner == key[0]:
-            counts[key]['a_wins'] += 1
+            records[pair_key]['ties'] += 1
+        elif winner == pair_key[0]:
+            records[pair_key]['wins_a'] += 1
         else:
-            counts[key]['b_wins'] += 1
+            records[pair_key]['wins_b'] += 1
 
-    return {k: v['a_wins'] / v['total'] for k, v in counts.items()}
+    results = {}
+    for pair, stats in records.items():
+        total = stats['total']
+        results[pair] = {
+            'win_rate_a': stats['wins_a'] / total,
+            'win_rate_b': stats['wins_b'] / total,
+            'tie_rate': stats['ties'] / total,
+            'sample_size': total
+        }
+    return results
 ```
 
-## 12.4 Sample size for subjective evaluation
+## 12.3 Statistical Power and Sample Size Estimation
 
-How many images and how many raters are needed to reach a reliable conclusion?
-
-### Sample size calculation (power analysis)
-
-To detect a 5% preference-rate difference (e.g. A win rate 50% vs 55%) requires:
+To reliably detect a true preference margin $\Delta p = |p_1 - p_2|$ in 2AFC testing with significance level $\alpha = 0.05$ and statistical power $1 - \beta = 0.80$, the required sample size of independent evaluations is governed by:
 
 $$
-n = \left( \frac{z_{1-\alpha/2} + z_{1-\beta}}{p_1 - p_2} \right)^2 \cdot \left( p_1(1-p_1) + p_2(1-p_2) \right)
+N = \left( \frac{z_{1-\alpha/2} + z_{1-\beta}}{\Delta p} \right)^2 \cdot \left( p_1(1-p_1) + p_2(1-p_2) \right)
 $$
 
-Plugging in $\alpha = 0.05$ (significance level), $\beta = 0.2$ (power 0.8), $p_1 = 0.55, p_2 = 0.5$:
+For detecting a $5\%$ preference difference ($p_1 = 0.55, p_2 = 0.50$):
 
 $$
-n \approx 1500 \text{ pairs}
+N \approx \left( \frac{1.96 + 0.84}{0.05} \right)^2 \cdot (0.55 \cdot 0.45 + 0.50 \cdot 0.50) \approx 1{,}550 \text{ pairwise trials}
 $$
 
-In other words, **to reliably distinguish two close models, each pair needs about 1500 2AFC votes**.
+| Detectable Performance Delta ($\Delta p$) | Minimum Required Evaluations ($N$) | Recommended Operational Context |
+|-------------------------------------------|------------------------------------|---------------------------------|
+| $\Delta p = 0.15$ (Coarse Screening) | $\sim 180$ Pairs | Architecture prototype validation |
+| $\Delta p = 0.05$ (Standard Benchmark) | $\sim 1{,}550$ Pairs | Academic peer review submissions |
+| $\Delta p = 0.02$ (Subtle Fine-Tuning) | $\sim 9{,}600$ Pairs | Commercial A/B model deployment |
 
-Common compromises in practice:
+## 12.4 Inter-Rater Reliability and Observer Quality Auditing
 
-- **Coarse screening** (gap 10%+): 100-300 pairs
-- **Normal comparison** (gap 3-5%): 500-1000 pairs
-- **Subtle differences** (gap 1-2%): 3000+ pairs (very expensive)
+Subjective experimental datasets must be validated for inter-observer consistency prior to drawing conclusions.
 
-### Number of raters
+### 1. Krippendorff's $\alpha$
 
-How many distinct raters per image pair? Empirical:
-
-- **Academic papers**: 5-10 distinct raters per pair
-- **Product A/B**: 100+ independent users
-
-## 12.5 Sources of raters
-
-### Amazon Mechanical Turk (AMT)
-
-The most classic crowdsourcing platform. Pros: many people, cheap ($0.01-0.05/task); cons: variable quality.
-
-### Prolific
-
-A more modern alternative. Quality is higher than AMT, price slightly higher ($0.10-0.20/task).
-
-### Self-built platform
-
-Deploy a rating system internally and have employees / recruited volunteers rate. Quality is controllable but sample size is limited.
-
-### Professional evaluation agencies
-
-Specialized video/image evaluation companies (such as Telecom ParisTech IPI lab). Highest quality, highest price (thousands of dollars per batch).
-
-### Rater quality control
-
-Required no matter the platform:
-
-1. **Catch trial**: include 5-10% "obvious-answer" samples (HR vs an extremely poor output); raters must pick correctly
-2. **Test-retest**: rate the same sample twice; remove raters with low consistency
-3. **Time check**: remove raters who score too quickly (< 5 sec/image)
-4. **Multiple raters per item**: a single rater cannot determine ground truth
-
-## 12.6 Inter-rater reliability
-
-Sample size, catch trials — all done. One independent question remains: **do raters actually agree with one another?** If five raters score the same image anywhere from 1 to 5, no amount of averaging makes that result trustworthy — either the image is at a genuine quality boundary (legitimate disagreement) or rater quality is the problem (noisy scoring).
-
-In practice you must compute an agreement statistic as a precondition to trusting the user study at all.
-
-### Cohen's κ (two raters, categorical)
-
-Simplest case: two raters classify items into categories (e.g., "A wins / B wins / tie"). $\kappa$ measures their agreement above chance:
+Krippendorff's $\alpha$ generalizes across arbitrary numbers of observers, missing ratings, and measurement scales:
 
 $$
-\kappa = \frac{p_o - p_e}{1 - p_e}
+\alpha = 1 - \frac{D_o}{D_e}
 $$
 
-$p_o$ is the observed agreement rate, $p_e$ the expected chance agreement. $\kappa = 1$ is perfect, $0$ is chance, $< 0$ is inverse.
-
-Empirical thresholds (Landis & Koch):
-
-- $\kappa < 0.4$: poor
-- $0.4–0.6$: moderate
-- $0.6–0.8$: good
-- $> 0.8$: very good
-
-```python
-from sklearn.metrics import cohen_kappa_score
-kappa = cohen_kappa_score(rater1_labels, rater2_labels)
-```
-
-### Krippendorff's α (multiple raters, multiple data types)
-
-More general: supports any number of raters, missing values, and ordinal / interval / ratio data. **Use ordinal α for MOS, nominal α for 2AFC**.
-
-Empirical thresholds (Krippendorff's own, stricter than κ):
-
-- $\alpha > 0.8$: high agreement, publishable
-- $0.67–0.8$: acceptable for preliminary conclusions
-- $< 0.67$: data is unreliable, conclusions don't hold
+Where $D_o$ is observed disagreement and $D_e$ is expected chance disagreement.
 
 ```python
 import krippendorff
 import numpy as np
 
-# Rows = raters, columns = items, NaN = rater didn't score that item
-ratings = np.array([
-    [4, 3, 5, np.nan, 2],
-    [4, 4, 5, 3, np.nan],
-    [3, 3, 4, 3, 2],
-])
-alpha = krippendorff.alpha(reliability_data=ratings, level_of_measurement='ordinal')
+def compute_inter_rater_reliability(rating_matrix: np.ndarray) -> float:
+    """Calculates Krippendorff's alpha for subjective rating matrices.
+
+    rating_matrix: shape (num_raters, num_images), missing values encoded as np.nan
+    """
+    return krippendorff.alpha(reliability_data=rating_matrix, level_of_measurement='ordinal')
 ```
 
-Practical experience: image-enhancement MOS data typically lands at α between 0.5 and 0.75 — **most public IQA datasets do not reach 0.8**. This means:
+- $\alpha \ge 0.80$: High consensus, standard for published benchmarks.
+- $0.67 \le \alpha < 0.80$: Moderate consensus, acceptable for preliminary exploratory studies.
+- $\alpha < 0.67$: Low consensus, indicating ambiguous task definitions or noisy rater cohorts.
 
-- Don't chase α > 0.8 — there is legitimate perceptual disagreement in this domain
-- But α < 0.5 should raise alarms: either the task is poorly defined or rater quality is poor
+### 2. Maximum Likelihood Score Recovery: SUREAL
 
-### ICC (Intraclass Correlation)
-
-When MOS is continuous / ordinal, papers often prefer ICC over Krippendorff α. ICC(2,k) is the most commonly reported variant:
-
-```python
-import pingouin as pg
-
-# df has three columns: rater, item, score (long format)
-icc = pg.intraclass_corr(data=df, targets='item', raters='rater',
-                          ratings='score', nan_policy='omit')
-print(icc[icc['Type'] == 'ICC2k'])
-```
-
-ICC > 0.75 is considered good, > 0.9 excellent (Koo & Li, 2016).
-
-### Outlier rater detection: BT.500-14 Annex V
-
-ITU-R BT.500-14 (the de-facto standard for video / image subjective assessment) gives a **β2 outlier detection** procedure in Annex V — raters whose scores have kurtosis far from normal are flagged:
-
-```
-For each rater i:
-1. Take their z-scored ratings across all images
-2. Compute β2 (kurtosis estimate) for that distribution
-3. If |β2| > 2, mark as suspicious
-4. Then check their deviation from the group mean: if > ±2σ on more than 5% of items, drop them
-```
-
-ITU's filtering procedure is more systematic than simply "drop people who failed catch trials" and **should be used for serious paper / product evaluations**.
-
-Engineering: see [Netflix's SUREAL library](https://github.com/Netflix/sureal), `bt500.py` for an implementation.
-
-## 12.7 SUREAL: modern MOS estimation
-
-The naive "take the mean across raters per image" assumes all raters are equally trustworthy. Netflix proposed **SUREAL** (Subjective REcovery Algorithm with Latent classes) in 2018, modeling MOS as:
+Rather than computing unweighted sample means, the SUREAL framework (Netflix) models observer ratings as a joint likelihood problem:
 
 $$
-s_{ij} = q_j + b_i + v_i \cdot \epsilon_{ij}
+s_{ij} = q_j + b_i + v_i \cdot \epsilon_{ij}, \quad \epsilon_{ij} \sim \mathcal{N}(0, 1)
 $$
 
-- $s_{ij}$: rater $i$'s score on image $j$
-- $q_j$: true quality of image $j$ (the thing to estimate)
-- $b_i$: rater $i$'s bias ("strict" or "lenient")
-- $v_i$: rater $i$'s inconsistency (high $v$ = noisy)
+Where $q_j$ represents true underlying image quality, $b_i$ represents observer bias, and $v_i$ reflects observer scoring inconsistency. Observers with abnormally high variance $v_i$ are automatically downweighted during score aggregation.
 
-EM iteration jointly estimates $(q, b, v)$ and **simultaneously identifies unreliable raters** (high $v_i$).
+## 12.5 Statistical Significance Testing
 
-### Difference from z-score normalization
+### Continuous Metric Evaluation (LPIPS / DISTS / PSNR)
 
-- **z-score**: each rater normalized independently, assumes each sees a similar distribution
-- **SUREAL**: joint estimation, identifies outlier raters in small samples
-
-In practice: **SUREAL significantly outperforms z-score when each rater scores < 30 images**. Production scenarios (each rater scores only a few dozen items) should use SUREAL.
+Because perceptual loss metrics across matched test sets exhibit spatial autocorrelation and non-normal distributions, use the non-parametric Wilcoxon Signed-Rank Test for paired samples:
 
 ```python
-# Netflix's official implementation
-# pip install sureal
-from sureal.dataset_reader import RawDatasetReader
-from sureal.subjective_model import MosModel, MaximumLikelihoodEstimationModel
+from scipy.stats import wilcoxon, ttest_rel
 
-# MLE model = SUREAL
-model = MaximumLikelihoodEstimationModel(dataset_reader)
-result = model.run_modeling()
-print(result['quality_scores'])     # Estimated true quality per image
-print(result['observer_bias'])      # Bias per rater
-print(result['observer_inconsistency'])  # v per rater
+def evaluate_paired_metric_significance(scores_model_a: list, scores_model_b: list) -> tuple:
+    """Computes paired t-test and non-parametric Wilcoxon signed-rank test."""
+    t_stat, p_param = ttest_rel(scores_model_a, scores_model_b)
+    w_stat, p_nonparam = wilcoxon(scores_model_a, scores_model_b)
+    return {'p_parametric': p_param, 'p_nonparametric': p_nonparam}
 ```
 
-Citing SUREAL instead of raw mean / z-score in user-study sections has become standard in video quality literature post-2020.
+### Multiple Comparison Corrections
 
-## 12.8 ITU-R BT.500: the bible of subjective video / image evaluation
+When simultaneously evaluating $M$ competing model pairs, apply Bonferroni correction to prevent Type I false positive inflation:
 
-For serious subjective evaluation, **ITU-R BT.500-14** (latest 2023 revision) is unavoidable. It defines:
+$$
+\alpha_{\text{adjusted}} = \frac{\alpha_{\text{base}}}{M}, \quad \text{where } M = \binom{K}{2} \text{ for } K \text{ models}
+$$
 
-### Evaluation methods
+## 12.6 Downstream Task Benchmarking
 
-- **DSCQS** (Double-Stimulus Continuous Quality Scale): reference + test shown together
-- **DSIS** (Double-Stimulus Impairment Scale): focus on impairment severity
-- **SS** (Single Stimulus): single-stimulus, similar to MOS
-- **SSCQE** (Single Stimulus Continuous Quality Evaluation): for video, raters score continuously
-- **PC** (Pair Comparison): = 2AFC
-
-### Physical environment standards
-
-- **Viewing distance**: 3–4× screen height (PVD: preferred viewing distance)
-- **Ambient light**: < 20 lux (avoid reflection interference)
-- **Display calibration**: D65 white point, 100–200 cd/m² luminance, contrast per BT.1886 EOTF
-- **Background**: neutral gray (15% reflectance)
-
-Academic papers must report these parameters. AMT / Prolific and other remote crowdsourcing platforms **cannot meet these requirements** — which is why serious papers run both lab and crowdsourcing rounds, calibrating the latter against the former.
-
-### Anchors and training
-
-- A **training session** is required before the experiment (5–10 anchor images covering worst to best) so raters calibrate their scale
-- Training data **does not count toward formal scores**
-
-### Trial randomization
-
-- Image presentation order is independently randomized per rater
-- Left/right order in pair comparisons is randomized
-- Repeated catch-trial images are scattered across positions
-
-The methods in 12.2–12.5 are a simplified form of the BT.500 framework — sufficient for product iteration. **For academic publication, report parameters per BT.500.**
-
-## 12.9 IRB / informed consent / ethics
-
-User studies involve human subjects. **Both academic publication and corporate GDPR compliance require ethics review**, but this is typically glossed over in image-enhancement papers — yet the risk is real.
-
-### Academic: IRB approval
-
-Since 2024, NeurIPS / CVPR / ICCV submission templates require an ethics statement covering:
-
-- Subject recruitment source, sample size, compensation
-- Whether the study went through institutional IRB / Ethics Committee
-- Data retention period and deletion policy
-- Additional protections for NSFW / violent content / images of real people
-
-Cross-border collaborations: EU subjects are protected under GDPR; **US IRB approval does not automatically cover them**.
-
-### Industry: consumer data
-
-When deploying user-study platforms inside companies:
-
-- If employee-rated images are real user data → run PII review
-- Rating-platform log retention: ≤ 30 days post task completion (unless required for compliance)
-- Informed consent: explicitly disclose task nature, payment, sensitive content, right of withdrawal
-
-### Crowdsourcing-platform ethics traps
-
-- AMT pay-rate problem: since 2023, multiple academic IRBs require pay rates ≥ minimum wage in the rater's jurisdiction. $0.01/task + 20s/task = $1.80/hour, which **fails most IRB review boards**.
-- Prolific defaults to $8/hour (UK minimum), saving IRB headaches.
-- Task disclosure: prominently disclose NSFW or real-person content **upfront** so raters can opt in.
-
-Engineering bottom line: budget ≥ $8/hour and obtain institutional IRB approval — the compliance floor since 2024.
-
-## 12.10 Cross-cultural and demographic bias
-
-The last commonly underestimated source of variance: **raters are not homogeneous**.
-
-- **Aesthetic differences**: East Asian raters tend to rate "over-sharpened + high contrast" as "good quality"; Western raters lean toward "natural + low artifacts" — same image's MOS can differ by 0.5
-- **Document / text content**: rater's native language affects judgment of text SR
-- **Devices**: phone-screen raters and desktop raters perceive the same image differently
-- **Professional vs lay**: photographers / designers are more sensitive to color tone, regular users to structure
-
-Engineering practice:
-
-- **Record demographic features**: region, age bracket, device — for post-hoc segmentation analysis
-- **Match the target market**: Asian-market product → Asian panel; cross-region products → at least 2–3 region samples
-- **Disclose in reporting**: paper user-study sections should give a demographic overview
-
-Papers that omit this dimension face challenges to generalizability — a common reviewer complaint in IQA since 2024.
-
-## 12.11 Statistical significance
-
-Before claiming "model A is better than B" you must run a significance test.
-
-### Paired t-test (continuous metrics)
-
-If you compare LPIPS of two models on the same set of test images:
+Evaluating restoration outputs through downstream automated vision models provides an objective, application-grounded metric of practical performance:
 
 ```python
-from scipy import stats
+def benchmark_downstream_ocr_gain(
+    restoration_fn,
+    ocr_engine,
+    degraded_test_loader
+) -> dict:
+    """Quantifies Character Error Rate (CER) reduction from image restoration."""
+    cer_unprocessed = []
+    cer_restored = []
 
-lpips_a = [...]   # LPIPS of model A on N test images
-lpips_b = [...]   # model B
-t_stat, p_value = stats.ttest_rel(lpips_a, lpips_b)
-print(f"t = {t_stat:.3f}, p = {p_value:.4f}")
-```
+    for lr_imgs, ground_truth_texts in degraded_test_loader:
+        # Evaluate baseline degraded input
+        texts_raw = ocr_engine.recognize_batch(lr_imgs)
+        # Evaluate restored output
+        restored_imgs = restoration_fn(lr_imgs)
+        texts_restored = ocr_engine.recognize_batch(restored_imgs)
 
-Only `p < 0.05` allows you to claim statistical significance.
+        for raw_pred, clean_pred, target in zip(texts_raw, texts_restored, ground_truth_texts):
+            cer_unprocessed.append(compute_character_error_rate(raw_pred, target))
+            cer_restored.append(compute_character_error_rate(clean_pred, target))
 
-### Wilcoxon Signed-Rank Test (non-parametric)
-
-LPIPS/PSNR don't necessarily follow a normal distribution; Wilcoxon is more robust:
-
-```python
-from scipy.stats import wilcoxon
-stat, p = wilcoxon(lpips_a, lpips_b)
-```
-
-### Binomial Test (2AFC)
-
-Significance for 2AFC preference rate:
-
-```python
-from scipy.stats import binomtest
-
-# Model A won 540 out of 1000 pairs
-result = binomtest(540, 1000, p=0.5, alternative='two-sided')
-print(f"A win rate 54%, p = {result.pvalue:.4f}")
-```
-
-### Multiple comparison correction
-
-If you are comparing 5 models (10 pairs), p-values must be Bonferroni-corrected: $\alpha_{\text{corrected}} = 0.05 / 10 = 0.005$.
-
-## 12.12 Correlation between automatic metrics and MOS
-
-Correlation between different metrics and human perception (statistics from multiple IQA benchmarks):
-
-| Metric | Spearman correlation with MOS |
-|------|----------------------|
-| PSNR | 0.40 - 0.55 |
-| SSIM | 0.50 - 0.65 |
-| MS-SSIM | 0.55 - 0.70 |
-| **LPIPS** | **0.70 - 0.80** |
-| **DISTS** | **0.72 - 0.82** |
-| **MANIQA** (NR) | **0.75 - 0.85** |
-| FID (distribution-level) | 0.40 - 0.60 |
-
-This tells us:
-
-- **PSNR alone is unreliable** (correlation only 0.4-0.55)
-- **LPIPS/DISTS are the strongest full-reference metrics** (0.7+)
-- **The SOTA NR metric (MANIQA) is already close to LPIPS**—when there's no ground truth in real-world settings, MANIQA is a decent proxy
-
-Engineering practice:
-
-- During training, watch PSNR + LPIPS
-- For papers/reports, beyond PSNR + LPIPS also do subjective evaluation
-- For production deployment, watch MANIQA + user behavior
-
-## 12.13 Real-world: downstream task evaluation
-
-The most convincing evaluation: **does the enhanced image make a downstream task perform better?**
-
-Examples:
-
-### Enhancement + OCR
-
-```python
-# Test set: 1000 low-quality document images
-# Ground truth: known text content
-
-original_ocr_acc  = test_ocr(low_quality_images)         # OCR accuracy on raw images: 65%
-enhanced_ocr_acc  = test_ocr(model_output(low_quality))  # after enhancement: 88%
-
-# This is what "real contribution of the enhancement model to the OCR task" means
-```
-
-### Enhancement + face recognition
-
-```python
-# Test set: 1000 pairs of (low-quality image, high-quality reference)
-# Ground truth: same person or not
-
-original_recognition = face_recognize(low_quality_images, gallery)  # accuracy: 70%
-enhanced_recognition = face_recognize(model_output(...), gallery)   # accuracy: 85%
-```
-
-### Enhancement + object detection
-
-```python
-# Test set: 1000 low-quality surveillance images, with object annotations
-mAP_original = detection_eval(low_quality_images, annotations)  # 0.45
-mAP_enhanced = detection_eval(model_output(...), annotations)   # 0.62
-```
-
-Pros of downstream task evaluation:
-
-- **Directly reflects value**—what customers/users actually care about
-- **No need for human rating**—reuse off-the-shelf downstream models
-- **Objective and reproducible**—accuracy/mAP are absolute numbers
-
-Applicable scenarios:
-
-- Document enhancement → OCR
-- Face enhancement → recognition / verification
-- Surveillance enhancement → detection / person re-identification
-- Satellite enhancement → land cover classification / change detection
-
-Inapplicable scenarios:
-
-- Art restoration (no "task")
-- Beauty filters (user-preference driven)
-
-## 12.14 A/B testing in production
-
-Deploy the new model to a fraction of users, compare against the old model, observe user-behavior changes.
-
-### A/B design
-
-```
-50% of users → old model (control)
-50% of users → new model (treatment)
-```
-
-Monitored metrics:
-
-- **Direct quality metrics** (active user feedback): like rate, report rate, reprocess rate
-- **Behavior metrics**: processing duration, repeat-use rate, subscription conversion rate
-- **Exit metrics**: bounce rate, uninstall rate
-
-```python
-# Simplified A/B report
-def compute_ab_metrics(control_users, treatment_users):
     return {
-        'reprocess_rate':  metric_reprocess(treatment) - metric_reprocess(control),
-        'subscribe_rate':  metric_subscribe(treatment) - metric_subscribe(control),
-        'rating_avg':      rating_avg(treatment) - rating_avg(control),
-        'p_value':         ab_significance_test(control, treatment),
+        'mean_cer_raw': np.mean(cer_unprocessed),
+        'mean_cer_restored': np.mean(cer_restored),
+        'relative_cer_reduction': (np.mean(cer_unprocessed) - np.mean(cer_restored)) / np.mean(cer_unprocessed)
     }
 ```
 
-### Multi-Armed Bandit
+## 12.7 Production A/B Testing Protocols
 
-A more advanced deployment style: have traffic allocation itself adjust dynamically based on results. Models that perform better automatically receive more traffic.
+Deploying restoration models in production environments requires controlled online experimentation:
 
-Engineering implementation: use mature frameworks such as Vowpal Wabbit, Adobe Sensei.
+```mermaid
+graph LR
+    Req[User Request y] --> Router{50/50 Hash Split}
+    Router -->|Control Group| M0[Baseline Model V1]
+    Router -->|Treatment Group| M1[Candidate Model V2]
+    M0 --> Log0[Log User Action & Latency]
+    M1 --> Log1[Log User Action & Latency]
+    Log0 --> Agg[Telemetry Aggregation & Ratio Mismatch Audit]
+    Log1 --> Agg
+    Agg --> Decision{Statistically Significant Gain?}
+    Decision -->|p < 0.01 & 0 Regression| Rollout[100% Production Rollout]
+    Decision -->|p >= 0.01 or Metric Drop| Rollback[Rollback to Baseline]
 
-### Engineering caveats for A/B
-
-1. **Long enough duration**: run for at least 7-14 days to avoid single-day fluctuations
-2. **Avoid Selection Bias**: assign users randomly, do not let users self-select
-3. **Sample Ratio Mismatch**: monitor whether the split is actually 50/50 (infrastructure bugs are common)
-4. **Multiple testing**: simultaneously testing several variants requires Bonferroni correction
-5. **Segmented analysis**: different devices/regions/user segments may react differently
-
-## 12.15 Failure case bank
-
-A model with good average metrics may completely break in **specific scenarios**. **Specifically maintain a failure case bank**—collect known broken inputs and run every new model against this set.
-
-### How to collect
-
-- From user reports (production)
-- Actively constructed (boundary scenarios)
-- Failure cases in papers
-- Complaints on Twitter/Reddit
-
-Typical failure categories (general for image enhancement):
-
-- Extreme low light
-- Extreme high-ISO noise
-- Severe motion blur
-- Extremely small details (small text, distant faces)
-- Multi-face scenes
-- Rare objects (animals other than cats and dogs)
-- Special viewpoints (fisheye, wide-angle)
-- Partial occlusion
-- All kinds of stylized imagery (anime, oil painting, pixel art)
-
-### Metrics for the failure case bank
-
-Beyond the average, also look at:
-
-- **Failure rate**: how many images in this set are visually broken?
-- **New failure modes**: did it introduce problems that didn't exist before?
-
-Engineering practice: every new model version must be run on the failure bank, results archived. **Long-term maintenance** of this set is far more important than benchmark grinding.
-
-## 12.16 Benchmark design
-
-Chapter 4, Section 4.9 covered the bias of academic benchmarks. Here we discuss how to design **your own** benchmark.
-
-### What the test set should include
-
-At least four sources:
-
-1. **Academic benchmarks** (DIV2K val, Set5/14, etc.): for comparison with published methods
-2. **Real degradation data** (RealSR, DRealSR): to test the real distribution
-3. **Domain-specific test set** (your business data): to test actual results
-4. **Failure case bank**: to test robustness
-
-### Diversity audit
-
-Tag every image in the test set (scene, content, degradation level) to ensure distribution coverage:
-
-| Scene | Share |
-|------|------|
-| Indoor | 25% |
-| Outdoor daylight | 30% |
-| Outdoor night | 15% |
-| Documents/screenshots | 10% |
-| People (including faces) | 15% |
-| Other | 5% |
-
-If a category is < 1% in share, failures in that category will not appear in the average metrics.
-
-### The benchmark cannot be optimized
-
-The most important discipline: **your final benchmark must not be used for hyperparameter tuning**.
-
-- Train on the train set
-- Tune hyperparameters on the val set
-- Final evaluation on the test set
-
-If you tweaked hyperparameters in order to grind the test set, the test set is already contaminated. This is the basic principle that machine learning repeatedly violates.
-
-Engineering practice: **keep one "sealed" test set** to be run only once before final release.
-
-## 12.17 Eval pipeline engineering
-
-In real engineering, eval should be automated.
-
-```python
-import json
-from pathlib import Path
-
-class EvalPipeline:
-    def __init__(self, model, datasets: dict, metrics: dict):
-        """
-        datasets: {name: dataloader}
-        metrics: {name: callable(pred, target) -> float}
-        """
-        self.model = model
-        self.datasets = datasets
-        self.metrics = metrics
-
-    @torch.no_grad()
-    def run(self, output_dir: Path) -> dict:
-        results = {}
-        for ds_name, loader in self.datasets.items():
-            ds_results = {m: [] for m in self.metrics}
-            for batch in loader:
-                lr, hr = batch['lr'], batch['hr']
-                pred = self.model(lr.cuda())
-                for m_name, m_fn in self.metrics.items():
-                    score = m_fn(pred, hr.cuda())
-                    ds_results[m_name].extend(score.cpu().tolist())
-            results[ds_name] = {
-                m: {
-                    'mean':  np.mean(scores),
-                    'std':   np.std(scores),
-                    'count': len(scores),
-                }
-                for m, scores in ds_results.items()
-            }
-
-        # Save results
-        output_dir.mkdir(parents=True, exist_ok=True)
-        with open(output_dir / 'results.json', 'w') as f:
-            json.dump(results, f, indent=2)
-        return results
+    style Router fill:#e3f2fd
+    style Decision fill:#fff3e0
+    style Rollout fill:#e8f5e9
+    style Rollback fill:#ffebee
 ```
 
-Engineering essentials:
+### Production Telemetry Indicators
 
-- **Reproducible**: fixed random seed, version number, commit ID
-- **Persistent**: every eval result is written to disk, kept long-term
-- **Comparable**: able to diff eval results across commits
-- **Visualized**: automatically generate comparison images and tables
+- **Active User Engagement**: Download rates, direct share rates, zoom-in interaction duration.
+- **Negative Feedback Signals**: Reprocess / retry rates, manual filter cancellation, in-app defect reports.
+- **Systems Performance**: $P_{95}$ / $P_{99}$ inference latency, peak GPU VRAM allocation, client memory pressure.
 
-## 12.18 Standards for paper experimental reporting
+## 12.8 Maintaining Curated Failure Case Suites
 
-When writing a paper / technical report, the eval section should include:
+To prevent silent performance regressions during model iteration, engineering teams should maintain a persistent, version-controlled **Failure Case Regression Suite**:
 
-1. **Datasets**: list each, including version numbers
-2. **Metrics**: PSNR + SSIM + LPIPS + DISTS + at least one NR metric
-3. **Comparison methods**: include 5+ public SOTA + a simple baseline
-4. **Multiple runs**: run each setup at least 3 times, report mean ± std
-5. **Failure cases**: required, otherwise reviewers will request them
-6. **Subjective evaluation** (if it is a perception-end method)
-7. **Downstream tasks** (if the method targets helping downstream tasks)
-8. **Ablation studies**: ablate each design decision
+1. **Extreme Lighting**: High-ISO sensor shot noise, severe underexposure, mixed non-uniform illumination.
+2. **Pathological Blur**: Complex non-linear motion trajectories, defocus coupled with camera shake.
+3. **Small-Scale Semantics**: Micro-typography (< 12px font), distant crowd faces (< 24px bounding boxes).
+4. **Out-of-Distribution Imagery**: Synthetic illustrations, line art, anime, graphical UI screenshots.
 
-Many papers skip 4, 5, 6, and the result is reviewer skepticism or failed reproductions.
+Each prospective model release must execute evaluation over this curated suite, verifying that average benchmark improvements do not introduce severe local visual regressions.
 
-## 12.19 Common evaluation antipatterns
+## 12.9 Chapter Summary
 
-A few to avoid in engineering:
-
-### Antipattern 1: only showing cherry-picked images
-
-"Look how well this old photo is restored!"—what about the failure cases you didn't show?
-
-### Antipattern 2: comparing against outdated methods
-
-Only comparing to ESRGAN (2018), not to SwinIR/HAT/SUPIR.
-
-### Antipattern 3: only reporting PSNR
-
-"Our PSNR is 0.3 dB higher than theirs"—high PSNR does not imply good visual quality.
-
-### Antipattern 4: training data contains the test set
-
-Inadvertently including images similar to the test set in training.
-
-### Antipattern 5: "by feel" hyperparameter selection
-
-Each eval is different, with no traceability to why this number was chosen.
-
-## 12.20 Summary
-
-1. **Three layers of evaluation**: automatic metrics + subjective evaluation + downstream tasks, validating each other
-2. **MOS is simple but noisy**, 2AFC's forced comparison has higher SNR, **prefer 2AFC**
-3. **Sample size requires power analysis**: 1000+ pairs is the lower bound for a serious experiment
-4. **Rater quality control**: catch trial, test-retest, time check
-5. **Inter-rater reliability**: Krippendorff α / ICC are the precondition for trusting a user study; BT.500-14 Annex V β2 outlier detection drops anomalous raters
-6. **Estimate MOS via SUREAL** (Netflix's MLE method) instead of raw mean / z-score — significantly more stable for small samples
-7. **For serious subjective evaluation, follow ITU-R BT.500-14**: DSIS/DSCQS/PC, viewing distance, ambient light, display calibration, anchor training — all parameters reported per standard
-8. **IRB / informed consent is the compliance floor**: NeurIPS/CVPR have required ethics statements since 2024; crowdsourcing pay rate ≥ $8/h
-9. **Cross-cultural and demographic bias is a real variance source**: report rater demographics; match the target market
-10. **Statistical significance**: t-test/Wilcoxon for continuous metrics, binomial test for 2AFC, Bonferroni for multiple comparisons
-11. **Correlation between automatic metrics and MOS**: LPIPS/DISTS/MANIQA ~0.75, PSNR only 0.4-0.55
-12. **Downstream task evaluation is the most convincing**: OCR accuracy, face recognition rate, detection mAP
-13. **A/B testing is the de facto standard in production**: monitor user behavior metrics
-14. **Failure case bank**: maintained long-term, more important than average metrics
-15. **Benchmarks must not be used for hyperparameter tuning**: keep a sealed test set
-
-That completes Part III's training and evaluation chapters. Part IV moves into video—video is not just "images plus time"; temporal consistency is an independent problem.
+1. **The Three-Tier Verification Protocol**: Sound model evaluation combines automated objective metrics, standardized subjective human trials, and downstream task benchmarks.
+2. **2AFC Superiority**: Two-Alternative Forced Choice protocols eliminate subjective scale calibration noise, providing superior statistical power over isolated Mean Opinion Scores.
+3. **Reliability and Outlier Auditing**: Measuring inter-rater consensus via Krippendorff's $\alpha$ and applying SUREAL maximum likelihood scoring rejects anomalous raters.
+4. **Hypothesis Testing Rigor**: Claims of algorithmic superiority require non-parametric significance testing (Wilcoxon, Binomial) alongside Bonferroni multiple-comparison adjustments.
+5. **Continuous Regression Testing**: Maintaining dedicated failure-case test banks prevents production deployment regressions obscured by global benchmark averages.
 
 ---
 
-> Next chapter [Video is Not Just Images Plus Time](13-video-basics.md) → temporal consistency, optical flow, the specifics of video degradation.
+> Next: [Video Restoration Fundamentals and Temporal Dynamics](13-video-basics.md) transitions from static image processing to video sequences, analyzing temporal coherence, optical flow alignment, and inter-frame propagation.
