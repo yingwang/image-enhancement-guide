@@ -1,79 +1,60 @@
-# 第 9 章 · 扩散的条件控制
+# 第 9 章 · 扩散模型的条件控制机制
 
-> 第 8 章讲了扩散模型的基础：给定噪声、预测去噪。
+> 第 8 章确立了扩散模型的生成机理：通过参数化反向去噪过程建模先验分布。
 >
-> 但影像增强任务的关键不在去噪能力，在**怎么让扩散模型听话**：既利用它的生成能力（创造合理细节），又严格遵守 LR 输入（不偏离原图）。
+> 然而在图像增强与逆问题中，核心工程挑战在于**如何精准约束生成轨迹**：在充分激活生成先验（补充缺失高频细节）的同时，严格受控于退化观测输入（防止语义偏移与结构失真）。
 >
-> 这一章是过去三年这个领域最活跃的工程战场。
+> 条件控制机制是连接无约束生成与确定性复原的工程桥梁。
 
 ## 9.0 阅读须知
 
-这一章紧接着第 8 章。第 8 章把扩散模型的"生成器"部分讲清楚了：给定一个潜空间噪声 $x_T$，UNet + 采样器能采出一张符合自然图像分布的 $\hat{x}_0$。但这只是"无条件生成"：结果可以是任何图。增强任务要做的是**条件生成**：给定退化图 $y$，从 $p(x \mid y)$ 里采样出与 $y$ 内容一致、质量更高的 $\hat{x}$。本章讲怎么把 $y$ 这个条件接进扩散过程，以及不同接法在 fidelity（保真）和 creativity（生成自由度）之间如何取舍。
+第 8 章阐明了无条件扩散模型的数据生成逻辑：从潜空间随机高斯噪声 $x_T$ 出发，经 UNet 迭代去噪能够采样出服从自然图像分布的样本 $\hat{x}_0$。而在图像增强场景中，任务目标为**条件后验采样**：给定退化观测 $y$，从后验概率分布 $p(x \mid y)$ 中采样出与 $y$ 空间拓扑严格对齐、分辨率更高且细节真实的解 $\hat{x}$。
 
-读这一章前，假设你已经熟悉第 8 章的：
+本章系统剖析将退化观测 $y$ 注入扩散反向轨迹的核心范式，深入探讨保真度（Fidelity）与生成自由度（Creativity）之间的工程权衡。
 
-- 前向加噪与反向去噪、$\bar{\alpha}_t$、$\epsilon$-prediction
-- DDIM / DPM-Solver 等采样器
-- LDM 的潜空间结构、SD UNet 的 ResBlock + Spatial Transformer
-- CFG 在推理时的两路前向
+阅读前提：
 
-本章会反复出现的缩写：
+- 第 8 章：前向加噪、反向迭代、$\bar{\alpha}_t$ 与 $\epsilon$-prediction 参数化；
+- DDIM 与 DPM-Solver 等快速常微分方程采样器；
+- LDM 潜空间表征及 SD UNet 的 ResBlock 与 Spatial Transformer 内部拓扑；
+- Classifier-Free Guidance（CFG）无分类器引导机制。
 
-- **SDEdit**（Stochastic Differential Editing，Meng et al. 2022）：把 $y$ 加噪到中间时间步，再用无条件扩散反向去噪，得到"被引导的随机样本"。最便宜的条件方案，零额外训练
-- **SR3**（Super-Resolution via Repeated Refinement，Saharia et al. 2022）：早期用 input concat 把 LR 接入扩散 UNet 的代表
-- **StableSR**（Wang et al. 2023）：基于 SD 的真实场景超分，在冻结 SD 上挂一个 time-aware encoder，特征经 SFT 注入 UNet，解码端用 CFW。既不是 input concat 也不是 ControlNet，属独立范式
-- **DiffBIR**（Lin et al. 2023）：Blind Image Restoration with Diffusion，两阶段设计。Stage-1 用 SwinIR 类网络去退化，Stage-2 用 IRControlNet（ControlNet 式并联）注入冻结 SD，不走 CLIP image cross-attention
-- **SUPIR**（Yu et al. 2024）：SDXL + ControlNet + LLaVA prompt，2024 年 real-world SR 的代表
-- **ControlNet**（Zhang & Agrawala 2023）：复制 UNet encoder + zero conv，扩散条件控制的事实标准
-- **T2I-Adapter**（Mou et al. 2023）：比 ControlNet 更轻量的条件适配器
-- **IP-Adapter**（Image Prompt Adapter，Ye et al. 2023）：把图像作为 prompt 注入扩散，解耦 cross-attention
-- **PnP / Plug-and-Play**（Tumanyan et al. 2023）：训练自由的扩散控制方法，靠 inversion + 特征注入做编辑
-- **null-text inversion**（Mokady et al. 2023）：DDIM inversion 的精度增强，常用于编辑任务
-- **CFW**（Controllable Feature Wrapping）：StableSR 提出的推理时可调融合，源自 CodeFormer 的可控特征变换，与光流/形变无关
-- **ZeroSFT**（Zero Spatial Feature Transform）：SUPIR 用的特征调制变体
-- **LoRA**（Low-Rank Adaptation）：低秩微调，常和 ControlNet 一起出现
-- **LCM**（Latent Consistency Model）：第 8 章介绍过的 4 步采样蒸馏方法
+**核心术语与缩写索引：**
 
-本章默认所有"扩散模型"指 SD / SDXL 这一支基于 LDM 的实现，不展开像素扩散（GLIDE 系等）的细节，因为生产端几乎全在潜空间。
+- **SDEdit**（Stochastic Differential Editing）：Meng 等人于 2022 年提出，将退化观测加噪至中间时间步后执行无条件反向去噪，无需重新训练即可实现基于先验的图像重构。
+- **SR3**（Super-Resolution via Repeated Refinement）：Saharia 等人于 2022 年提出的早期超分辨率扩散模型，采用输入通道直接拼接（Input Concat）注入低分辨率先验。
+- **StableSR**：Wang 等人于 2023 年提出，基于冻结的 Stable Diffusion 主干，通过外挂时间感知编码器（Time-aware Encoder）与空间特征变换（SFT）实现特征级注入，并在解码端配置可控特征包裹（CFW）调节保真度。
+- **DiffBIR**：Lin 等人于 2023 年提出的两阶段盲图像恢复模型。第一阶段使用 SwinIR 变体去除退化，第二阶段通过 IRControlNet 并联模块注入冻结的 SD 主干（不使用 CLIP 图像跨注意力）。
+- **SUPIR**：Yu 等人于 2024 年提出的真实场景超分辨率架构，融合 SDXL 基座、ZeroSFT 门控 ControlNet、LLaVA 文本提示以及恢复引导采样（Restoration-Guided Sampling）。
+- **ControlNet**：Zhang 等人于 2023 年提出，通过克隆 UNet 编码器分支并配合零卷积（Zero Convolution），成为扩散条件控制的通用标准架构。
+- **T2I-Adapter**：Mou 等人提出的轻量级外部条件引导网络，直接将特征图逐级加注至 UNet 编码器。
+- **IP-Adapter**（Image Prompt Adapter）：Ye 等人提出的解耦跨注意力机制，为图像提示词构建独立的 Attention 通道，避免文本语义表征漂移。
+- **CFW**（Controllable Feature Wrapping）：StableSR 中用于在解码阶段线性调节生成质量与像素保真度的特征变换模块。
+- **ZeroSFT**（Zero Spatial Feature Transform）：SUPIR 中采用的空间特征仿射变换调制层，通过零初始化保证训练初期的平滑过渡。
 
-## 9.1 核心问题：fidelity vs creativity
+## 9.1 核心矛盾：保真度（Fidelity）与生成自由度（Creativity）
 
-第 8 章末尾讲过扩散的"无中生有"能力，这既是它的优势，也是它的危险。
+在图像增强任务中，过度追求生成自由度与过度约束保真度均会导致不良结果：
 
-放大同一张老人脸 LR 图，扩散模型可能：
+- **过度约束输入（Over-constraint）**：模型退化为近似恒等映射，输出图像依然模糊，未能有效发挥扩散模型的先验生成能力；
+- **过度自由发挥（Hallucination / 幻觉伪影）**：模型脱离退化图像的物理几何约束，凭空生成不符合原图身份或文字拓扑的虚假纹理；
+- **最优工程平衡点**：在全局空间轮廓、边缘骨架与身份特征上严格依从原图，在局部高频纹理与微观结构上由扩散先验自适应填充。
 
-- **过强遵守 LR**：输出和 LR 一模一样，糊得不行（没利用生成能力）
-- **过弱遵守 LR**：编造细节，脸变了样（生成能力失控）
-- **平衡**：遵守 LR 的整体结构、用生成能力补合理细节
+条件控制机制的本质是：**在去噪轨迹的每个迭代步，动态将退化观测的特征约束投影至当前生成的特征切空间中**。
 
-如何控制这个平衡点，就是本章的主题。
+## 9.2 五种条件注入范式概览
 
-> 影像增强里"条件控制"的实质：
->
-> 让模型在每一步去噪时，都把"$\hat{x}_0$ 应该接近 $y$"这个约束**注入**进采样过程。
+| 条件控制范式 | 特征注入位置 | 代表性工作 | 显存与训练开销 | 空间约束强度 |
+|-------------|-------------|-----------|---------------|-------------|
+| **Input Concat** | UNet 输入第一层通道 | SR3 / LDSR | 低（仅需微调输入层或小范围全调） | 中等（深层易发生梯度稀释） |
+| **Cross-Attention** | Spatial Transformer 交叉注意力 | IP-Adapter / 语义注入 | 中等（训练额外投影矩阵） | 弱（偏向全局语义与风格） |
+| **ControlNet** | UNet 跳跃连接（Skip Connections） | SUPIR / DiffBIR | 较高（复制 Encoder 分支） | 强（像素级几何与结构对齐） |
+| **IP-Adapter** | 解耦并行 Cross-Attention | 风格与身份保持 | 较低（新增参数量 < 100M） | 中等（局部纹理与色彩迁移） |
+| **Tile + ControlNet** | 局部重叠滑动窗口推断 | 超大分辨率增强 | 无需重训（推断策略） | 强（支持超大分辨率缝合） |
 
-不同的注入方式（concat、cross-attention、ControlNet、IP-Adapter）效果差别很大。这一章把它们讲清楚。
+注：StableSR 作为独立范式，在冻结主干外挂时间感知编码器并经由 SFT 注入中间层，下文 §9.8 将单独论述。
 
-## 9.2 五种条件注入范式
-
-总览：
-
-| 范式 | 注入位置 | 代表方法 | 训练成本 | 控制强度 |
-|------|---------|---------|---------|---------|
-| **Input Concat** | UNet 输入通道 | SR3 | 低（改输入） | 中 |
-| **Cross-Attention** | UNet 内部 attention | IP-Adapter | 中（训 cross-attn） | 弱（语义级） |
-| **ControlNet** | UNet 中间层加和 | SUPIR、DiffBIR | 高（复制 encoder） | 强 |
-| **IP-Adapter** | 解耦 cross-attention | 风格/身份保持 | 中 | 中 |
-| **Tile + ControlNet** | 局部条件 | 大图增强 | （推理 trick） | 强 |
-
-StableSR 不在上表任何一行：它既不是 input concat 也不是 ControlNet，而是在冻结 SD 上挂一个 time-aware encoder、特征经 SFT 注入 UNet、解码端用 CFW 的独立范式，9.8 节单独讲。
-
-除此之外还有两类**训练自由**的方法，靠在采样过程动手脚而不重训权重：
-
-- **SDEdit**：把 $y$ 加噪到 $t^* \ll T$ 然后无条件采样回 0，相当于"用扩散先验对 $y$ 做一次随机重塑"
-- **PnP / null-text inversion / classifier guidance**：通过 inversion 拿到 $y$ 对应的 $x_T$，然后在反向过程中注入额外约束
-
-这些训练自由方法在生产里偶有用处（特别是没数据训 ControlNet 的时候）。SDEdit 因为足够典型也足够便宜，下面单独画一张数据流图，让读者先建立"训练自由"这条线的直觉：
+此外，以 **SDEdit** 为代表的免微调（Training-free）方案通过截断时间步实现了轻量级条件控制：
 
 ```mermaid
 graph LR
@@ -81,19 +62,17 @@ graph LR
     VAE1 --> Z0[z_0 latent]
     Z0 --> Add[+ 高斯噪声 加到 t*<br/>t* in 100, 600 中选]
     Add --> ZT[z_t*<br/>带噪 latent]
-    ZT --> Loop{反向采样<br/>无条件 UNet<br/>t = t*, t*-1, ..., 1}
     Loop --> Z0p[ẑ_0]
     Z0p --> VAE2[VAE decode]
     VAE2 --> Xhat[x̂<br/>结构来自 y<br/>细节由扩散先验补]
+    ZT --> Loop{反向采样<br/>无条件 UNet<br/>t = t*, t*-1, ..., 1}
 
     style Y fill:#ffebee
     style Xhat fill:#e8f5e9
     style Loop fill:#fff3e0
 ```
 
-SDEdit 的关键参数是中间时间步 $t^*$：$t^*$ 越大噪声加得越狠，模型自由度越高（生成端走更远，可能改变内容）；$t^*$ 越小越保留输入结构（接近恒等映射）。这两个极端正是后面 9.3 节 fidelity-creativity 谱的两端，只不过 SDEdit 通过一个数值就能滑动。
-
-**没有哪个范式全胜**：选哪个看任务和预算。下面这张图把五种范式的注入位置画在同一张 UNet 上，便于对比：
+下图展示了各条件注入范式在 UNet 内部拓扑上的作用节点：
 
 ```mermaid
 graph LR
@@ -114,150 +93,77 @@ graph LR
     style Out fill:#e8f5e9
 ```
 
-可以看到，不同范式作用点不同：concat 在最浅层、cross-attention 与 IP-Adapter 在每一层 attention 块、ControlNet 在 encoder 的所有 skip 上。一般来说**注入位置越深越广，控制越强但训练成本越高**。
+## 9.3 保真度与自由度的工程量化含义
 
-## 9.3 Fidelity vs Creativity 的工程含义
+根据第 4 章的感知失真权衡理论：
+- **高保真度（High Fidelity）**：像素级对齐，PSNR/SSIM 指标优异，但视觉质感偏向保守与平滑；
+- **高创造度（High Creativity）**：感知质感突出（LPIPS/FID 极佳），但在高倍率缩放下存在不可控的幻觉细节。
 
-把 perception-distortion trade-off（第 4 章 4.8 节）放到扩散语境下：
+工业落地的关键在于为终端用户提供**推断时可连续调节的权重滑块**，使同一套预训练权重能够灵活适配监控安防、人像精修与艺术重绘等不同业务场景。
 
-- **Fidelity 高**：输出像素一致性强，PSNR/SSIM 高，但视觉死板
-- **Creativity 高**：模型自由发挥，视觉惊艳但可能编造（"幻觉"）
+## 9.4 范式一：输入通道拼接（Input Concat）
 
-两个极端对应不同的应用：
-
-- 监控录像→ 高 fidelity（不允许编人脸）
-- 老照片修复 → 中等（结构保留，细节生成）
-- 艺术放大、4K 直播创意增强 → 高 creativity（视觉冲击为主）
-
-这一章讲的所有技术都是为了**让用户能在这条曲线上选点**：不仅训练时选，**推理时也能调**。
-
-## 9.4 范式一：Input Concat
-
-最简单的条件注入：把 LR 的 latent **拼到** UNet 的输入通道。
-
-UNet 输入从 $(B, 4, h, w)$ 变成 $(B, 8, h, w)$，前 4 通道是当前噪声 latent，后 4 通道是 LR latent。
+输入通道拼接将低分辨率图像的潜空间表征与当前时间步的带噪潜变量在通道维度直接串联：输入张量尺寸由 $(B, 4, h, w)$ 扩展为 $(B, 8, h, w)$。
 
 ```python
-def diffusion_step_concat(unet, x_t, lr_latent, t):
-    """Input concat 风格的条件注入。"""
-    inp = torch.cat([x_t, lr_latent], dim=1)  # (B, 8, h, w)
-    return unet(inp, t)
-```
-
-修改 UNet 第一层 conv 接受 8 通道输入：
-
-```python
+import torch
 import torch.nn as nn
 
-# 原 UNet 第一层
-old_conv = unet.conv_in  # in_channels=4
+def modify_conv_in_for_concat(unet: nn.Module) -> nn.Module:
+    """修改 UNet 第一层卷积以支持 8 通道输入。"""
+    old_conv = unet.conv_in
+    new_conv = nn.Conv2d(8, old_conv.out_channels, kernel_size=3, padding=1)
 
-# 替换成 8 通道输入
-new_conv = nn.Conv2d(8, old_conv.out_channels, kernel_size=3, padding=1)
+    with torch.no_grad():
+        # 前 4 通道继承预训练权重, 后 4 通道零初始化
+        new_conv.weight[:, :4] = old_conv.weight
+        new_conv.weight[:, 4:] = 0.0
+        new_conv.bias[:] = old_conv.bias
 
-# 重要: 只 copy 前 4 通道的权重, 后 4 通道初始化为 0
-with torch.no_grad():
-    new_conv.weight[:, :4] = old_conv.weight
-    new_conv.weight[:, 4:] = 0
-    new_conv.bias[:] = old_conv.bias
-
-unet.conv_in = new_conv
+    unet.conv_in = new_conv
+    return unet
 ```
 
-后 4 通道初始化为 0 让训练初期 UNet 行为接近原模型，LR 信号慢慢起作用。
+### 工程特性评估
 
-### Input Concat 的优缺点
+- **优点**：结构改动极小，仅需微调首层卷积；推断阶段无需额外的前向计算分支；
+- **缺陷**：条件信息仅在最外层注入，随着网络深度增加，深层特征中的退化约束容易被多层非线性变换稀释；难以在推断阶段动态调节引导强度。
 
-**优点**：
+## 9.5 范式二：跨注意力机制注入（Cross-Attention）
 
-- 最简单，几行代码改完
-- 训练时只需要 fine-tune（UNet 大部分权重保留）
-- 推理时无额外开销
-
-**缺点**：
-
-- LR 信息只在第一层注入，**深层信息会被稀释**
-- 不容易调"控制强度"
-- 对 LR 的尊重度不够（高 t 时，UNet 更"自由发挥"）
-
-**SR3**（Saharia et al. 2022）是这种简单形式的早期代表：效果不错，但 fidelity 不够强，深层信息容易被稀释，后来的真实场景方法大多转向 ControlNet 或独立的 side-encoder 注入（如 StableSR）。
-
-## 9.5 范式二：Cross-Attention 注入
-
-不在输入层注入，在 UNet 内部的 cross-attention 注入：把 LR 通过某个 image encoder 编成 token，作为 cross-attention 的 KV。
-
-最常见的 image encoder：CLIP。流程：
-
-```
-LR image
-  ↓ CLIP image encoder
-  ↓ (B, T_img, D)  image tokens (代替原 SD 的 text tokens)
-  ↓ 注入到 UNet 每层的 cross-attention
-```
+利用图像编码器（如 CLIP ViT）提取退化图像的 Patch-level Token 序列，替代或补充原有的文本 Token 作为 Spatial Transformer 内部 Cross-Attention 的 Key 与 Value。
 
 ```python
-import open_clip
+import torch
+import torch.nn as nn
 
-class CLIPImageEncoder(nn.Module):
-    def __init__(self):
+class CLIPImageTokenEncoder(nn.Module):
+    """提取图像 Patch Token 作为跨注意力上下文。"""
+
+    def __init__(self, clip_model, projection_dim: int = 768):
         super().__init__()
-        self.clip, _, _ = open_clip.create_model_and_transforms('ViT-L-14')
-        self.proj = nn.Linear(self.clip.visual.output_dim, 768)  # 对齐 SD context dim
+        self.clip = clip_model
+        self.proj = nn.Linear(clip_model.visual.output_dim, projection_dim)
 
-    def forward(self, lr_img):
-        # 取 CLIP 倒数第二层的 patch tokens (而不是最终 [CLS])
-        feat = self.clip.encode_image(lr_img, return_tokens=True)
-        # feat: (B, T, D), 通常 T=257 for ViT-L/14
-        return self.proj(feat)
+    def forward(self, lr_img: torch.Tensor) -> torch.Tensor:
+        # 获取倒数第二层的 Patch-level Token
+        patch_tokens = self.clip.encode_image(lr_img, return_tokens=True)
+        return self.proj(patch_tokens)
 ```
 
-UNet 的 cross-attention 不变（参考第 8 章 8.8 节），只是 KV 来源从 text encoder 换成 image encoder。
+**适用场景与局限**：适用于全局色彩、光照与语义风格的迁移控制；但由于 CLIP 编码过程丢弃了细粒度的空间坐标对应关系，纯 Cross-Attention 无法保证文字、人脸五官等局部几何的严格像素级对齐。
 
-### Cross-Attention 注入的特点
+## 9.6 范式三：ControlNet 拓扑与零卷积机制
 
-**适合**：
+Zhang 与 Agrawala 提出的 ControlNet 是目前扩散结构控制的工业标准范式。
 
-- LR 信息以**语义级**为主（需要保持是猫还是狗，不需要逐像素一致）
-- 风格 transfer 类任务
+### 核心架构原理
 
-**不适合**：
+1. **冻结主干权重**：保持预训练扩散模型 UNet 权重不变，完整保留海量预训练数据赋予的自然图像分布先验；
+2. **克隆编码器分支（Trainable Copy）**：完整复制 UNet 的 Encoder 与 Middle Block 作为独立的控制特征提取分支；
+3. **零卷积（Zero Convolution）桥接**：在 ControlNet 的各层输出接入权重与偏置均初始化为 0 的 1×1 卷积，直接加注至主干 UNet 的对应跳跃连接（Skip Connection）。
 
-- 高 fidelity SR（CLIP embedding 丢失了像素级信息）
-- 文档/小字增强（结构信息靠 patch token 不够）
-
-把图像编码成 token 走 cross-attention，这一路最干净的落地是 9.6b 要讲的 IP-Adapter（解耦式图像 prompt）。这里需要澄清一个常见误解：DiffBIR（Lin et al. 2023）常被说成"CLIP image cross-attention + ControlNet"，其实它不走图像 cross-attention。DiffBIR 是两阶段设计，靠 ControlNet 式的结构注入，归在下一节的 ControlNet 路线里讲。
-
-## 9.6 范式三：ControlNet（本章主角）
-
-Zhang & Agrawala (2023) 的 ControlNet 是扩散控制的**事实标准**。它的核心设计：
-
-> 复制一份 UNet 的 encoder，专门处理"控制信号"，输出**加和**到主 UNet 对应层的 skip connection。
-
-主 UNet 完全不动（保留预训练权重），ControlNet 是一个**外挂**。这种设计的优势：
-
-1. **保留预训练知识**：主 UNet 的所有能力（包括 text-to-image 的语义理解）不变
-2. **训练参数比全量微调小**：ControlNet 复制主 UNet 的 encoder + mid block，可训练参数约为主 UNet 的 0.4–0.5×（SD 1.5 上 ControlNet ≈ 360M vs 主 UNet ≈ 860M）。但**显存开销不可控**：前向时主 UNet 仍要全量参与算 skip features，反向只有 ControlNet 那部分有梯度。SDXL 上单卡训 ControlNet 实测仍要 40GB+，不是 LoRA 那种"小成本"
-3. **可以堆叠**：多个 ControlNet 同时作用（一个管 LR、一个管 edge map、一个管 depth map）
-
-### ControlNet 的具体结构
-
-```
-                  Main UNet (frozen)
-                  
-LR ──→ Encoder copy ──→ Mid block copy
-        (trainable)       (trainable)
-              │              │
-              ↓ zero conv    ↓ zero conv
-              │              │
-              ▼              ▼
-       UNet skip 1-12    UNet mid
-              │              │
-              └──→ 加到主 UNet 对应位置
-              
-Output (B, 4, h, w) noise prediction
-```
-
-把这个 ASCII 图换成 mermaid 数据流，看得更清楚：主 UNet 是冻结的 SD 权重，左下角的 trainable copy 只在 encoder + mid 上有梯度，输出经过 zero conv 加到主 UNet 的 skip 上。
+下图展示了 ControlNet 与主 UNet 的数据交互流向：
 
 ```mermaid
 graph LR
@@ -289,150 +195,32 @@ graph LR
     style EpsOut fill:#e8f5e9
 ```
 
-几个细节值得在图里反复看：
+### 零卷积（Zero Convolution）的数学稳定性保证
 
-- 主 UNet 全部前向都跑（红色虚线没标但永远是必走的路径），所以 ControlNet 的"训练成本低"指的是反向梯度只走 trainable copy，前向显存仍要装下主 UNet
-- ControlNet 的输入是 $x_t$ 和 LR latent 的 concat（与第 9.4 节的"input concat"路线重叠），区别在 concat 走的是一份独立的 encoder 复制，而不是替换主 UNet 第一层
-- zero conv 把每层 ControlNet 输出收敛回 0，让训练初期主 UNet 行为不变；这一点和 LoRA 把适配器初始化为 0 矩阵是同一思想
-- ControlNet 输出加到主 UNet 的 **skip connection** 上（不是替换、不是 cross-attention），所以主 UNet 拿到的是"自己的 skip 特征 + 一点条件偏移"，对预训练知识破坏最小
+设主干 UNet 某层的特征表示为 $h_m$，ControlNet 对应层的输出为 $h_c$。注入后的融合特征为：
 
-### Zero Convolution：核心 trick
+$$
+h_m' = h_m + \mathcal{Z}(h_c; \mathcal{W}_z, \mathbf{b}_z)
+$$
 
-ControlNet 输出加到主 UNet 之前，过一个 **zero-initialized 1×1 conv**，初始权重全为 0。
+由于零卷积的初始权重 $\mathcal{W}_z = \mathbf{0}$ 且偏置 $\mathbf{b}_z = \mathbf{0}$，在训练初始状态下 $\mathcal{Z}(h_c) \equiv \mathbf{0}$，因此 $h_m' = h_m$。
 
-为什么这个细节重要？
-
-- 训练初期，ControlNet 输出乘 0 = 0，**对主 UNet 完全无影响**
-- 这意味着训练前期模型行为等同于原 SD（没有质量退化风险）
-- ControlNet 的权重慢慢学到非零，控制信号渐强
+这一设计确保了：
+- **训练起点完全等价于原始生成基座**：避免随机初始化的附加分支破坏主干已收敛的特征空间；
+- **控制信号平滑渐进注入**：梯度反向传播时，零卷积参数逐步偏离零点，控制强度随训练步数自然增强。
 
 ```python
-class ZeroConv(nn.Module):
-    """ControlNet 的 zero convolution。"""
+class ZeroConv2d(nn.Module):
+    """零初始化 1x1 卷积层。"""
 
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+        self.conv = nn.Conv2d(in_channels, out_channels, 1)
         nn.init.zeros_(self.conv.weight)
         nn.init.zeros_(self.conv.bias)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
-```
-
-数学上，假设 ControlNet 输出 $h_c$，主 UNet 在某层的特征是 $h_m$。修改后：
-
-$$
-h_m' = h_m + Z(h_c)
-$$
-
-其中 $Z$ 是 zero conv。初始 $Z(h_c) = 0$，$h_m' = h_m$，模型行为不变。训练让 $Z$ 学到非零权重后，控制信号开始作用。
-
-### 简化的 ControlNet 实现
-
-```python
-import torch
-import torch.nn as nn
-import copy
-
-
-class ControlNetForSR(nn.Module):
-    """简化的 SR ControlNet。
-    主 UNet 是预训练的 SD UNet (frozen)。
-    ControlNet 复制其 encoder + mid block, 加 zero conv。
-    """
-
-    def __init__(self, sd_unet: nn.Module, lr_input_channels: int = 3,
-                 latent_channels: int = 4):
-        super().__init__()
-        # 复制主 UNet 的 encoder + mid (浅拷贝结构, 深拷贝权重)
-        self.input_blocks = copy.deepcopy(sd_unet.input_blocks)
-        self.middle_block = copy.deepcopy(sd_unet.middle_block)
-
-        # 关键: 复制后必须替换第一层 conv, 因为 SD UNet 的第一层是 4 通道入,
-        # 而 ControlNet 接受 (x_t || lr_latent) 共 8 通道 (官方 ControlNet 用单独
-        # 的 condition embedding, 这里为简洁直接 concat 到输入)
-        old_conv = self._first_conv(self.input_blocks)
-        new_conv = nn.Conv2d(
-            latent_channels * 2, old_conv.out_channels,
-            kernel_size=old_conv.kernel_size, padding=old_conv.padding,
-        )
-        with torch.no_grad():
-            new_conv.weight[:, :latent_channels] = old_conv.weight
-            new_conv.weight[:, latent_channels:] = 0      # 让多出的通道初始无效
-            new_conv.bias[:] = old_conv.bias
-        self._replace_first_conv(self.input_blocks, new_conv)
-
-        # Zero convs 接每个 input_block 输出
-        self.zero_convs = nn.ModuleList()
-        for block in self.input_blocks:
-            ch = self._get_block_out_ch(block)
-            self.zero_convs.append(ZeroConv(ch, ch))
-        # Mid block 也加 zero conv
-        self.zero_conv_mid = ZeroConv(
-            self._get_block_out_ch(self.middle_block),
-            self._get_block_out_ch(self.middle_block),
-        )
-
-        # LR 在喂给 ControlNet 前的预处理 (RGB -> latent 大小)
-        self.cond_pre = nn.Sequential(
-            nn.Conv2d(lr_input_channels, 16, 3, padding=1, stride=2),
-            nn.SiLU(),
-            nn.Conv2d(16, 32, 3, padding=1, stride=2),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, 3, padding=1, stride=2),
-            nn.SiLU(),
-            nn.Conv2d(64, latent_channels, 3, padding=1),
-        )
-
-    @staticmethod
-    def _first_conv(input_blocks):
-        for m in input_blocks[0].modules():
-            if isinstance(m, nn.Conv2d):
-                return m
-        raise RuntimeError("no conv found in first input block")
-
-    @staticmethod
-    def _replace_first_conv(input_blocks, new_conv):
-        # 简化: 真实 SD UNet 第一个 input_block 通常是单独的 input conv,
-        # 这里用搜索-替换示意。生产实现请按具体 UNet 结构精确替换。
-        for parent in input_blocks.modules():
-            for name, child in list(parent.named_children()):
-                if isinstance(child, nn.Conv2d) and child.in_channels in (4, 8):
-                    setattr(parent, name, new_conv)
-                    return
-
-    def forward(self, x_t, lr_img, t, context):
-        """
-        x_t: (B, 4, h, w) noisy latent
-        lr_img: (B, 3, H, W) LR input (RGB)
-        t: (B,) time
-        context: (B, T, D) text/image tokens
-        """
-        # 把 LR 处理到 latent 大小
-        lr_latent = self.cond_pre(lr_img)
-
-        # ControlNet 的输入 = 噪声 latent + LR latent (concat 成 8 通道)
-        h = torch.cat([x_t, lr_latent], dim=1)
-
-        outs = []
-        for block, zero_conv in zip(self.input_blocks, self.zero_convs):
-            h = block(h, t, context)
-            outs.append(zero_conv(h))
-
-        h = self.middle_block(h, t, context)
-        outs.append(self.zero_conv_mid(h))
-
-        # 这些 outs 在主 UNet forward 时, 加到对应的 skip 上
-        return outs
-
-    @staticmethod
-    def _get_block_out_ch(block):
-        # 简化, 实际要根据 SD UNet 具体结构推
-        for m in block.modules():
-            if isinstance(m, nn.Conv2d):
-                return m.out_channels
-        return None
 ```
 
 主 UNet 的 forward 要改成把 ControlNet 的输出加到对应 skip：
@@ -538,129 +326,136 @@ class IPAdapterCrossAttn(nn.Module):
         return text_out + scale * image_out
 ```
 
-在增强任务里 IP-Adapter 常与 ControlNet 一起用：ControlNet 管"结构对齐 LR"，IP-Adapter 管"风格/身份对齐 reference"。SUPIR 用 LLaVA prompt 取代了 IP-Adapter 的图像 prompt 角色，是另一种解法。
+## 9.6b 范式四：IP-Adapter 解耦图像提示词机制
 
-### 与第 10 章 RefSR 的关系
+Ye 等人提出的 IP-Adapter 旨在解决基于参考图像（Reference Image）引导生成的特征耦合问题。
 
-IP-Adapter 在工程上和第 10 章的 RefSR 极为接近：都是"LR + Ref → HR"的多输入扩散增强。区别是 RefSR 的 cross-attention 通常做 patch-level matching（Ref 的局部纹理 → 主图的对应区域），IP-Adapter 把 Ref 全局编成一个 token 序列，控制偏向全局风格 / 身份。生产里这两种思路常常同时存在，并不互斥。
+在图像增强任务中的典型应用包括：
+- **同源参考超分（RefSR）**：结合低分辨率输入与同主体的高清参考特写，定向迁移高频细节；
+- **风格与光照对齐**：以特定样张的色调分布与光影质感引导重建过程；
+- **材质纹理注入**：利用高质量微观材质切片辅助大面积破损区域修复。
 
-## 9.7 SUPIR（2024）：当前 SR SOTA 的设计
+### 解耦跨注意力（Decoupled Cross-Attention）数学原理
 
-SUPIR 把多个工程技巧叠加，达到 2024 年 real-world SR 的 SOTA。值得详细看一下它的组合逻辑。
+标准 SD 架构中，跨注意力模块仅处理来自文本编码器的序列：$\text{Attention}(Q, K_t, V_t)$。若将图像 Token 与文本 Token 强行拼接输入同一注意力层，会破坏预训练文本注意力的特征分布，导致指令遵循度下降。
 
-### 组件 1：SDXL 作为基础
-
-SDXL 是 SD 的更大版本（2.6B 参数 UNet），生成质量显著强于 SD 1.5。SUPIR 用 SDXL 作为基础保证生成质量。
-
-### 组件 2：ControlNet 注入 LR
-
-类似上面讲的 ControlNet，把 LR 通过 ControlNet 注入。但 SUPIR 用了一个变体，即 **ZeroSFT**（Zero Spatial Feature Transform）：
-
-ZeroSFT 是一种特征调制：在 ControlNet 输出加到主 UNet 之前，做一个空间相关的仿射变换：
+IP-Adapter 采用解耦双通路并行设计：为图像特征独立构建专用的 Key 与 Value 投影矩阵，输出端执行加权求和：
 
 $$
-h' = h \odot (1 + \gamma) + \beta
+\text{Output} = \text{Attention}(Q, K_t, V_t) + \lambda \cdot \text{Attention}(Q, K_i, V_i)
 $$
 
-其中 $\gamma, \beta$ 是从 ControlNet 输出预测的空间特征图。这样控制比简单加和更灵活。
+其中 $K_i, V_i$ 由 CLIP 图像特征经新增线性层投影生成，$\lambda$ 为可在线调节的图像引导强度标量。
 
-### 组件 3：LLaVA prompt
+```python
+class IPAdapterCrossAttn(nn.Module):
+    """IP-Adapter: 解耦的图像 cross-attention。
+    与原 text cross-attention 并行, 输出相加。
+    """
 
-SUPIR 用 LLaVA（一个 VLM）给 LR 自动生成文字描述，作为 SDXL 的文本条件。这让模型有"语义先验"：知道这是猫还是狗，能生成对应的细节。
+    def __init__(self, dim: int, num_heads: int, image_dim: int = 1024):
+        super().__init__()
+        # 复用原 cross-attention 的 Q (来自 latent)
+        # 新增图像分支的 K, V projection
+        self.to_k_img = nn.Linear(image_dim, dim, bias=False)
+        self.to_v_img = nn.Linear(image_dim, dim, bias=False)
+        self.num_heads = num_heads
+        nn.init.zeros_(self.to_k_img.weight)
+        nn.init.zeros_(self.to_v_img.weight)        # 0 初始化, 训练初期无影响
 
-### 组件 4：EDM 噪声调度
+    def forward(self, q, text_kv, image_tokens, scale: float = 1.0):
+        # text_kv 走原 cross-attention (省略, 主 UNet 内置)
+        text_out = original_cross_attn(q, text_kv)
 
-SUPIR 建立在 SDXL 上，采样遵循 EDM（Karras et al. 2022）的 σ 空间参数化与预条件，而不是 DDPM 那套离散时间步。
+        # 图像分支
+        k_img = self.to_k_img(image_tokens)
+        v_img = self.to_v_img(image_tokens)
+        image_out = scaled_dot_product_attention(q, k_img, v_img, num_heads=self.num_heads)
 
-这里要澄清一个常见误传：有的资料把"从中间时间步 $T' < T$ 起采样、跳过最高步"当成 SUPIR 的组件。这其实是 SDEdit（以及 StableSR 的 time-aware 注入）的做法，即把 $y$ 加噪到中间步再反向去噪，用来减少步数、保留更多输入结构：
+        return text_out + scale * image_out
+```
+
+工程优势：
+1. **零破坏预训练基座**：主干权重完全冻结，新增参数量不足 100M，训练资源开销极小；
+2. **多模态权重完全解耦**：文本 CFG 强度与图像引导强度 $\lambda$ 相互独立，支持推断期灵活消融与微调。
+
+## 9.7 工业级 SOTA 架构剖析：SUPIR（2024）
+
+Yu 等人提出的 SUPIR 融合了多项工程创新，是当前真实场景通用超分辨率（Real-world SR）领域的代表性架构。
+
+### 核心系统组件剖析
+
+1. **SDXL 强生成先验基座**：采用 2.6B 参数量的 SDXL 作为生成主干，显著提升复杂自然纹理的重建上限；
+2. **ZeroSFT 门控 ControlNet**：在 ControlNet 输出端引入零初始化空间特征变换（Zero Spatial Feature Transform），实现逐像素空间仿射调制：
+   $$
+   h' = h \odot (1 + \gamma) + \beta
+   $$
+   其中调制参数 $\gamma, \beta$ 由控制分支自适应预测；
+3. **视觉语言大模型（LLaVA）文本引导**：集成多模态大模型自动解析输入图像的高级语义（如主体类别、光照环境、局部材质），转化为精细 Prompt 注入生成主干，有效降低歧义区域的生成盲目性；
+4. **EDM 连续连续扩散框架**：基于 Karras 等人的 EDM 连续时间扩散框架，采用 $\sigma$ 空间参数化与二阶 Heun 采样求解器；
+5. **恢复引导采样（Restoration-Guided Sampling）**：在推断采样的每个时间步，通过显式计算估计真值 $\hat{x}_0$ 与低分辨率输入 $y$ 之间的物理退化一致性梯度，反向校正预测得分，强力压制幻觉伪影。
+
+性能表现：在严重退化的历史老照片与复杂真实退化集上，主观感知质感与边缘锐利度表现优异。
+
+## 9.8 独立范式：StableSR 架构与可控特征包裹（CFW）
+
+Wang 等人提出的 StableSR 构建了一条区别于标准 ControlNet 的独立控制范式：在冻结的 Stable Diffusion 基座外挂时间感知编码器（Time-aware Encoder），通过 SFT 机制将多尺度退化特征注入主干；在像素重构阶段，引入**可控特征包裹机制（Controllable Feature Wrapping, CFW）**。
+
+### CFW 机制的数学机理与工程实现
+
+CFW 的核心目标在于解耦“扩散潜变量生成”与“图像保真度解码”，在 VAE 解码阶段引入线性连续调节因子 $w \in [0, 1]$：
 
 $$
-x_{t^*}^{\text{init}} = \sqrt{\bar{\alpha}_{t^*}} \cdot \text{Encode}(y) + \sqrt{1 - \bar{\alpha}_{t^*}} \cdot \epsilon,\quad t^* < T
+\hat{x}_0 = \text{Decoder}\Big(\text{CFW}\big(z_{\text{diff}},\ E(y);\ w\big)\Big)
 $$
 
-SUPIR 本身不靠这个"跳步"技巧，它从常规起点采样，再用下面组件 5 的 restoration guidance 控制保真。
+其中 $z_{\text{diff}}$ 为扩散去噪生成的潜变量，$E(y)$ 为退化图像经旁路编码器提取的深层特征。
 
-### 组件 5：Restoration-Guided Sampling
+调节参数 $w$ 的物理行为：
+- $w \to 0$：完全依赖扩散潜变量生成，纹理丰富但客观保真度较低；
+- $w \to 1$：深度融合输入特征，几何轮廓与像素分布严格依从原图；
+- $w = 0.5$：兼顾高频生成与客观保真的平衡配置。
 
-这是 SUPIR 真正的采样特色。每一步采样后，用一个 restoration 项（把 $\hat{x}_0$ 与 LR 的一致性作为引导）把预测拉回靠近 LR，抑制过度生成。这是个推理时的技巧，不需要重新训练。
+### 时间感知条件调制（Time-aware Conditioning）
 
-### SUPIR 综合效果
+StableSR 的特征注入强度与扩散时间步 $t$ 强相关：
+- 高噪声阶段（$t \to T$）：抑制条件注入强度，赋予扩散主干充分的全局拓扑探索空间；
+- 低噪声阶段（$t \to 0$）：加大条件注入权重，迫使生成特征向输入退化观测的像素空间对齐收敛。
 
-- 在严重退化的真实老照片上视觉效果远超所有判别式 SR
-- 感知指标（LPIPS）明显优于 ESRGAN
-- 但保真指标（PSNR）低于 HAT，这是 perception-distortion trade-off 选了 perception 端的必然代价（真实盲 SR 上这个差距通常在 2-4 dB 量级，具体看退化强度）
-- 速度慢（30-50 步推理），单张 1K 图在 A100 上是数秒量级
+## 9.9 超大分辨率分块推断（Tiling Inference）工程实践
 
-## 9.8 StableSR（2023）：独立范式
+扩散模型受限于训练切片尺寸（通常为 $512 \times 512$ 或 $1024 \times 1024$），直接推断 4K/8K 图像不仅会触发显存溢出（OOM），且易导致结构多头畸变。
 
-Wang et al. 的 StableSR 是 SUPIR 之前的代表，思路简化但工程实践友好。它的注入方式既不是 input concat 也不是 ControlNet，而是自成一路：在冻结的 SD 上挂一个 time-aware encoder，编码 LR 得到多尺度特征，特征通过 SFT（spatial feature transform）注入 UNet；解码端再用 CFW 做可调融合。下面分别看两个关键设计。
-
-### 关键设计：CFW（Controllable Feature Wrapping）
-
-CFW 的全称是 Controllable Feature Wrapping，源自 CodeFormer 的可控特征变换，和光流、几何形变没有关系。它让用户在推理时调节"质量 vs 保真"：在把 latent 解码到像素时，用一个系数 $w$ 把 LR 的编码特征融进解码器特征。
-
-$$
-\hat{x}_0 = \text{Decode}\big(\,\text{CFW}\big(z,\ E(y);\ w\big)\,\big)
-$$
-
-其中 $E(y)$ 是 LR 经编码器得到的特征，$\text{CFW}(\cdot;w)$ 按系数 $w$ 把它包裹进解码器特征。$w \in [0, 1]$ 是用户可调的参数：
-
-- $w = 0$：纯生成（高质量但低保真）
-- $w = 1$：完全保真（接近 LR）
-- $w = 0.5$：平衡
-
-这种用户可调设计在生产环境是加分项：同一个模型可以服务不同需求的用户。
-
-### Time-aware Condition
-
-StableSR 还有一个细节：条件注入的强度和时间步相关。早期（高 $t$）注入弱（让模型自由生成），后期（低 $t$）注入强（让模型对齐 LR）。这是对扩散动力学的精确利用。
-
-## 9.9 Tile 推理：处理大图
-
-扩散模型训练时通常在 $256 \times 256$ 或 $512 \times 512$ 的 patch 上。但实际增强任务可能要处理 4K 甚至 8K 图。**直接全图推理会爆显存**，而且模型从没在那么大尺寸上见过，效果可能崩。
-
-解决：**tile-based 推理**。
-
-### 朴素 tile
-
-把大图切成多块，每块独立推理，再拼起来。问题：**块边界不连续**。
-
-### Overlap + blend
-
-让 tile 之间有重叠区域（比如 50%），然后用渐变 mask 融合：
+工业界普遍采用带边缘渐变融合的重叠滑动窗口（Overlap-Tiling）机制：
 
 ```python
 import torch
 import torch.nn.functional as F
 
 def tile_diffusion_inference(
-    pipeline, hr_img_tensor, tile_size=512, overlap=128, **pipe_kwargs
-):
+    pipeline, hr_img_tensor: torch.Tensor,
+    tile_size: int = 512, overlap: int = 128, **pipe_kwargs
+) -> torch.Tensor:
     """
-    Tile-based 扩散推理。
-    pipeline: 一个 diffusion pipeline
-    hr_img_tensor: 输入 LR 图 tensor (1, 3, H, W) - 已经经过 latent 编码或 RGB
+    基于重叠滑动窗口与锚定边界的大图扩散推断。
+    hr_img_tensor: (1, C, H, W)
     """
     _, _, H, W = hr_img_tensor.shape
     stride = tile_size - overlap
 
-    # 创建累加器和权重
     output = torch.zeros_like(hr_img_tensor)
     weight = torch.zeros_like(hr_img_tensor)
 
-    # 创建渐变权重 mask (中心权重最高, 边缘渐变到 0)
-    blend_mask = torch.ones((1, 1, tile_size, tile_size))
+    # 构建四向线性渐变权重衰减 Mask
+    blend_mask = torch.ones((1, 1, tile_size, tile_size), device=hr_img_tensor.device)
     for i in range(overlap):
         v = (i + 1) / (overlap + 1)
-        blend_mask[:, :, i, :]  *= v
+        blend_mask[:, :, i, :] *= v
         blend_mask[:, :, -i-1, :] *= v
-        blend_mask[:, :, :, i]  *= v
+        blend_mask[:, :, :, i] *= v
         blend_mask[:, :, :, -i-1] *= v
 
-    blend_mask = blend_mask.to(hr_img_tensor.device)
-
-    # 滑动窗口推理 - 关键: 用 anchored ranges 保证最后一个 tile 落在 H-tile_size,
-    # 否则当 (H - tile_size) 不是 stride 整数倍时, 右/下边缘会缺失覆盖。
+    # 锚定滑动起点计算函数，确保边缘完全覆盖
     def anchored_starts(total: int, tile: int, step: int):
         if total <= tile:
             return [0]
@@ -680,128 +475,66 @@ def tile_diffusion_inference(
     return output / (weight + 1e-8)
 ```
 
-### Shared Noise（共享噪声）
+**工程关键技巧**：
+- **全局共享初始噪声（Shared Noise Map）**：所有局部 Tile 从同一张全图标准高斯噪声中截取对应坐标的局部切片，确保拼接处的纹理方向与相位连续；
+- **ControlNet Tile 专用微调**：采用多尺度混合切片微调 ControlNet，提升模型对边界模糊截断的容忍度。
 
-更高级的 trick：所有 tile **共享同一个噪声起点**：把全图的噪声 latent 先生成出来，每个 tile 推理时用对应位置的 noise。这样 tile 之间的"随机性方向"一致，边界更连续。
+## 9.10 负向提示词（Negative Prompt）与质量约束
 
-这是 Multi-Diffusion / SyncDiffusion 等工作的思路。
-
-### ControlNet Tile 模型
-
-专门为 tile 推理训练的 ControlNet 模型：在训练时就用各种 tile 配对训练（包括小尺寸和大尺寸的混合），让模型对 tile 边界更鲁棒。
-
-工程实践：4K+ 图增强**几乎全部用 tile + blend**，没有更好的方案。
-
-## 9.10 Negative Prompt 与质量控制
-
-文生图里 negative prompt 用来排除不想要的（"blurry, low quality, deformed"）。增强任务里也能用：
+在 Classifier-Free Guidance 架构中，负向提示词通过向反方向外推得分向量，能够有效剔除常见生成伪影：
 
 ```python
-# 推理时
-positive_prompt = "high quality, sharp, detailed photograph"
-negative_prompt = "blurry, low quality, jpeg artifacts, oversmooth, plastic skin"
+positive_prompt = "ultra-high resolution, sharp focus, natural texture, pristine details"
+negative_prompt = "blurry, low quality, jpeg compression artifacts, oversmooth, plastic skin, distorted geometry"
 ```
 
-通过 CFG 让生成结果**远离** negative prompt 描述的特征。实测影响：
+## 9.11 推断关键超参数工程推荐
 
-- 不写 negative prompt：偶尔出现轻度伪影
-- 加合理 negative prompt：伪影出现的概率明显下降
+| 调节参数 | 建议搜索区间 | 参数调高的物理效应 |
+|---------|-------------|-------------------|
+| `num_inference_steps` | 20 至 35 步 | 纹理精细度提升，推断耗时线性增加 |
+| `guidance_scale` (CFG) | 1.5 至 3.0 | 提示词依从度提升，过高易导致色彩饱和度过载 |
+| `controlnet_conditioning_scale` | 0.6 至 1.2 | 几何保真度增强，过高可能导致退化伪影被复现 |
+| `tile_size` / `overlap` | 1024 / 256 | 拼接接缝更自然，显存占用与计算开销增加 |
 
-成本：几乎为零（推理时多一次 UNet 前向）。
+### 极速单步/少步蒸馏超分辨率前沿
 
-## 9.11 推理参数调优
+针对生产环境中严苛的延迟约束（SLA < 500ms），基于一致性蒸馏与对抗蒸馏的加速算法取得了突破性进展：
 
-扩散增强模型有很多推理参数，对最终效果影响巨大：
+- **OSEDiff**：基于 SD 2.1 蒸馏的单步真实场景超分辨率模型，仅需单次 UNet 前向推断；
+- **SinSR**：基于 ResShift 架构蒸馏的单步超分模型；
+- **AddSR**：结合对抗扩散蒸馏（ADD），在 2 至 4 步内实现感知与保真的平衡；
+- **TSD-SR**：CVPR 2025 前沿工作，将少步生成机制扩展至 DiT 扩散架构。
 
-| 参数 | 典型范围 | 调高的影响 |
-|------|---------|-----------|
-| `num_inference_steps` | 20 - 50 | 质量提升、速度变慢 |
-| `guidance_scale` | 1.0 - 3.0 | 更"听话"，但可能 oversaturated |
-| `controlnet_conditioning_scale` | 0.5 - 1.5 | 更靠 LR，但可能糊 |
-| `start_noise_level` | 0.5 - 1.0 | 越小保留更多 LR 结构 |
-| `tile_size` | 512, 1024 | 更大块更连贯但显存爆 |
-| `tile_overlap` | 64 - 256 | 更平滑但慢 |
+## 9.12 训练与推断工程差异清单
 
-工程实践（增强任务的起始配置）：
+| 环节 | 训练阶段（Training） | 推断阶段（Inference） |
+|------|--------------------|---------------------|
+| **计算复杂度** | 单次前向与反向传播 | 多步数值积分循环（15-30 次前向） |
+| **空间尺寸** | 固定小尺度切片（如 512×512） | 任意超大分辨率输入（依赖 Tiling 调度） |
+| **引导机制** | 10% 概率条件随机置空 | 双路前向（有条件 + 无条件）执行 CFG 外推 |
+| **显存瓶颈** | 梯度反向传播与优化器状态 | 激活值峰值与大尺寸潜空间重构 |
 
-```python
-{
-    'num_inference_steps': 25,
-    'guidance_scale': 2.0,
-    'controlnet_conditioning_scale': 1.0,
-    'start_noise_level': 0.7,
-    'tile_size': 1024,
-    'tile_overlap': 256,
-    'positive_prompt': 'high quality, sharp, detailed',
-    'negative_prompt': 'blurry, low quality, oversmooth',
-}
-```
+## 9.13 架构选型决策矩阵
 
-这些参数最好让用户可调：同一个模型不同用户对 fidelity 偏好不同。
-
-### 少步/一步蒸馏扩散 SR
-
-上表和前面的 SUPIR、StableSR 都默认扩散 SR 要跑 30-50 步，单张 1K 图要数秒。这条"扩散必然慢"的旧叙事到 2024-25 已经不成立。通过一致性蒸馏、对抗蒸馏、分数蒸馏等技术，一批工作把 SUPIR 级的质量压到了 1-4 步：
-
-- **OSEDiff**（One-Step Effective Diffusion，基于 SD 2.1）：把真实场景 SR 蒸馏成单步，推理只跑一次 UNet 前向
-- **SinSR**：从 ResShift 蒸馏出单步扩散 SR
-- **AddSR**：用对抗蒸馏在少步下兼顾锐度与保真
-- **TSD-SR**（CVPR 2025，基座 SD3）：把 DiT 骨干的扩散 SR 压到少步
-
-工程含义：如果延迟是硬约束，不必再默认"扩散就慢"而退回 CNN。少步蒸馏 SR 在质量与速度上已经是一个可选项，端侧之外的实时/近实时场景可以优先评估。这条线属于快速演进的方向，更细的谱系和取舍留到第 18 章。
-
-## 9.12 训练 vs 推理：关键差异
-
-扩散增强模型的训练和推理差异比 CNN/Transformer 模型大得多。
-
-### 训练时
-
-- 输入大小固定（典型 $512 \times 512$）
-- 单步反向（不是迭代采样）
-- 不需要采样器，只需 noise scheduler 加噪
-- 不需要 tile（直接全图）
-
-### 推理时
-
-- 输入大小可变（任意分辨率）
-- 多步迭代采样
-- 选择采样器（DDIM/DPM-Solver/UniPC）
-- 大图必须 tile
-- CFG / negative prompt
-- ControlNet conditioning scale 可调
-
-工程含义：**实验时的训练表现和生产时的推理表现可能不一致**：很多问题（tile artifact、CFG 失稳、长序列采样误差累积）只在推理时暴露。这是扩散增强工程的特殊难点。
-
-## 9.13 选型决策表
-
-按场景给推荐：
-
-| 场景 | 推荐范式 | 代表方法 |
-|------|---------|---------|
-| 严重退化、强生成 | SDXL ControlNet + LLaVA prompt | SUPIR |
-| 中等退化、可调节 | SD + time-aware encoder + SFT 注入 + CFW | StableSR |
-| 语义保持优先 | 两阶段：预去退化 + IRControlNet | DiffBIR |
-| 内容保持（不变身份） | IP-Adapter + ControlNet | 自定义组合 |
-| 快速推理（少步） | 蒸馏到 1-4 步的扩散 SR | OSEDiff / SinSR / AddSR / TSD-SR |
-| 端侧 | **不推荐扩散**（用 CNN） | — |
-| 4K+ 大图 | ControlNet Tile + Multi-Diffusion | Tile workflow |
-| 视频 | 还在研究中 | 第 13 章 |
+| 应用业务场景 | 推荐控制范式 | 代表性方案 |
+|-------------|-------------|-----------|
+| 历史老照片重度破坏修复 | SDXL + ZeroSFT ControlNet + LLaVA | SUPIR |
+| 画质与几何保真平衡可调需求 | 冻结 SD + SFT + 可控特征包裹（CFW） | StableSR |
+| 严重噪声/压缩盲恢复 | 两阶段：预恢复滤波 + IRControlNet | DiffBIR |
+| 跨图特征对齐与身份保持 | 解耦图像跨注意力 + ControlNet | IP-Adapter + ControlNet |
+| 实时/近实时高吞吐服务 | 少步/单步蒸馏扩散模型 | OSEDiff / AddSR |
+| 4K/8K 巨幅海报精修 | 共享噪声滑动窗口与 Tile 融合 | Tile Pipeline |
+| 移动端/嵌入式端侧场景 | 不推荐扩散模型（优先选用 CNN） | NAFNet / Real-ESRGAN |
 
 ## 9.14 小结
 
-1. **条件控制是扩散增强的工程核心**：比基础扩散重要得多
-2. **五种范式**：concat、cross-attention、ControlNet、IP-Adapter、Tile + ControlNet
-3. **ControlNet 是事实标准**：复制 encoder + zero conv，保留预训练权重
-4. **Zero conv 让训练初期模型行为不变**，这是 ControlNet 训练稳定的关键
-5. **StableSR 与 DiffBIR 各成一路**：StableSR 是 time-aware encoder + SFT 注入 + CFW 的独立范式，DiffBIR 是两阶段的 ControlNet 式复原，都不是 cross-attention 方法
-6. **SUPIR 的多组件叠加**：SDXL + ControlNet + ZeroSFT + LLaVA prompt + restoration-guided sampling
-7. **Tile + Blend 是大图的唯一方案**，用 shared noise + ControlNet Tile 减少边界伪影
-8. **少步/一步蒸馏让扩散 SR 不再必然慢**：OSEDiff、SinSR、AddSR、TSD-SR 把 SUPIR 级质量压到 1-4 步
-9. **推理参数对最终效果影响巨大**：guidance_scale、conditioning_scale、num_steps、start_noise 都要调
-10. **训练和推理差异大**，很多问题只在推理时暴露，必须做生产级测试
-
-到这里 Part II 走过 CNN → Transformer → 扩散基础 → 扩散控制四章。下一章是这部分的最后一章，即任务特化模型，讲人脸、文档、医疗等不同任务用了哪些归纳偏置。
+1. **条件控制是生成式增强的核心支撑**：决定了模型在保真度与生成自由度之间的落点；
+2. **ControlNet 确立了工业标准**：克隆编码器配合零卷积，在完整保留基础生成先验的前提下实现像素级拓扑约束；
+3. **独立范式的多样化探索**：StableSR（SFT + CFW）提供了推断期线性可控的保真度滑块，DiffBIR 确立了两阶段解耦恢复流程；
+4. **超大分辨率工程解法**：通过锚定滑动窗口、重叠权重衰减及共享噪声地图，实现了显存可控的无缝拼接；
+5. **少步蒸馏打破延迟瓶颈**：1 至 4 步极速扩散架构使生成式增强具备了落地高并发在线服务的工程可行性。
 
 ---
 
-> 下一章 [任务特化模型](10-task-specific.md) → 通用增强 vs 特化增强：人脸用 GAN inversion、文档用 CRNN 引导、医疗用物理先验。
+> 下一章 [任务特化模型](10-task-specific.md) → 探索人脸、文档、医疗与跨图像参考等特定应用场景中的先验归纳偏置与专用算法设计。

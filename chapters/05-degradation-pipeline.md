@@ -1,218 +1,162 @@
 # 第 5 章 · 数据与退化合成
 
-> 这是这本书最"工程"的一章。
+> 图像复原与超分辨率工程的核心瓶颈往往不在网络架构本身，而在于训练退化数据的分布建模。
 >
-> 影像增强领域有一句话流传很久：**Real-ESRGAN 的核心贡献不是网络，是数据**。
->
-> 这一章把这句话拆解清楚。
+> 深入剖析 Real-ESRGAN 的高阶退化合成流水线与工程优化，是掌握真实场景鲁棒复原的关键。
 
 ## 5.0 阅读须知
 
-本章是 Part I 的最后一章，也是全书最贴近工程实现的一章。前四章建立的概念在这里全部落到 Python 代码、目录结构、训练循环里。读完之后，你应当能直接动手写一份可以喂给 ESRGAN/Real-ESRGAN/Restormer 的训练 dataloader。
+本章是第一篇（原理与基础）的收官章节，也是全书最贴近工程实现的一章。前四章建立的数学概念与先验理论，将在本章具象化为 Python 数据加载器、GPU 批处理流水线与目录存储架构。读完本章，你将能够独立构建面向 ESRGAN、Real-ESRGAN 与 Restormer 等主流架构的高性能退化合成数据管道。
 
-本章预设你已经掌握：
+本章预设你已掌握：
 
-- 第 1 章里"退化算子 $D$ 是一串随机复合"的图像（§1.5 那张数据流图，本章会把它扩成更细的版本）
-- 第 2-3 章里像素空间/特征空间和损失函数的对应
-- 第 4 章里 PSNR/SSIM/LPIPS 与 NIQE/MANIQA 的区别（决定了什么时候"真值不存在"）
+- 第 1 章关于复合退化算子 $D$ 的物理建模（包含模糊、下采样、加性/乘性噪声及有损压缩的链式组合）
+- 第 2-3 章关于像素空间、特征空间与多目标损失函数的对应关系
+- 第 4 章关于全参考（PSNR/SSIM/LPIPS）与无参考（NIQE/MANIQA）评估指标的适用边界
 
-不预设你写过 Real-ESRGAN 的 dataloader 或者读过它七百行的退化代码。
+**本章首次出现或重点展开的缩写与术语：**
 
-**本章首次出现或将反复出现的缩写。** 为防止后面读到一半被术语劝退，先在这里列一遍：
+- **Real-ESRGAN**：2021 年提出的真实场景盲超分辨率算法，其核心创新在于高阶退化建模流水线（High-Order Degradation Modeling）
+- **BSRGAN**（Blind Super-Resolution GAN）：采用随机退化次序生成复杂失真样本的盲超分辨率算法
+- **SRMD**（Super-Resolution with Multiple Degradations）：将退化核与噪声水平作为显式条件输入网络的非盲超分方案
+- **DiffJPEG**：基于 PyTorch 的可微/非可微 GPU 批量 JPEG 编解码实现，消除 CPU 磁盘读写瓶颈
+- **DCT**（Discrete Cosine Transform，离散余弦变换）：JPEG 压缩算法中实现空域至频域能量集中的核心正交变换
+- **ISP**（Image Signal Processor，图像信号处理器）：相机硬件管线中将原始 Sensor RAW 数据转换为标准 sRGB 图像的算法集成芯片
+- **LMDB**（Lightning Memory-Mapped Database）：基于内存映射文件的高性能键值数据库，常用于大规模训练集的高吞吐读取
+- **USM**（Unsharp Masking，反掩模锐化）：通过从原图中扣除高斯低通滤波分量以强化局部高频边缘的经典图像增强算子
+- **Chroma Subsampling**（色度下采样）：利用人眼对色度空间分辨率不敏感的生理特性，在 YCbCr 空间对 Cb/Cr 分量进行降采样存储的有损压缩策略（如 4:2:0、4:2:2）
 
-- **Real-ESRGAN**：2021 年的代表性"真实场景"超分模型，论文核心贡献是退化合成 pipeline 而不是网络结构
-- **BSRGAN**（Blind Super-Resolution GAN）：与 Real-ESRGAN 同期、思路相近的 blind SR 方案，由 Zhang et al. 提出，用"随机化退化顺序"训出一个对真实图鲁棒的 SR 模型
-- **SRMD**（Super-Resolution with Multiple Degradations）：早期把"退化参数"作为条件喂给网络的工作，属于 non-blind 的折衷方案
-- **KernelGAN**：用 GAN 在测试图上估退化核的方法，blind SR 的另一条路线
-- **RRDB**（Residual in Residual Dense Block）：ESRGAN 提出的密集残差块，Real-ESRGAN 沿用它作为 backbone（详见第 6 章）
-- **DiffJPEG**：可微的 JPEG 编解码实现，让退化 pipeline 能在 GPU 上整批做完 JPEG 步骤
-- **DCT**（Discrete Cosine Transform，离散余弦变换）：JPEG 压缩的核心算子（已在 §1.0 介绍过，此处复述）
-- **ISP**（Image Signal Processor，图像信号处理器）：相机内部把传感器读数变成 8-bit RGB 的整套流水线（同样已在 §1.0 介绍）
-- **LMDB**（Lightning Memory-Mapped Database）：一个轻量级的 key-value 存储，常用来把大量小图像预编码缓存起来加速训练
-- **USM**（Unsharp Mask，反掩模锐化）：传统图像处理里的锐化算子，先对图像做高斯模糊再用原图减去模糊版得到高频，再加回原图
-- **chroma subsampling**（色度下采样）：JPEG 在 RGB → YCbCr 转换后把 Cb/Cr 两个色度通道按 4:2:0 等方式降分辨率存储，对人眼不敏感、对模型很敏感
+## 5.1 数据工程主导模型泛化能力
 
-后面用到具体术语时还会再展开一句话定义。
+在 2014 至 2020 年的早期超分辨率文献中，普遍存在一种方法论偏差：
 
-## 5.1 数据 > 网络
+1. 仅采用理想双三次下采样（Bicubic）合成配对训练数据
+2. 在合成数据集上刷榜并刷新 PSNR/SSIM 指标
+3. 部署于手机实拍、网络传输等真实场景时，模型由于输入分布失配而发生灾难性退化
 
-第 1 章提到过，2014-2020 年这个领域有一个反复出现的模式：
+Real-ESRGAN（Wang et al. 2021）通过一组控制变量实验揭示了数据分布的决定性作用：
 
-- 用 bicubic 下采样合成训练数据
-- 在合成数据上训出 SOTA 网络
-- 实际部署时模型在真实图像上几乎不工作
+| 网络骨干架构 | 训练集退化建模策略 | 合成测试集 PSNR (dB) | 真实场景实拍测试观感 |
+|-------------|-------------------|---------------------|-------------------|
+| **ESRGAN（RRDB 骨干）** | 经典 Bicubic 单一下采样 | 18.2 | 无法处理真实噪点，伪影严重 |
+| **Real-ESRGAN（完全相同的 RRDB 骨干）** | 复杂高阶退化合成流水线 | **23.8** | 边缘锐利自然，高度可用 |
 
-2021 年的 Real-ESRGAN 论文做了一个对比实验：
+实验表明：**在网络骨干保持不变的前提下，仅重构退化数据流水线，即可使模型在真实场景下的可用性发生根本性转变。**
 
-| 网络 | 训练数据 | 合成退化 holdout 上的 PSNR | 真实图像视觉 |
-|------|---------|--------------|------------|
-| ESRGAN（RRDB 网络） | bicubic 退化 | 18.2 dB | 几乎不工作 |
-| **Real-ESRGAN（同样的 RRDB 网络）** | **复杂退化合成** | **23.8 dB** | **可用** |
+类似结论在图像去噪与去模糊领域屡获验证：
 
-**网络没变，数据变了，性能从"不工作"到"可用"**。这是这个领域最重要的一次方法论修正。
+- 经典 DnCNN 在合成高斯白噪声测试集上性能优异，面对真实手机传感器暗光噪点时迅速失效，引入真实 RAW 噪声建模后泛化性显著提升
+- 前沿扩散增强模型（如 SUPIR）的核心竞争力，极大程度建立在千万级高质量图像与复杂高阶退化合成流水线的基础之上
 
-类似的故事在去噪、去模糊、视频增强里反复出现：
+```mermaid
+graph TD
+    A["传统方法: 单一 Bicubic 退化"] --> B["过拟合反插值函数<br/>对真实传感器噪声与压缩极度脆弱"]
+    C["现代工程: 高阶混合退化流水线"] --> D["覆盖广泛失真流形<br/>在真实复杂退化下稳定收敛"]
 
-- DnCNN 在 BSD68（标准基准）上无敌，在真实手机图上不行，用 SIDD 真实数据微调后大幅提升
-- SUPIR 的关键之一是用了约 2000 万（20M）张高质量互联网图像 + 复杂退化合成
-- 视频去抖在合成抖动数据上完美，在真实手机视频上需要额外的真实数据
+    style A fill:#ffebee
+    style B fill:#ffebee
+    style C fill:#e8f5e9
+    style D fill:#e8f5e9
+```
 
-**工程哲学**：
+## 5.2 训练数据的两大来源与工程权衡
 
-> 在影像增强里，**数据 pipeline 决定了模型能力上限**。
-> 同样的网络在不同数据上能差出一个数量级，反过来不成立。
+### 合成数据管道（Synthetic Data Pipeline）
 
-这一章讲数据 pipeline 怎么设计。
-
-## 5.2 训练数据的两种来源
-
-### 合成数据
-
-**做法**：拿一批高质量图（HR），用代码模拟退化得到（HR, LR）配对。
+**技术路径**：收集大规模高清真值图像（HR），在训练期通过随机参数化算子在线模拟退化过程，动态生成低质输入（LR）。
 
 ```python
-# 伪流程
-for hr in high_quality_images:
-    lr = degradation_pipeline(hr)
-    yield (lr, hr)
+# 合成数据在线生成逻辑
+for hr_batch in high_resolution_loader:
+    lr_batch = degradation_pipeline(hr_batch)
+    yield (lr_batch, hr_batch)
 ```
 
-优点：
+- **核心优势**：
+  1. **样本规模无限**：依托通用高清数据集即可源源不断合成无穷无尽的配对样本
+  2. **边际成本极低**：无需昂贵的光学实验室标定设备与实景拍摄人力
+  3. **退化空间完全可控**：能够精确调节模糊核半径、噪声信噪比与压缩质量因子的参数区间
+- **固有缺陷**：合成退化算子是对真实物理成像过程的近似，未建模的物理效应（如特定传感器的固定模式噪声 FPN）容易引发分布漂移。
 
-- **无限**：只要有 HR，就能合成无限多 (LR, HR) 对
-- **便宜**：不需要拍照设备
-- **可控**：能精确控制退化的每个参数
+### 真实光学配对数据（Real-World Paired Data）
 
-缺点：
+**技术路径**：在物理世界中使用专业光学变焦相机或多设备协同采集硬件对齐的（HR, LR）对。
 
-- **不真实**：合成出的 LR 不一定像真实拍到的烂图
-- **偏差**：所有"已知不真实"的部分会被模型学到
+- **实现方案**：
+  1. **光学焦段切换**（如 RealSR、DRealSR）：保持相机位置固定，长焦拍摄作为 HR，广角拍摄裁剪后作为 LR
+  2. **双摄分光支架**（如 DPED）：通过分光棱镜同步触发单反相机（HR）与低端手机（LR）曝光
+- **核心优势**：包含真实的传感器物理噪声、透镜像差、暗角与硬件 ISP 处理伪影。
+- **工程局限**：
+  1. **样本规模受限**：受制于实拍成本，公开数据集通常仅有数百至数千对
+  2. **亚像素几何与测光失配**：变焦或双摄不可避免存在局部视差、白平衡漂移与全局几何形变，直接用像素 L1 训练会导致网络输出边缘重影
+  3. **泛化范围狭窄**：模型容易过拟合特定相机型号的 ISP 风格
 
-### 真实数据
+**最佳工业落地范式**：以大规模合成数据进行深度预训练，再以少量业务场景真实配对数据进行小学习率微调对齐。
 
-**做法**：用相机/扫描仪在物理世界采集 (HR, LR) 对。
+## 5.3 物理成像链与 Bicubic 假设的理论脱节
 
-实现方式：
-
-- **不同焦段**（RealSR、DRealSR）：同一相机用不同焦段拍同一场景，远焦图当作 HR、近焦图当作 LR
-- **不同设备**（DPED）：低端手机和单反同时拍同一场景
-- **降质模拟**（少见）：拿 HR 走特定流程（打印 + 扫描）得到 LR
-
-优点：**真实**，所有退化都是物理过程，不是合成假设
-
-缺点：
-
-- **少**：几百到几千张配对，对数据驱动方法不够
-- **对齐难**：两次拍摄的物体位置、光线、白平衡都会偏，需要复杂的对齐流程
-- **退化模式有限**：你拍的是哪种相机的哪种退化，模型就只对这种退化好
-
-**工程实践**：合成数据为主 + 真实数据微调。
-
-## 5.3 经典 bicubic 流程的问题（再深入一点）
-
-第 1 章已经提过 bicubic 退化的问题。这里再深入。
-
-**真实低分辨率图的复杂性。** 一张被用户从相册里随手扔进来的图，经历过的处理大致是这样：
+一张用户拍摄并上传至互联网的低质图像，经历的实际物理与信号链如下：
 
 ```
-用户拍照流程:
-  传感器 (光子噪声 + 读出噪声)
-    → demosaicing (RGB 重建)
-    → ISP (降噪 + 锐化 + 白平衡 + tone mapping + 色彩矩阵)
-    → JPEG 压缩 (8-bit, quality 70-95)
-    → 上传到微信/微博 (再压缩, quality 50-70)
-    → 别人下载 (可能再压缩一次)
+物理成像与传输退化链:
+  入射光子
+    → 光学镜头 (光学像差 + 衍射极限 + 散焦)
+    → 传感器像元 (光子散粒噪声 + 读出噪声 + 暗电流)
+    → 拜耳滤色阵列 Demosaicing (色彩插值引入相邻相关性)
+    → 硬件 ISP (非线性降噪 + USM 锐化 + 自动白平衡 + 伽马色调映射)
+    → 相机本地 JPEG 压缩 (8-bit 量化, Quality 70-95)
+    → 社交平台网络重压缩 (二次 JPEG/WebP 压缩, Quality 50-70)
 ```
 
-每一步都有自己的退化贡献，最终的 LR 是这些变化的非线性复合。其中 demosaicing 是把传感器 Bayer 阵列上每个像素只采到单一颜色（R 或 G 或 B）的数据重建成三通道彩色图的步骤，几乎所有相机内部都做这件事，但不同厂家的算法会留下不同的相邻像素相关性。
-
-**bicubic 退化只模拟了哪一步？** 严格说，**一步都没真正模拟**。bicubic 假设 LR 是 HR 经过理想抗混叠滤波后再降采样的结果，整个过程是线性、可微、与场景内容无关的，**与上面这条物理链没有任何对应关系**。
-
-ESRGAN 在 bicubic 数据上学到的恰恰是"反 bicubic 函数"。这个函数在 bicubic 测试集上表现完美，但只要测试图换成手机拍出来的真实低分辨率图，模型就会做出"反 bicubic"该做的事：把不该被锐化的噪点也按"高频信号"处理，结果输出一张满是放大噪点的图。这种迁移失败不是偶然，是函数空间根本不重叠。
-
-**修正这个问题的方向：让训练数据的退化分布覆盖真实世界的退化分布。** Real-ESRGAN 的设计就是朝这个方向。下一节展开。
-
-为了让 §5.4 的代码读起来不抽象，先把这一节的主张画成一张图：左边是真实世界用户拿到一张烂图的物理过程，右边是 Real-ESRGAN 用代码模拟的过程，中间用箭头标出哪个合成步骤对应哪个物理过程。
+**Bicubic 下采样的数学本质**仅仅是理想抗混叠低通滤波后的网格重采样，其假定退化过程是全线性、空间平移不变且无噪声注入的。用 Bicubic 数据训练超分网络，本质是让网络逆解一个确定性的三次卷积多项式。一旦输入图像带有传感器噪点，网络会错误地将高频噪点判定为插值高频残差并进行大幅放大，导致输出严重劣化。
 
 ```mermaid
 graph LR
-    subgraph Real["真实世界 (物理链, 一次成像)"]
-        S1[光子分布]
-        S2[传感器读数<br/>+ shot + read noise]
-        S3[demosaicing<br/>+ ISP]
-        S4[JPEG quality 70-95]
-        S5[网络重压缩<br/>quality 50-70]
-        S1 --> S2 --> S3 --> S4 --> S5
+    subgraph Real["真实物理退化全流程"]
+        S1["光子统计分布"] --> S2["传感器读出与暗电流噪声"]
+        S2 --> S3["Bayer Demosaicing 与硬件 ISP"]
+        S3 --> S4["初次 JPEG 压缩 (Quality 70-95)"]
+        S4 --> S5["网络平台二次重压缩 (Quality 50-70)"]
     end
 
-    subgraph Synth["合成世界 (二阶退化, 可参数化)"]
-        D1[blur 1<br/>各向同性/异性高斯]
-        D2[resize 1<br/>area / bilinear / bicubic]
-        D3[noise 1<br/>Gaussian + Poisson]
-        D4[JPEG 1<br/>quality 30-95]
-        D5[blur 2<br/>偏小]
-        D6[resize 2]
-        D7[noise 2]
-        D8[JPEG 2 / sinc]
-        D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7 --> D8
+    subgraph Synth["Real-ESRGAN 高阶合成建模"]
+        D1["一阶多参数模糊核 (Blur 1)"] --> D2["一阶多模式下采样 (Resize 1)"]
+        D2 --> D3["一阶混合传感器噪声 (Noise 1)"]
+        D3 --> D4["一阶 DiffJPEG 压缩 (JPEG 1)"]
+        D4 --> D5["二阶小尺度模糊 (Blur 2)"]
+        D5 --> D6["二阶混合下采样 (Resize 2)"]
+        D6 --> D7["二阶低强度噪声 (Noise 2)"]
+        D7 --> D8["二阶 JPEG / Sinc 振铃滤波"]
     end
 
-    S2 -. 模拟 .-> D3
-    S3 -. 模拟 .-> D1
-    S3 -. 模拟 .-> D2
-    S4 -. 模拟 .-> D4
-    S5 -. 模拟 .-> D8
+    S2 -.物理对齐.-> D3
+    S3 -.物理对齐.-> D1
+    S4 -.物理对齐.-> D4
+    S5 -.物理对齐.-> D8
 
     style Real fill:#e3f2fd
     style Synth fill:#fff8e1
 ```
 
-图里有几条规律值得记住。第一，物理链是一次性的、顺序固定的，合成链是有意打乱顺序、参数随机化的，因为模型要见过的不是某一台相机的退化，而是"所有可能的相机+所有可能的传输链"的退化分布。第二，物理链的某些步骤（如 ISP 降噪和锐化）会在 LR 上留下细节耦合，合成链很难精确复刻，所以 §5.12 才会强调"用真实数据微调"作为最后一公里。第三，合成链里两阶 JPEG 之间的中间产物是带块状伪影的，第二阶 JPEG 会进一步打乱这些块边界，这是 §5.4 里要强调"二阶"的根本原因。
+## 5.4 Real-ESRGAN 高阶退化流水线解构
 
-## 5.4 Real-ESRGAN 退化 pipeline 详解
+Real-ESRGAN 的核心设计包含两大维度：
 
-Real-ESRGAN 的 pipeline 由两个关键设计组成：
-
-### 设计一：每个组件参数化 + 随机化
-
-每一种退化（模糊、下采样、噪声、JPEG）都不是固定的，而是**从一个分布里随机采**。模型在训练时见到了广泛的退化分布。
-
-### 设计二：二阶退化（high-order degradation modeling）
-
-把整个退化流程跑两遍。这是 Real-ESRGAN 的核心创新，也是它在论文标题里就要强调的"high-order"的含义。
-
-```
-一阶退化 (模拟相机内部):
-  HR → blur₁ → downsample₁ → noise₁ → jpeg₁ → 中间产物
-
-二阶退化 (模拟传输/二次压缩):
-  中间产物 → blur₂ → downsample₂ → noise₂ → jpeg₂ → LR
-```
-
-这样合成的 LR 就接近"图片被相机处理后又被互联网压缩多次"的真实状态。
-
-第二阶的关键参数和第一阶**有意不同**：
-
-- 第一阶 blur 偏大（模拟实际相机/传输模糊）
-- 第二阶 blur 偏小（避免训练数据糊到不能学）
-- 第二阶有可能加 **sinc 滤波**（基于 sinc 函数的滤波器，频域是矩形低通，时域会产生振荡），用来模拟过度锐化导致的振铃伪影，这种伪影在 LCD 显示器/某些图像处理软件输出里特别常见
-- 二阶最后阶段把 **resize + sinc 与 JPEG 的先后顺序**在官方代码里做**随机化**（每次训练 step 从两种顺序里随机选一种），不是固定的，这让模型见到更多组合
-
-把"二阶 + 顺序随机化"画成一张状态图，更直观一些：
+1. **组件参数化与连续分布采样**：模糊核、插值模式、噪声类型与压缩质量均从预设连续区间内独立随机采样，消除模型对固定参数的记忆效应。
+2. **二阶退化建模（High-Order Degradation Modeling）**：将模糊、下采样、加噪与压缩的完整退化链连续串联执行两次，完美复刻真实图像“相机初次成像 + 互联网重采样二次压缩”的复合退化状态。
 
 ```mermaid
 graph TD
-    HR[HR clean image<br/>x in 0,1]
-    HR --> B1[blur 1<br/>sigma 0.2-3.0]
-    B1 --> R1[resize 1<br/>scale 0.15-1.5]
-    R1 --> N1[noise 1<br/>std 1-30/255]
-    N1 --> J1[JPEG 1<br/>quality 30-95]
-    J1 --> Mid[中间产物]
-    Mid --> B2[blur 2<br/>sigma 0.2-1.5]
-    B2 --> Choice{随机顺序}
-    Choice -->|分支 A| A1[resize + sinc 后 JPEG]
-    Choice -->|分支 B| A2[JPEG 后 resize + sinc]
-    A1 --> LR[LR degraded]
+    HR["高清原图 HR (B, 3, H, W)"] --> B1["一阶模糊 (Blur 1)<br/>sigma: 0.2 - 3.0"]
+    B1 --> R1["一阶缩放 (Resize 1)<br/>scale: 0.15 - 1.5"]
+    R1 --> N1["一阶混合噪声 (Noise 1)<br/>高斯 / 泊松 1-30/255"]
+    N1 --> J1["一阶 JPEG 压缩 (JPEG 1)<br/>quality: 30 - 95"]
+    J1 --> Mid["中间退化状态"]
+    Mid --> B2["二阶小尺度模糊 (Blur 2)<br/>sigma: 0.2 - 1.5"]
+    B2 --> Choice{"二阶次序随机化"}
+    Choice -->|分支 A| A1["先 Resize/Sinc 再 JPEG 2"]
+    Choice -->|分支 B| A2["先 JPEG 2 再 Resize/Sinc"]
+    A1 --> LR["最终退化输入 LR (B, 3, H/4, W/4)"]
     A2 --> LR
 
     style HR fill:#e8f5e9
@@ -220,46 +164,35 @@ graph TD
     style LR fill:#ffebee
 ```
 
-这张图里需要强调两个工程结论。第一，每个 step 的参数都是从一个明确的区间里随机采样的，所以"训练时模型见到的 $D$ 分布"被显式地写成了代码，而不是模糊地"希望它见过各种情况"。第二，最后阶段两种顺序随机化的意义是让模型见到"先 resize 再 JPEG"和"先 JPEG 再 resize"两种结果，前者更像相机本机处理，后者更像微博转发链。模型如果只见过一种顺序，它会过拟合到该顺序留下的伪影模式。
-
-### 一个简化版的 Real-ESRGAN pipeline
+### Real-ESRGAN 退化管道核心原型实现
 
 ```python
 import random
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 
 class RealESRGANDegradation:
-    """Real-ESRGAN 风格退化的主流程示意 (非完整实现)。
-    输入: HR clean image (B, 3, H, W) in [0, 1]
-    输出: LR degraded image (B, 3, H/scale, W/scale) in [0, 1]
-
-    与官方 Real-ESRGAN 的差异:
-    - JPEG 用占位符 (官方用 diffjpeg)
-    - 没有 sinc 滤波 (官方用来模拟过锐化伪影)
-    - 模糊核只有各向同性高斯 (官方还有各向异性、广义高斯、plateau)
-    - 退化顺序固定 (官方的最终阶段 sinc/resize/JPEG 顺序随机化)
-    本节后面会逐项展开这些缺失部分。
+    """Real-ESRGAN 风格高阶退化生成核心逻辑。
+    输入: 高清张量 (B, 3, H, W), 范围 [0, 1]
+    输出: 低质退化张量 (B, 3, H/scale, W/scale), 范围 [0, 1]
     """
 
     def __init__(self, scale: int = 4):
         self.scale = scale
 
-        # 一阶退化参数范围
+        # 一阶退化参数区间
         self.blur1_sigma_range = (0.2, 3.0)
-        self.noise1_range = (1, 30)         # std on [0, 255]
+        self.noise1_range = (1, 30)         # 对应 8 位尺度下的噪声标准差
         self.jpeg1_range = (30, 95)
-        self.resize1_range = (0.15, 1.5)    # 相对 final size
+        self.resize1_range = (0.15, 1.5)
 
-        # 二阶退化参数范围 (整体偏弱)
+        # 二阶退化参数区间（整体强度适度减弱，防止信息完全灭失）
         self.blur2_sigma_range = (0.2, 1.5)
         self.noise2_range = (1, 25)
         self.jpeg2_range = (30, 95)
         self.resize2_range = (0.3, 1.2)
 
-    # ============= 模糊 =============
     def random_gaussian_blur(self, x: torch.Tensor,
                              sigma_range: tuple) -> torch.Tensor:
         sigma = random.uniform(*sigma_range)
@@ -278,10 +211,8 @@ class RealESRGANDegradation:
         kernel = kernel / kernel.sum()
         return kernel.unsqueeze(0).unsqueeze(0)
 
-    # ============= 下采样 =============
     def random_resize(self, x: torch.Tensor, target_size: tuple,
                       scale_range: tuple) -> torch.Tensor:
-        """随机选择目标尺寸 (相对 target_size 缩放), 随机选插值。"""
         s = random.uniform(*scale_range)
         h, w = target_size
         new_h = max(1, int(h * s))
@@ -292,39 +223,28 @@ class RealESRGANDegradation:
             kw['align_corners'] = False
         return F.interpolate(x, size=(new_h, new_w), **kw)
 
-    # ============= 噪声 =============
     def random_noise(self, x: torch.Tensor,
                      sigma_range_255: tuple) -> torch.Tensor:
-        """三种噪声按概率选择: 彩色高斯 0.4, 灰度高斯 0.3, 泊松 0.3。"""
         choice = random.random()
         sigma_max = random.uniform(*sigma_range_255) / 255.0
 
         if choice < 0.4:
-            # 彩色高斯
+            # 独立彩色高斯噪声
             return (x + torch.randn_like(x) * sigma_max).clamp(0, 1)
         elif choice < 0.7:
-            # 灰度高斯 (所有通道相同噪声)
+            # 单通道灰度高斯噪声（三通道共享相同噪声图）
             n = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
             return (x + n * sigma_max).clamp(0, 1)
         else:
-            # 泊松 (signal-dependent)
+            # 泊松散粒噪声（信号相关）
             scale = random.uniform(80, 1000)
             photons = (x * scale).clamp(min=0)
             return (torch.poisson(photons) / scale).clamp(0, 1)
 
-    # ============= JPEG (简化, 真实需 diffjpeg) =============
     def random_jpeg(self, x: torch.Tensor, quality_range: tuple) -> torch.Tensor:
-        """占位符。真实代码:
-            from basicsr.utils.diffjpeg import DiffJPEG
-            jpeger = DiffJPEG(differentiable=False).to(x.device)
-            q = random.randint(*quality_range)
-            quality = torch.full((x.shape[0],), q, device=x.device)
-            return jpeger(x, quality=quality)
-        """
-        # 直接返回，不做任何处理（占位符）
+        # 生产环境调用 DiffJPEG 实现
         return x
 
-    # ============= 一阶退化 =============
     def first_order(self, hr: torch.Tensor, target_size: tuple) -> torch.Tensor:
         x = self.random_gaussian_blur(hr, self.blur1_sigma_range)
         x = self.random_resize(x, target_size, self.resize1_range)
@@ -332,7 +252,6 @@ class RealESRGANDegradation:
         x = self.random_jpeg(x, self.jpeg1_range)
         return x
 
-    # ============= 二阶退化 =============
     def second_order(self, x: torch.Tensor, target_size: tuple) -> torch.Tensor:
         x = self.random_gaussian_blur(x, self.blur2_sigma_range)
         x = self.random_resize(x, target_size, self.resize2_range)
@@ -340,87 +259,57 @@ class RealESRGANDegradation:
         x = self.random_jpeg(x, self.jpeg2_range)
         return x
 
-    # ============= 主流程 =============
     def __call__(self, hr: torch.Tensor) -> torch.Tensor:
-        """完整 Real-ESRGAN 风格退化。
-        hr: (B, 3, H, W) in [0, 1]
-        return: lr (B, 3, H/scale, W/scale)
-        """
         b, c, h, w = hr.shape
         out_h, out_w = h // self.scale, w // self.scale
 
-        # 一阶: 缩到 [0.15*out, 1.5*out] 之间的中间尺寸
+        # 阶段一退化
         intermediate = self.first_order(hr, target_size=(out_h, out_w))
 
-        # 二阶: 最终缩到 (out_h, out_w), 注意先 resize 到目标
+        # 阶段二退化
         lr = self.second_order(intermediate, target_size=(out_h, out_w))
 
-        # 强制最终尺寸 (二阶 resize 可能让尺寸偏离)
+        # 强制对齐到最终规格尺寸
         lr = F.interpolate(lr, size=(out_h, out_w),
-                          mode='bicubic', align_corners=False)
+                           mode='bicubic', align_corners=False)
         return lr.clamp(0, 1)
 ```
 
-实战中的版本会比这个复杂：完整的 Real-ESRGAN 代码大约 700 行。补的内容包括：
+## 5.5 模糊核全家族物理拓扑
 
-- 多种模糊核（各向异性、广义高斯、plateau）
-- sinc 滤波（模拟过锐化伪影）
-- 可微 JPEG（直接在 GPU 上做）
-- 灰度图/彩色图的概率分配
-- USM sharpening（Unsharp Mask，反掩模锐化）反向（模拟手机后处理）
+在盲复原任务中，单一各向同性高斯核无法满足复杂光学失真建模。工业级退化管道需融合多种核拓扑：
 
-USM 的具体做法是：先对图像做高斯模糊得到 $x_b$，然后用 $x_{usm} = x + \lambda (x - x_b)$ 增强高频，其中 $\lambda$ 控制锐化强度。手机厂商的 ISP 几乎都会内置 USM 风格的锐化，这导致用户拍到的图本身就带轻微"过锐化"特征。Real-ESRGAN 在合成时也加入 USM 步骤，让模型能"识别"这类已经被锐化过一遍的输入，避免在 SR 时再次叠加锐化导致看起来油腻。
+```mermaid
+graph TD
+    Root["模糊核多样性家族"] --> Iso["各向同性高斯<br/>对称散焦模糊"]
+    Root --> Aniso["各向异性高斯<br/>像差与手抖方向模糊"]
+    Root --> Gen["广义高斯<br/>可调尖峰形状"]
+    Root --> Plat["Plateau 平台核<br/>散焦圆盘光斑"]
+    Root --> Mot["直线运动模糊核<br/>曝光期相对位移"]
+    Root --> Sinc["Sinc 振铃滤波器<br/>模拟过度锐化边缘"]
 
-但骨架就是上面这个，扩展只是把"采核"这一步从单一函数换成一族函数，把退化顺序从固定换成随机选择。读完 §5.5 到 §5.8 各组件之后，你应该能自己把上面的骨架补全到 production 级别。
+    style Root fill:#fff3e0
+    style Iso fill:#e3f2fd
+    style Aniso fill:#e3f2fd
+    style Gen fill:#fff8e1
+    style Plat fill:#fff8e1
+    style Mot fill:#ffebee
+    style Sinc fill:#ffebee
+```
 
-## 5.5 模糊核家族
+### 核心核函数数学表征
 
-不同退化场景需要不同的模糊核。
-
-### 各向同性高斯（最基础）
-
-$$
-k(u, v) = \frac{1}{2\pi\sigma^2} \exp\left(-\frac{u^2 + v^2}{2\sigma^2}\right)
-$$
-
-只有一个参数 $\sigma$。模拟散焦、大气模糊。$\sigma$ 越大模糊越严重，且模糊在所有方向上都一样。
-
-### 各向异性高斯
-
-$$
-k(u, v) \propto \exp\left(-\frac{1}{2}\begin{pmatrix}u\\v\end{pmatrix}^T \Sigma^{-1} \begin{pmatrix}u\\v\end{pmatrix}\right)
-$$
-
-协方差矩阵 $\Sigma$ 控制 x/y 方向不同的模糊量。模拟相机抖动、镜头像差。把 $\Sigma$ 写开是：
-
-$$
-\Sigma = R(\theta)\begin{pmatrix}\sigma_1^2 & 0 \\ 0 & \sigma_2^2\end{pmatrix} R(\theta)^T
-$$
-
-其中 $R(\theta)$ 是旋转矩阵，$\theta$ 是模糊方向，$\sigma_1, \sigma_2$ 是两个主轴上的模糊尺度。三个参数共同决定核的形状（一个角度 + 两个尺度），比各向同性多两个自由度，能模拟"水平模糊比垂直模糊明显"这类常见的相机抖动残留。
-
-### 广义高斯（Generalized Gaussian）
-
-$$
-k(u, v) \propto \exp\left(-\left(\frac{u^2}{\sigma_x^2} + \frac{v^2}{\sigma_y^2}\right)^\beta\right)
-$$
-
-多一个形状参数 $\beta$：$\beta = 1$ 是标准高斯，$\beta > 1$ 边缘更尖（更接近 box）、$\beta < 1$ 边缘更软。
-
-### Plateau-shaped 核
-
-Real-ESRGAN 还使用一族 **plateau 核**：中心是一个平坦的"平台"区域、边缘陡降。它和广义高斯是**两个独立的家族**，不是简单的"$\beta < 1$ 等于 plateau"。Plateau 核更接近于"散焦圆盘"的形状，常出现在小光圈大景深的场景里，是普通高斯核无法精确表示的。Real-ESRGAN 在采样训练核时会按概率混合这几族（各向同性高斯、各向异性高斯、广义高斯、plateau），具体比例在官方代码的 `degradations.py` 里可查：各向同性高斯 0.45、各向异性高斯 0.25、广义各向同性高斯 0.12、广义各向异性高斯 0.03、plateau 各向同性 0.12、plateau 各向异性 0.03，另有约 0.1 的概率改用 sinc 核。
-
-### 运动模糊核
-
-模拟拍摄时相机或被摄物体的直线运动。在曝光时间 $T$ 内，如果传感器相对场景以速度 $v$ 做直线移动，那么场景上的每个点会沿着运动方向在像面上扫出一条长度为 $vT$ 的线段。把这条线段离散化到像素网格、并归一化，就是一个最简形式的运动模糊核。它在频域里是一个 sinc 函数沿着运动方向的延拓，因此运动模糊不仅让边缘糊，还会在该方向上选择性地压制高频。
+1. **各向异性高斯核**：引入协方差矩阵 $\Sigma = R(\theta) \begin{pmatrix} \sigma_1^2 & 0 \\ 0 & \sigma_2^2 \end{pmatrix} R(\theta)^T$，通过主轴尺度比 $\sigma_1/\sigma_2$ 与旋转角 $\theta$ 模拟方向性模糊。
+2. **广义高斯核**：引入形状参数 $\beta$：$k(u, v) \propto \exp\left(-\left(\frac{u^2}{\sigma_x^2} + \frac{v^2}{\sigma_y^2}\right)^\beta\right)$，$\beta < 1$ 时呈现重尾分布，$\beta > 1$ 时边缘急剧收敛。
+3. **Plateau 平台核**：中心区域为平坦顶盖、外围快速衰减，精准拟合大光圈光学系统的离焦弥散圆（Circle of Confusion）。
+4. **Sinc 滤波核**：频域为理想矩形低通滤波，时域表现为环状空间振荡。引入 Sinc 滤波的目的是模拟图像经由传统 USM 锐化算法处理后遗留的振铃光晕（Ringing Artifacts），防止超分网络将振铃误判为真实边缘。
 
 ```python
 import numpy as np
 import torch
 
 def motion_blur_kernel(length: int, angle_deg: float) -> torch.Tensor:
-    """长度为 length 的线段形运动模糊核, 方向 angle_deg 度。"""
+    """生成线段运动模糊核，模拟曝光时间内相机与物体的相对平移。"""
     kernel = np.zeros((length, length), dtype=np.float32)
     angle = np.deg2rad(angle_deg)
     cx, cy = length // 2, length // 2
@@ -429,248 +318,106 @@ def motion_blur_kernel(length: int, angle_deg: float) -> torch.Tensor:
         dy = int(round(cy + (i - cx) * np.sin(angle)))
         if 0 <= dx < length and 0 <= dy < length:
             kernel[dy, dx] = 1.0
-    kernel /= kernel.sum()
+    kernel /= (kernel.sum() + 1e-8)
     return torch.from_numpy(kernel).unsqueeze(0).unsqueeze(0)
 ```
 
-更真实的运动核会让线段带轻微曲率（模拟手抖时的非匀速运动），或者把多条不同方向的短线段叠加（模拟相机抖动 + 物体局部运动）。Real-ESRGAN 的官方实现里运动核占比不高，主要是把它作为"低概率出现的难样本"采样进训练分布，避免模型在单一类型的模糊上过拟合。
+## 5.6 多样化下采样策略对比
 
-### Sinc 滤波
+| 插值算法 | 频域传递特性 | 典型空间伪影 | 工业模拟场景 |
+|---------|-------------|-------------|-------------|
+| **Nearest** | 空间矩形脉冲，频域高频镜像泄漏 | 剧烈马赛克阶梯边缘 | 模拟低劣像素缩放算法 |
+| **Bilinear** | 空间三角卷积，高频衰减平缓 | 画面呈现适度模糊 | 移动端实时缩放管线 |
+| **Bicubic** | 逼近 Sinc 函数，通带平坦过渡陡峭 | 包含轻微过冲与振铃 | 桌面端标准图像处理 |
+| **Lanczos** | 窗口截断 Sinc 滤波 | 边缘极其锐利，高频振铃显著 | 专业图形软件高质量缩放 |
+| **Area / Box** | 局部像素网格积分均值 | 消除混叠，平滑度高 | 大比例下采样物理像素合并 |
 
-$$
-k(u, v) = \frac{\omega_c}{2\pi r} J_1(\omega_c r), \quad r = \sqrt{u^2 + v^2}
-$$
+在数据加载期随机混洗上述下采样方式，能够迫使网络对各类重采样留存的频域指纹保持鲁棒。
 
-其中 $J_1$ 是一阶 Bessel 函数。Sinc 在频域是理想低通滤波（rect 形），但截断的 sinc 在像素域有振荡，会产生**振铃**伪影。
+## 5.7 传感器物理噪声精细化建模
 
-为什么 Real-ESRGAN 用 sinc：模拟某些图像处理软件（如 Adobe 系产品）的锐化算法在过度处理后产生的振铃。这种伪影在真实"被处理过"的图像里很常见，尤其是从微博/Twitter 下载下来的"看起来挺锐其实细节是假的"那种图。模型如果没在训练数据里见过 sinc 风格的振铃，遇到这类输入时会把振铃当作真实高频去保留甚至放大，让输出看起来更假。
-
-为了让"模糊核家族"这件事有个直观印象，下面这张图比较各种核在像素域的剖面形状：
-
-```mermaid
-graph LR
-    A[各向同性高斯<br/>圆形钟形] --> Aa[1 参数 sigma]
-    B[各向异性高斯<br/>椭圆钟形] --> Bb[3 参数 sigma1 sigma2 theta]
-    C[广义高斯<br/>钟形可调尖度] --> Cc[加形状参数 beta]
-    D[Plateau<br/>中心平台 边缘陡降] --> Dd[模拟散焦圆盘]
-    E[运动核<br/>线段] --> Ee[长度和方向]
-    F[Sinc<br/>振荡环] --> Ff[模拟过锐化振铃]
-
-    style A fill:#e3f2fd
-    style B fill:#e3f2fd
-    style C fill:#fff8e1
-    style D fill:#fff8e1
-    style E fill:#ffebee
-    style F fill:#ffebee
-```
-
-颜色分组反映"难度"：左侧三族是高斯家族，参数少、采样便宜；中间两族需要额外几何参数，但仍可批量在 GPU 上生成；右侧两族（运动、sinc）形状特殊、对模型来说最难，需要专门采样且不能用单一高斯近似。
-
-## 5.6 下采样的多种策略
-
-不同的插值核在频域行为差别巨大：
-
-| 算法 | 频域行为 | 视觉特点 | 何时用 |
-|------|---------|---------|-------|
-| nearest | 矩形（高频泄漏严重） | 锯齿 | 模拟极差的处理 |
-| bilinear | 三角形 | 略糊 | 均衡选择 |
-| bicubic | 接近 sinc | 锐利但有 ringing | 学术标准 |
-| lanczos | 截断 sinc | 最锐利、振铃明显 | 模拟某些软件输出 |
-| area / box | sinc（空间域是矩形均值） | 柔和无锯齿 | 大幅缩小时 |
-
-Real-ESRGAN 的 pipeline 在每次 resize 时**随机选**这些之一，让模型见过各种插值伪影。
-
-为什么这点重要，可以从频域角度理解：bicubic 在频域几乎是理想低通，会把高频干净地滤除；nearest 完全不做低通，留下大量混叠；area 把每个 LR 像素取作 HR 块的均值，等价于 box filter，其频域响应是 sinc，对高频有整体压制但抑制并不锐利，会把细小纹理一并抹平，同时对粗大边缘影响有限。模型如果只见过 bicubic 的"干净低频图"，在面对真实图（这些图往往是 area 或 bilinear 处理过的）时就会把残留的混叠当成高频信号去"放大"，结果是把锯齿做得更尖锐而不是恢复细节。
-
-工程上的一个微小但有用的细节：`torch.nn.functional.interpolate` 在 `align_corners=False` 时和 OpenCV 的 `cv2.resize` 默认设置基本一致；如果设成 `True`，则与一些老版 TensorFlow 的对齐方式一致，两者会在 1-2 像素的边缘处差异明显。线上推理时使用的 resize 库要和训练时一致，否则会出现"训练时是 bicubic，部署时调用的是 ImageMagick 的 catmull-rom 实现，输出尺寸差一行"这类不容易察觉的 bug。
-
-## 5.7 噪声的实现细节
-
-第 1 章已经讲过噪声的物理模型。这里补充几个工程细节。
-
-### 灰度噪声 vs 彩色噪声
-
-真实噪声的颜色相关性是个微妙问题，要从光学和处理流程两个层面理解：
-
-- 高端相机（全画幅单反、中画幅）：传感器像元大、信噪比高，单帧噪声大致独立同分布（每通道独立），三通道噪声基本无相关
-- 手机摄像头：像元小、ISO 常常很高，经过 demosaicing（用相邻像素插出缺失颜色）后，**相邻像素的噪声会相关**；色彩矩阵也会把不同通道的噪声混合，导致通道间也有相关
-- ISP 降噪后：内置降噪算法会先把"独立的彩色噪点"压掉，剩余噪声常常是"灰色"（三通道相关，看上去像一层薄薄的灰雾）
-
-工程实践：训练数据里**两种都给**，50% 时间用三通道独立的彩色噪声（模拟低 ISP 处理或 RAW），50% 时间用灰度噪声（所有通道共享同一张噪声 map，模拟 ISP 后残留）。再考究一点的实现会按 9:1 的比例混入"相邻像素相关"的噪声（用一张随机噪声做轻微高斯模糊后再加上去），模拟手机 demosaicing 后的实际状态。
-
-### 噪声强度分布
-
-噪声 sigma 不要均匀采样，真实场景里**小噪声更常见，大噪声较少见**。
-
-工程上常用：
-
-```python
-# 偏小噪声居多的分布
-sigma = torch.rand(()) ** 2 * sigma_max  # 平方让分布偏小
-```
-
-或者从一个明确的混合分布采：
-
-```python
-if random.random() < 0.5:
-    sigma = random.uniform(0.005, 0.02)   # 小噪声 (常见)
-else:
-    sigma = random.uniform(0.02, 0.08)    # 大噪声 (少见但要见过)
-```
-
-### 真实传感器噪声模型
-
-如果想做更精确的模拟，可以用论文 "A Physics-based Noise Formation Model for Extreme Low-light Raw Denoising"（CVPR 2020）提出的物理模型。
-
-简化版：
+在暗光成像与极低信噪比场景下，简单的加性高斯白噪声无法反映硬件物理特性。真实噪声模型必须融合光子散粒噪声（泊松分布）与传感器读出电路噪声（高斯分布）：
 
 ```python
 def realistic_sensor_noise(
     x: torch.Tensor,
     iso: int = 1600,
-    quantum_efficiency: float = 0.5,
     read_noise_sigma: float = 0.005,
     dark_current: float = 0.001,
     quant_step: float = 1/255.0,
 ) -> torch.Tensor:
-    """模拟真实传感器噪声链。
-    iso 越大, 各类噪声越强。
-    """
-    # 模拟"相机增益"对噪声的影响
+    """基于物理成像机制的传感器噪声合成流水线。"""
     gain = iso / 100.0
 
-    # 1. 光子噪声 (Poisson, signal-dependent)
-    photons = x * 1000 / gain  # 标定光子数
+    # 1. 光子散粒噪声 (Poisson Shot Noise, 信号依赖)
+    photons = x * 1000.0 / gain
     photons_noisy = torch.poisson(photons.clamp(min=0))
-    shot = photons_noisy / 1000 * gain
+    shot = photons_noisy / 1000.0 * gain
 
-    # 2. 暗电流噪声
-    dark = torch.poisson(torch.full_like(x, dark_current * gain)) / 1000
+    # 2. 暗电流热噪声 (Dark Current Noise)
+    dark = torch.poisson(torch.full_like(x, dark_current * gain)) / 1000.0
 
-    # 3. 读出噪声 (Gaussian, signal-independent)
+    # 3. 读出电路高斯白噪声 (Read Noise, 信号独立)
     read = torch.randn_like(x) * read_noise_sigma * gain
 
-    # 4. 量化误差
+    # 4. 模拟模数转换 (ADC) 量化误差
     out = shot + dark + read
     out = (out / quant_step).round() * quant_step
-
     return out.clamp(0, 1)
 ```
 
-这个模型对**手机暗光去噪**的训练数据合成至关重要。
+## 5.8 频域压缩模拟：DiffJPEG 的工程化落地
 
-## 5.8 JPEG 压缩
+JPEG 压缩广泛存在于网络图像中。JPEG 算法的 8×8 块 DCT 变换与高频系数除法量化舍入（Rounding），会在图像中引入显著的块效应（Block Artifacts）与高频蚊状伪影（Mosquito Noise）。
 
-JPEG 是合成 pipeline 里最容易被忽略、又最关键的一步。如果训练数据里没有 JPEG，那么模型在面对任何"经过网络传输"的图时（也就是 99% 的真实输入）都会失效，因为 JPEG 块状伪影对模型来说是完全没见过的输入分布。
-
-JPEG 的编解码流程简述如下，便于理解后面为什么"DCT 量化步"是不可微的核心：
-
-1. RGB → YCbCr，把亮度 Y 和色度 Cb/Cr 分开
-2. 对 Cb/Cr 做色度下采样（4:2:0 最常见，分辨率各砍一半）
-3. 每个 8×8 块做 DCT，得到 64 个频域系数
-4. 用 quality 决定的量化表对系数除法+取整
-5. zig-zag 扫描 + 熵编码存盘
-
-第 4 步的"取整"是把连续值映射到整数，**没有梯度**。这意味着如果想在端到端训练中让梯度穿过 JPEG，需要用一个软化的版本替代取整（例如 straight-through estimator 或者一阶 Taylor 展开），这正是 DiffJPEG 库做的事。
-
-JPEG 在合成 pipeline 里需要满足：
-
-1. **可以在 GPU 上做**（不要每张图存盘读盘），读盘瓶颈会让 dataloader 卡死整个训练
-2. **理想情况下可微**（虽然增强训练里梯度通常不会传过 JPEG，但可微版本性能也不错，且未来如果想加 perceptual loss 在 JPEG 后图上算梯度，可微是必需的）
-
-推荐用 **DiffJPEG**（basicsr 里内置了一份可直接调用的实现，原始版本见 [github.com/mlomnitz/DiffJPEG](https://github.com/mlomnitz/DiffJPEG)），它实现了可微的 JPEG 编解码：
+在训练流水线中，严禁采用 CPU 调用 OpenCV/PIL 读写磁盘的方式模拟 JPEG，否则磁盘 I/O 将彻底拖垮 GPU 计算吞吐。必须采用 **DiffJPEG** 在 GPU 显存内执行全张量并行的矩阵分块 DCT 变换与可调量化表模拟。
 
 ```python
 from basicsr.utils.diffjpeg import DiffJPEG
 
-# 构造一次, 不在构造时传 quality; 是否可微在构造时决定
-jpeger = DiffJPEG(differentiable=False).to(device)    # 推理用
-# jpeger = DiffJPEG(differentiable=True).to(device)    # 训练时想反传就换这一行
+# 初始化 GPU 端 JPEG 模拟算子
+jpeger = DiffJPEG(differentiable=False).cuda()
 
-def random_jpeg_diffjpeg(x: torch.Tensor, quality_range=(30, 95)) -> torch.Tensor:
-    # quality 在 forward 时传入, basicsr 版接受一个 (B,) 的 quality 张量
+def batch_gpu_jpeg(x: torch.Tensor, quality_range=(30, 95)) -> torch.Tensor:
+    """在 GPU 上对整批张量执行随机质量因子 JPEG 压缩模拟。"""
     q = random.randint(*quality_range)
-    quality = torch.full((x.shape[0],), q, device=x.device)
+    quality = torch.full((x.shape[0],), q, device=x.device, dtype=torch.float32)
     return jpeger(x, quality=quality)
 ```
 
-### 第二阶 JPEG 的特殊性
+## 5.9 增强数据集生态与组合策略
 
-Real-ESRGAN 的二阶 JPEG 模拟"已经压缩过的图被再次压缩"。这种情况下：
+### 核心公开数据集全景
 
-- 第一阶 JPEG 的块状伪影会被第二阶 JPEG 进一步混乱
-- 两次 JPEG 的 8×8 块边界一般不重合，因为中间夹了一次 resize，导致复杂的非对齐复合伪影
-- 真实"网络重传"图像里这种现象普遍存在，你保存的微博图被别人重转后，块边界已经"漂移"过一次
+| 数据集分类 | 代表数据集名称 | 样本规模 | 分辨率与内容特点 | 主要应用场景 |
+|-----------|--------------|---------|-----------------|-------------|
+| **高质量通用基底** | **DF2K (DIV2K + Flickr2K)** | 3,450 对 | 2K 分辨率，丰富自然纹理 | 学术标准训练基准 |
+| **大规模现代图库** | **LSDIR** | 84,991 张 | 多样化现实题材，超大容量 | 现代大模型通用预训练 |
+| **真实光学配准对** | **RealSR / DRealSR** | 数百组对 | 多焦段 DSLR 实拍配准 | 真实场景微调与评估 |
+| **移动端噪声特化** | **SIDD / DND** | 数万组 RAW/RGB | 手机多 ISO 实拍暗光噪点 | 真实传感器降噪评估 |
+| **人脸垂直领域** | **FFHQ / CelebA-HQ** | 70K / 30K | 1024 高清五官对齐人像 | 人脸盲复原模型训练 |
+| **视频时序增强** | **REDS / Vimeo-90K** | 数十万帧 | 动态运动与复杂相机抖动 | 视频超分与去模糊 |
 
-直接两次调用 JPEG 就能模拟这种现象。值得注意的细节：第二阶 JPEG 的 quality 不需要比第一阶低，反过来甚至常见（手机 → 微信 quality 70 → 你保存时 quality 90），重点是**两次量化网格不对齐**，而不是 quality 数值本身。
+### 生产级数据混合工程方案
 
-### 关于 chroma subsampling 的额外提醒
+1. **基底预训练阶段**：以 `LSDIR (85K) + DF2K (3.5K)` 作为核心 HR 源，全程启用 Real-ESRGAN 二阶退化合成，训练 50 万至 100 万 Iterations，确立通用空间恢复先验。
+2. **场景微调阶段**：混合少量（5% - 10% 采样权重）真实配对数据（如 RealSR），使用较小学习率（如 $1 \times 10^{-5}$）微调 2 万至 5 万 Iterations，校准残余的 ISP 分布偏差。
 
-JPEG 的 4:2:0 色度下采样会把 Cb/Cr 通道分辨率降低一半，对人眼几乎察觉不到，但模型会通过它学到"绿色边缘比红色边缘要锐利"等不真实的关系。如果你的目标是修复"被网络压扁的图"，那么训练时的 JPEG 模拟一定要保留 chroma subsampling；如果你的目标是修复"高保真专业拍摄但有轻微 JPEG 伪影"，可以关掉。DiffJPEG 默认是 4:2:0。
+## 5.10 空间数据增强的准则与禁区
 
-## 5.9 数据集选择
-
-按用途列出常用数据集：
-
-### 通用 SR / 去噪 / 去模糊
-
-| 数据集 | 张数 | 特点 | 用途 |
-|-------|------|------|------|
-| **DIV2K** | 800 + 100 val | 高质量自然图，2K 分辨率 | 学术标准 |
-| **Flickr2K** | 2650 | DIV2K 风格补充 | 与 DIV2K 合并成 DF2K |
-| **LSDIR** | 84,991 + 250 val | 2023 大规模数据集 | 现代训练首选 |
-| **BSD500** | 500 | 老但经典 | 去噪 |
-| **OST300** | 300 | 户外纹理特化 | 真实 SR 辅助 |
-| **WED** | ~5000 | Watermark/exif 多样 | 真实场景 |
-
-### 真实退化（无合成）
-
-| 数据集 | 张数 | 特点 |
-|-------|------|------|
-| **RealSR** | 595 (V3) | Canon + Nikon 不同焦段对 |
-| **DRealSR** | ~800 | DSLR 不同焦段，对齐更精 |
-| **NTIRE Real-World SR** | 每年增 | 比赛数据，质量高 |
-| **DPED** | ~16K | 手机 vs 单反 |
-| **SIDD** | 320 (HR) + 30K (LR) | 真实手机噪声 |
-| **DND** | 50 测试 | Darmstadt Noise Dataset，真实噪声测试 |
-
-### 任务特化
-
-| 数据集 | 用途 |
-|-------|------|
-| **FFHQ** | 70K 高质量人脸，人脸增强 |
-| **CelebA-HQ** | 30K 人脸，老一点的标准 |
-| **REDS** | 视频去模糊/SR |
-| **Vimeo-90K** | 视频帧插值 |
-| **GoPro** | 视频去模糊 |
-| **UDM10** | 视频去噪 |
-
-### 数据集组合策略
-
-最常见的两种：
-
-1. **学术标准**：DF2K（DIV2K + Flickr2K）训练，Set5/14/B100/Urban100/Manga109/DIV2K val 测试
-2. **真实导向**：LSDIR + DF2K + OST300 训练，加少量 RealSR 微调，DRealSR/RealSR 测试
-
-学术标准的好处是结果可比，缺点是 benchmark 都很小（Set5 真的只有 5 张），结论的统计意义有限。真实导向的好处是反映生产分布，缺点是没有标准化测试集让你和别人的论文做横向比较，你只能拿自己的真实 holdout 集做内部对比。生产环境里两套都跑一遍是常见做法：学术 benchmark 用来确认"没把基础能力训差"，真实测试集用来确认"对得起这次部署"。
-
-## 5.10 数据增广
-
-低层视觉的数据增广和分类任务很不同。**安全**的：
+在图像复原任务中，数据增强必须严格遵守**退化模型不变性准则**：
 
 ```python
-# 安全增广 (不改变退化模型)
 import torchvision.transforms.functional as TF
 
-def safe_augment(hr: torch.Tensor, lr: torch.Tensor):
-    """对 HR-LR 配对做同步的安全增广。"""
-    # 随机水平翻转
+def synchronous_safe_augment(hr: torch.Tensor, lr: torch.Tensor):
+    """几何正交安全增强：严格同步变换且不改变退化核统计特性。"""
     if random.random() < 0.5:
-        hr = TF.hflip(hr); lr = TF.hflip(lr)
-    # 随机垂直翻转
+        hr = TF.hflip(hr)
+        lr = TF.hflip(lr)
     if random.random() < 0.5:
-        hr = TF.vflip(hr); lr = TF.vflip(lr)
-    # 90° 旋转
+        hr = TF.vflip(hr)
+        lr = TF.vflip(lr)
     if random.random() < 0.5:
         k = random.choice([1, 2, 3])
         hr = torch.rot90(hr, k, dims=[-2, -1])
@@ -678,266 +425,63 @@ def safe_augment(hr: torch.Tensor, lr: torch.Tensor):
     return hr, lr
 ```
 
-**慎用**的：
+- **安全操作**：水平翻转、垂直翻转、90° 整数倍正交旋转（不引入重采样插值失真）。
+- **工程禁区**：
+  1. **色彩抖动（ColorJitter）**：破坏物理色彩分布与白平衡一致性
+  2. **任意连续角度旋转**：二次双线性插值会引入非预期的频域低通滤波，污染合成退化核
+  3. **Mixup / CutMix**：像素线性混合破坏了自然图像流形的连续性，使得逐像素回归损失失去明确物理意义
 
-- **色彩抖动**：会改变退化分布，模型学到错的颜色映射；对于真实退化模型来说，色彩偏移本身是 $D$ 的一部分，不应被当作"任意可改"的增广轴
-- **任意角度旋转**：插值会引入额外退化（实际是又一次 bicubic/bilinear 重采样），不在原始 $D$ 里，模型会学到"输出带轻微插值伪影"是正常的
-- **随机缩放**：等同于改 scale factor，增强 SR 时不要用，因为 SR 模型的输入输出尺寸关系是任务定义的一部分
-- **mixup / cutmix**：低层视觉用得很少，效果不明确；它们的设计前提是"任务对类别 invariant"，但像素回归任务里每个像素都有真值，混合两张图的像素没有清晰的语义
+## 5.11 高吞吐训练流水线架构优化
 
-**裁剪策略**：
-
-```python
-def random_crop(hr: torch.Tensor, lr: torch.Tensor,
-                lr_size: int, scale: int):
-    """随机裁剪 LR + 对应 HR 区域。"""
-    _, _, lr_h, lr_w = lr.shape
-    top  = random.randint(0, lr_h - lr_size)
-    left = random.randint(0, lr_w - lr_size)
-    lr_crop = lr[:, :, top:top+lr_size, left:left+lr_size]
-    hr_crop = hr[:, :, top*scale:(top+lr_size)*scale,
-                       left*scale:(left+lr_size)*scale]
-    return hr_crop, lr_crop
-```
-
-## 5.11 数据加载 pipeline 优化
-
-退化合成的计算量不小（特别是模糊 + JPEG），如果在 CPU 上做会成为训练瓶颈。两种优化：
-
-### 选项一：CPU 多 worker
-
-```python
-from torch.utils.data import DataLoader, Dataset
-
-class SRDataset(Dataset):
-    def __init__(self, hr_paths, scale=4, crop_size=256):
-        self.hr_paths = hr_paths
-        self.degrader = RealESRGANDegradation(scale=scale)
-        self.crop_size = crop_size
-
-    def __len__(self):
-        return len(self.hr_paths)
-
-    def __getitem__(self, idx):
-        hr = load_image(self.hr_paths[idx])  # PIL or cv2
-        hr = random_crop_hr(hr, self.crop_size)
-        hr_tensor = to_tensor(hr).unsqueeze(0)  # (1, 3, H, W)
-        lr_tensor = self.degrader(hr_tensor)
-        return hr_tensor.squeeze(0), lr_tensor.squeeze(0)
-
-
-loader = DataLoader(
-    SRDataset(hr_paths),
-    batch_size=16,
-    num_workers=8,           # 8 CPU workers
-    pin_memory=True,
-    persistent_workers=True,
-)
-```
-
-### 选项二：GPU 上做退化（Real-ESRGAN 推荐）
-
-把退化 pipeline 移到 GPU 上，整个 batch 一次过。这个方案乍看违反直觉：通常我们把数据预处理放在 CPU 上让 GPU 专心做矩阵乘。但是退化合成里 blur、JPEG、resize 这几步本身就是大量卷积和频域变换，跑在 GPU 上比 CPU 快 20× 以上，把它们留在 CPU 反而拖垮整个训练。
-
-```python
-# 训练循环里
-for hr_batch in loader:                  # CPU 只读 HR
-    hr_batch = hr_batch.cuda()
-    lr_batch = degrader(hr_batch)        # GPU 上一次性合成
-    pred = model(lr_batch)
-    loss = compute_loss(pred, hr_batch)
-    ...
-```
-
-Real-ESRGAN 的官方代码就用这种模式。优点：
-
-- 大幅减少 CPU 工作量
-- 可以用更复杂的退化（多 GPU 并行合成）
-- 退化结果可以利用 GPU 的随机性（每个 step 不一样）
-
-缺点：
-
-- 占 GPU 显存（一些临时 tensor）
-- 退化代码必须支持 batched + GPU
-
-为了让"CPU 读 + GPU 退化"两边都不空转，整个数据流应该长成下面这样：
+为了最大化 GPU 算力利用率，必须将退化流水线与磁盘 I/O 完全解耦：
 
 ```mermaid
 graph LR
-    Disk[HR PNG / LMDB] --> CPU[CPU workers<br/>read + crop + to_tensor]
-    CPU --> Queue[pinned memory queue]
-    Queue --> GPU1[GPU: degradation<br/>blur/resize/noise/JPEG]
-    GPU1 --> GPU2[GPU: model forward]
-    GPU2 --> GPU3[GPU: loss + backward]
-    GPU3 --> GPU4[GPU: optimizer step]
-    GPU4 -.next batch.-> Queue
+    Disk["LMDB 存储文件<br/>连续二进制读取"] --> CPU["CPU Workers 多进程<br/>解码 + 随机裁剪 HR Patch"]
+    CPU --> Queue["Pinned Memory 锁页内存队列<br/>异步非阻塞 DMA 传输"]
+    Queue --> GPU1["GPU 端批量退化算子<br/>DiffJPEG + 多核并行卷积"]
+    GPU1 --> GPU2["模型前向与反向传播"]
+    GPU2 --> GPU3["优化器梯度更新"]
 
     style Disk fill:#e3f2fd
     style CPU fill:#fff8e1
     style GPU1 fill:#ffebee
     style GPU2 fill:#ffebee
     style GPU3 fill:#ffebee
-    style GPU4 fill:#ffebee
 ```
 
-这张图里有两个工程窍门容易被忽视。第一，pinned memory queue 是 PyTorch 的 `pin_memory=True` 开启的固定内存缓冲区，让 CPU 到 GPU 的拷贝可以走异步 DMA，不阻塞主进程；第二，退化步骤要写成"batch 级 + 完全 GPU 可执行"，任何不小心写成 Python for-loop 或者 `.cpu()` 的代码都会让训练 throughput 掉一个数量级。
+### 关键优化要点
 
-### LMDB 存储加速大数据集
+1. **LMDB 预编码存储**：对于 LSDIR 等超大图库，预先将零散小文件写入 LMDB，利用内存映射（mmap）机制消除海量小文件随机读写的 inode 检索瓶颈。
+2. **GPU 端全批次退化**：CPU 仅负责快速读取高质量 HR 裁剪块并载入 Pinned Memory，模糊卷积、随机噪声注入及 DiffJPEG 压缩全部移至 GPU 端批量并行执行，训练吞吐量可提升 3 至 5 倍。
 
-LSDIR 这种 8 万+ 张图的数据集，每个 epoch 解码 PNG 是显著开销。用 LMDB 把数据预编码后存为 key-value 数据库，加载快 5-10×：
+## 5.12 训练集质量与分布审计
 
-```python
-import lmdb
-import pickle
+在模型训练之前，必须对 HR 数据源本身进行前置质量审计：
 
-# 写入
-env = lmdb.open('lsdir.lmdb', map_size=int(1e12))
-with env.begin(write=True) as txn:
-    for i, path in enumerate(hr_paths):
-        img_bytes = open(path, 'rb').read()  # 或者预 decode 成 numpy
-        txn.put(f"{i:08d}".encode(), pickle.dumps(img_bytes))
-
-# 读取
-class LMDBDataset(Dataset):
-    def __init__(self, lmdb_path, length):
-        self.env = lmdb.open(lmdb_path, readonly=True, lock=False)
-        self.length = length
-
-    def __getitem__(self, idx):
-        with self.env.begin() as txn:
-            data = pickle.loads(txn.get(f"{idx:08d}".encode()))
-        # decode bytes to image
-        ...
-```
-
-## 5.12 真实数据微调
-
-通用最佳实践：
-
-```
-阶段 1: pretrain (合成数据)
-  - 数据: DF2K + LSDIR
-  - 退化: Real-ESRGAN pipeline
-  - 训练步数: 500K - 1M
-  - 目标: 学到通用的退化恢复能力
-
-阶段 2: fine-tune (真实数据)
-  - 数据: RealSR / DRealSR (几百张)
-  - 训练步数: 10K - 50K (远少于 pretrain)
-  - 学习率: 比 pretrain 小 10×
-  - 目标: 把通用模型 calibrate 到真实退化分布
-```
-
-不直接在真实数据上从头训的原因：数据太少（几百张），模型容易过拟合到这几百张的具体物体和场景。这是一个典型的 catastrophic specialization 陷阱：模型在训练集物体上 PSNR 涨得飞快，但一旦换一类场景，表现就急剧变差。两阶段训练法本质上是用合成数据先把模型的"先验"打牢，让真实数据只负责微小的分布对齐，而不必从零学习"自然图像应该长什么样"。
-
-微调阶段还有几个工程细节需要注意。学习率不仅要比 pretrain 小一个数量级，最好也用 cosine schedule 让它在最后几千步降到几乎为零，避免模型在小数据上反复震荡。EMA（Exponential Moving Average，对权重做指数移动平均的影子副本）在微调阶段尤其重要，它能进一步把训练抖动平滑掉。最后，验证集要用与微调集**不同来源**的真实图（比如微调用 RealSR，验证用 DRealSR），否则你看到的提升完全可能是过拟合。
-
-## 5.13 数据质量审计
-
-在跑训练前，**审计你的训练数据本身**：
-
-### HR 数据是否真"高质量"
-
-DIV2K 的 HR 看起来高质量，但仍有：
-
-- 轻微 JPEG 压缩痕迹
-- 偶尔的 noise pattern
-- 局部过曝 / 欠曝
-
-如果 HR 本身有压缩伪影，模型会学到"输出带轻微压缩伪影是正常的"，你的"HR 真值"就不是真正的 ground truth。
-
-工程检查：
-
-```python
-# 审计 HR 数据集的 JPEG 压缩痕迹
-def audit_jpeg_traces(hr_path: str) -> float:
-    """通过分析 8x8 块边界处的不连续性, 估计 HR 数据有多"被压缩过"。
-    返回值越大, JPEG 压缩痕迹越明显。
-    """
-    img = cv2.imread(hr_path)
-    img = img.astype(np.float32)
-    # 块边界 (8 的倍数列/行) 处的差异
-    h, w = img.shape[:2]
-    block_diff = 0
-    for i in range(7, h-1, 8):
-        block_diff += np.abs(img[i] - img[i+1]).mean()
-    for j in range(7, w-1, 8):
-        block_diff += np.abs(img[:, j] - img[:, j+1]).mean()
-    return block_diff
-```
-
-### 数据多样性审计
-
-模型在某类内容上失败，常常是数据偏差：
-
-- 如果训练数据 90% 是城市/自然风景，模型在文档/截图上失败
-- 如果训练数据全是日光照片，模型在夜景上失败
-- 如果训练数据全是西方人脸，模型在亚洲/非洲人脸上失败
-
-这种偏差不会被指标显示出来：平均 PSNR 看起来正常，但失败模式集中。第 17 章会专门讲。
-
-最简单的审计：
-
-```python
-# 用 CLIP 把训练集每张图嵌入, 然后聚类看分布
-import open_clip
-
-clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32')
-embeddings = []
-for path in hr_paths:
-    img = preprocess(Image.open(path)).unsqueeze(0)
-    with torch.no_grad():
-        emb = clip_model.encode_image(img).cpu().numpy()
-    embeddings.append(emb)
-
-# K-means 聚 20 类, 看每类是什么内容、占比多少
-from sklearn.cluster import KMeans
-clusters = KMeans(n_clusters=20).fit_predict(np.vstack(embeddings))
-```
-
-如果某一类占比极少（< 1%），考虑专门补这部分数据。
-
-### 不平衡退化分布的隐患
-
-合成数据的另一个隐藏问题是退化参数本身的分布。假设你的 blur sigma 范围是 [0.2, 3.0]，看似合理，但如果你用均匀采样，那么 [2.5, 3.0] 区间的样本和 [0.2, 0.7] 区间的样本数量相同，而实际真实世界的模糊几乎都集中在小 sigma 端。这会导致模型在"轻微模糊"输入上反应过度（把本来清晰的小细节当成需要去模糊的对象），在"严重模糊"输入上反而表现不错。
-
-工程上常见的修正是把均匀采样换成对数采样或者 beta 分布采样：
+1. **伪真值排查（JPEG Traces Audit）**：部分网络爬取的高清图本身包含历史压缩伪影，若直接作为 HR，模型将自发学习生成微观压缩伪影。通过计算 $8 \times 8$ 块边界梯度的异常峰值即可量化其压缩残留。
+2. **内容语义分布审计**：利用预训练 CLIP 提取图像全局语义向量，并执行 K-Means 聚类，排查人脸、文字、建筑与自然风景等类别的样本不平衡比例。
+3. **退化参数非均匀采样**：在模糊半径 $\sigma$ 与噪声标准差采集中，采用对数均匀采样（Log-Uniform）替代线性均匀采样，确保轻度常见退化占据足够梯度权重，避免模型对轻微模糊产生过拟合锐化过度。
 
 ```python
 import math
 import random
 
-def log_uniform(low: float, high: float) -> float:
-    """对数均匀分布, 让小值更常被采到。"""
+def log_uniform_sampling(low: float, high: float) -> float:
+    """对数均匀采样：大幅提升小参数区间的命中概率，对齐真实失真频次分布。"""
     return math.exp(random.uniform(math.log(low), math.log(high)))
-
-# 用法
-sigma = log_uniform(0.2, 3.0)
 ```
 
-类似的修正适用于噪声 sigma、JPEG quality 等所有"退化强度"参数。在生产中观察到模型表现异常时，第一步排查就是看训练参数分布是否和你 deploy 时遇到的真实分布对得上。
+## 5.13 本章小结
 
-## 5.14 小结
+1. **数据退化建模直接决定了模型的工业落地能力**，在网络骨干收敛的背景下，数据管道的逼真度构成了算法的核心护城河。
+2. **Bicubic 单一下采样属于脱离物理现实的学术简化**，Real-ESRGAN 的高阶退化建模成功复刻了现实世界的多级失真传递链。
+3. **模糊核、噪声与插值必须覆盖多样化拓扑**，融合各向异性高斯、Plateau 核、Sinc 振铃与泊松-高斯混合噪声。
+4. **GPU 端 DiffJPEG 批处理流水线与 LMDB 存储**是解决复杂在线退化计算瓶颈的标准工程方案。
+5. **两阶段训练流水线（大规模合成预训练 + 小规模实拍微调）**兼顾了模型的泛化多样性与特定业务场景的精准对齐。
 
-1. **数据 > 网络**：低层视觉里同样的网络在不同数据上能差一个数量级
-2. **bicubic 退化是这个领域 5 年的方法论错误**，Real-ESRGAN 系统性纠正了它
-3. **退化 pipeline 三个核心**：参数化 + 随机化 + 二阶
-4. **每个组件都是一个家族**：模糊核多种、噪声多种、JPEG 多 quality、resize 多算法
-5. **数据集的选择决定模型能见到什么世界**：DF2K + LSDIR 是合成数据通用基础，RealSR/DRealSR 用于真实退化微调
-6. **数据加载 pipeline 优化**：GPU 上做退化是 Real-ESRGAN 风格的事实标准
-7. **数据增广要克制**：低层视觉只用翻转 + 90° 旋转，色彩抖动等会破坏退化模型
-8. **审计你的 HR 数据**：HR 本身的 JPEG 痕迹和数据偏差会被模型学到
-9. **真实数据微调**是把合成训练模型 calibrate 到真实分布的关键步骤
-
-到这里 Part I 五章全部完成。读完这五章，你应当能：
-
-- 看到一张烂图，知道它经历了哪些 D
-- 看到一个增强模型，知道它在哪种空间预测、用什么损失
-- 看到一组指标，知道哪些可信、哪些有偏
-- 看到一个数据 pipeline，知道它能 cover 真实分布的哪部分
-
-Part II 开始我们进入具体的网络架构。第一站是 CNN 时代，这条线从 2014 年的 SRCNN 一直走到 2022 年的 NAFNet，是这个领域的"传统重武器"。
+至此，全书第一篇（第 1 至 5 章：原理与基础）构建完毕。你已系统掌握了不适定逆问题定义、表征空间解耦、多目标损失设计、质量评估指标与高阶退化数据管道。在第二篇中，我们将正式开启经典与前沿网络架构的深度剖析。
 
 ---
 
-> 下一章 [CNN 时代](06-cnn.md) → 从 SRCNN 三层网络到 NAFNet 移除所有非线性激活，CNN 在低层视觉走过的 8 年。
+> 下一章 [CNN 时代：从 SRCNN 到 NAFNet](06-cnn.md) → 我们将回顾卷积神经网络在低层视觉领域的演进历程，看架构设计如何从早期的简单层级堆叠，演进至极致简化的非线性结构重构。

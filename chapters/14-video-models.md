@@ -1,125 +1,116 @@
-# 第 14 章 · VSR / 帧插值 / 视频修复
+# 第 14 章 · 视频增强模型与系统架构：VSR、帧插值与综合修复
 
-> 第 13 章建立了视频增强的基础概念：时序一致、光流、对齐。
+> 第 13 章建立了视频增强的基础概念体系：时序一致性、光流运动补偿与特征对齐。
 >
-> 这一章看具体模型：BasicVSR++、RVRT、RIFE/FILM、视频去抖。
+> 本章系统剖析经典与前沿视频模型：BasicVSR++、VRT/RVRT、RIFE/FILM/AMT、视频去模糊与视频修复工程。
 >
-> 这些模型把第 13 章的概念落地，每个有不同的工程权衡。
+> 深入理解各模型在时序感受野、计算复杂度、显存开销与重建保真度之间的工程权衡。
 
 ## 14.0 本章定位与前置知识
 
-视频增强从模型设计角度看，比图像多出一个根本约束：**时间维度**。同一个物体在相邻帧上不仅要清晰，还要在像素层面"接得上"，否则视觉上会出现闪烁、抖动、纹理跳变。第 13 章已经讨论了这个时序一致性是怎么定义的、光流和对齐为什么必要、双向传播为何比单向更稳。本章假设读者已经掌握这些基础概念，重点放在**具体模型如何把这些概念落地成可训练、可部署的网络**。
+视频增强模型的设计受制于一个根本性的物理约束：**时间维度的连续性**。同一物体表面在相邻帧之间不仅需要保持高频空间清晰度，更需在像素与特征级实现平滑对应，否则视觉上会出现高频抖动、边缘闪烁与纹理漂移。第 13 章系统阐释了时序一致性的数学定义、光流 Warping 与双向循环的必要性。本章在此基础上，**聚焦如何将这些理论概念工程化实现为高效、可训练且具备工业部署价值的深度网络**。
 
-读完本章你应当能回答下面几个问题：
+读完本章，你应当能够掌握：
 
-- 在视频超分（VSR）任务里，sliding window、recurrent、bidirectional 这三种结构的取舍是什么？
-- BasicVSR++ 的"二阶传播"和"flow-guided deformable alignment"具体在解决哪一类失败模式？
-- VRT / RVRT 把 Transformer 引进 VSR 之后，相对 BasicVSR++ 究竟换来了什么、付出了什么？
-- 视频帧插值（VFI）为什么不直接复用光流模型，而要训一个专门估计"中间帧到两端"的 IFNet？
-- 视频去模糊为什么有"相邻帧清晰副本"这种结构性优势？
-- 老电影修复这种偏向工艺的任务，为什么不是单模型而是多步 pipeline？
+- 视频超分辨率（VSR）中滑动窗口、单向因果循环与双向循环三种时序建模范式的核心差异与工程选型；
+- BasicVSR++ 中"二阶网格传播（Second-Order Propagation）"与"光流引导可变形对齐（Flow-Guided Deformable Alignment）"解决的具体失效模式；
+- VRT / RVRT 将时空注意力机制引入 VSR 带来的表达能力增益与计算代价；
+- 视频帧插值（VFI）为何需通过 IFNet 直接预测中间时刻光流，而非简单反推相邻帧单向光流；
+- 视频去模糊利用"相邻帧清晰瞬态副本"的结构性机理；
+- 历史老影像综合修复的多阶段级联工程流水线设计。
 
-阅读建议：本章的代码片段大多是骨架（stub），不能直接训练，目的是把架构的关键数据流写清楚。完整实现可以参考 mmagic（原 mmediting，OpenMMLab 的低层视觉工具箱）和各项目官方仓库。
+阅读建议：本章提供的代码片段为聚焦核心数据流的架构骨架（Stub），完整工程实现可参考 OpenMMLab 旗下的低层视觉工具箱 MMagic（原 MMEditing）及各模型官方开源仓库。
 
-**首次出现的缩写。** 沿用第 1 章的体例，本章把第一次出现的缩写在括号里给出全称与一句话定义：
+**专业术语缩写。** 本章核心概念与网络架构缩写定义如下：
 
-- **VSR**（Video Super-Resolution，视频超分辨率）：把低分辨率视频提升到高分辨率，要求空间锐度与时序一致同时达标
-- **VFI**（Video Frame Interpolation，视频帧插值）：在两帧之间合成中间帧，把低帧率视频提升到高帧率
-- **EDVR**（Enhanced Deformable Video Restoration，2019）：第一代用 deformable conv 做对齐的滑动窗口 VSR，CVPR Workshops 2019 NTIRE 冠军
-- **TDAN**（Temporally Deformable Alignment Network）：用 deformable conv 做"隐式光流"对齐的早期 VSR
-- **BasicVSR**（2021）：第一个把双向循环 + 显式光流对齐做到 SOTA 的 VSR baseline
-- **IconVSR**：BasicVSR 同一篇论文的"info-fused"变体，把多帧信息抽到关键帧供后续传播
-- **BasicVSR++**（2022）：BasicVSR 的升级版，加入二阶传播和 flow-guided deformable alignment
-- **VRT**（Video Restoration Transformer，2022）：把窗口 Transformer 引入 VSR，沿时间轴做 attention
-- **RVRT**（Recurrent Video Restoration Transformer，2022）：VRT 的循环化版本（同为 2022 年提出，NeurIPS 2022），用循环替代部分长程 attention 来控制计算量
-- **DCN**（Deformable Convolutional Network，可变形卷积）：卷积核每个采样位置带一个可学习的偏移，使卷积能"瞄准"非规则位置
-- **RIFE**（Real-time Intermediate Flow Estimation，2022）：直接估计"中间帧到两端"光流的 VFI 方法
-- **IFNet**（Intermediate Flow Network）：RIFE 里专门预测中间帧光流的子网络
-- **FILM**（Frame Interpolation for Large Motion，Google 2022）：多尺度递归光流估计的 VFI 方法，对大位移强
-- **AMT**（All-pairs Multi-field Transforms，CVPR 2023）：核心是像 RAFT 那样构建 all-pairs 相关体，再用 multi-field（多组光流假设）细化中间流，对大位移与遮挡更鲁棒
-- **MIMO-UNet**（Multi-Input Multi-Output UNet，ICCV 2021）：单图去模糊网络，"multi-input multi-output"指同一张图的多尺度金字塔（不是多帧），本章只借用它的多尺度思想
-- **ProPainter**（ICCV 2023）：当前 SOTA 的视频 inpainting 方法，先补光流再补帧
-- **E2FGVI**（End-to-end Flow-Guided Video Inpainting，CVPR 2022）：端到端的光流引导视频补全
-- **GOP**（Group of Pictures，画面组）：视频编码里以一个 I 帧为起点的若干帧组成的独立解码单元
-- **REDS**（Realistic and Dynamic Scenes）：NTIRE 2019 提出的 VSR 标准数据集，官方划分为 240 训练 + 30 验证 + 30 测试片段（不少 VSR 工作会把训练与验证合并成 270 段一起训练，这是常见 270 口径的来源）
-- **VMAF**（Video Multi-Method Assessment Fusion）：Netflix 2016 推出的视频质量评估指标，融合多个子指标，训练数据是真实人评
-- **FVD**（Fréchet Video Distance）：把 FID 推广到视频的分布距离指标，常用于生成式视频
-- **tOF / tLPIPS**：时序版本的光流一致性 / LPIPS 一致性指标，衡量相邻帧的对齐与感知差异
-- **NAFNet**（Nonlinear Activation Free Network，2022）：用门控乘法替代非线性激活的极简低层视觉网络
-- **GoPro**：视频去模糊事实标准数据集，用 240 fps 高速相机平均多帧合成"模糊帧"，原始帧作为真值
+- **VSR**（Video Super-Resolution，视频超分辨率）：提升视频空间分辨率，兼顾单帧锐度与时序一致性；
+- **VFI**（Video Frame Interpolation，视频帧插值）：在相邻帧之间合成高保真中间帧，提升视频时间帧率；
+- **EDVR**（Enhanced Deformable Video Restoration，2019）：基于滑动窗口与可变形卷积（DCN）对齐的经典 VSR 模型；
+- **TDAN**（Temporally Deformable Alignment Network）：利用可变形卷积实现隐式时序特征对齐的早期代表工作；
+- **BasicVSR**（2021）：确立"双向循环特征传播 + 显式光流对齐"作为通用 Baseline 的经典架构；
+- **IconVSR**：在 BasicVSR 基础上引入关键帧信息聚合与回补机制（Information-Fused）的变体；
+- **BasicVSR++**（2022）：BasicVSR 的升级演进版，引入二阶网格传播与光流引导可变形对齐，为回归式 VSR 的重要基准；
+- **VRT**（Video Restoration Transformer，2022）：引入时空联合自注意力机制的视频复原 Transformer；
+- **RVRT**（Recurrent Video Restoration Transformer，2022）：结合段内注意力与段间循环传播的高效混合 Transformer；
+- **DCN**（Deformable Convolutional Network，可变形卷积）：采样网格带有自适应偏移量的卷积算子；
+- **RIFE**（Real-time Intermediate Flow Estimation，2022）：直接预测目标时刻双向中间流的实时帧插值网络；
+- **IFNet**（Intermediate Flow Network）：RIFE 中专门用于端到端预测中间时刻光流的多尺度子网络；
+- **FILM**（Frame Interpolation for Large Motion，2022）：基于多尺度递归流估计的高动态大位移帧插值架构；
+- **AMT**（All-pairs Multi-field Transforms，CVPR 2023）：构建全像素相关体并通过多假设流场细化光流的高精度帧插值模型；
+- **MIMO-UNet**（Multi-Input Multi-Output UNet，2021）：多尺度单图去模糊网络，本章借用其多尺度级联表征思想；
+- **ProPainter**（ICCV 2023）：基于循环光流补全与时空注意力的视频修复（Inpainting）模型；
+- **E2FGVI**（End-to-end Flow-Guided Video Inpainting，CVPR 2022）：端到端光流引导视频内容补全架构；
+- **GOP**（Group of Pictures，图像组）：视频编码中以 I 帧为起点的独立解码单元；
+- **REDS**（Realistic and Dynamic Scenes）：NTIRE 2019 提出的 VSR 标准基准数据集（包含 240 训练段、30 验证段与 30 测试段）；
+- **VMAF**（Video Multi-Method Assessment Fusion）：Netflix 开源的视频多维度质量评估指标；
+- **FVD**（Fréchet Video Distance）：度量生成视频时空分布距离的客观指标；
+- **GoPro**：视频去模糊标准基准数据集，由高速摄像机拍摄并经相邻帧加权平均合成。
 
-更多缩写在出现时再展开。
+## 14.1 本章知识谱系与任务链路
 
-## 14.1 这一章的结构
-
-下面四类子任务在视频增强里相互独立又互相依赖。VSR 与去模糊都关注"每一帧更清晰"，帧插值关注"帧数更多"，视频修复关注"内容补全"，去抖关注"帧间几何稳定"。一个真实的视频增强 pipeline 通常会按某种顺序串接其中几项。
+视频增强的四大核心子任务在工程上既相互独立，又存在紧密的级联协作关系：
 
 ```
-14.2-14.5  视频超分（VSR）：BasicVSR → BasicVSR++ → RVRT
-14.6       帧插值（VFI）：RIFE、FILM、AMT
-14.7       视频去模糊
-14.8       视频修复
-14.9       视频去抖
-14.10-14.11  工程组合与评估
+14.2-14.5  视频超分辨率（VSR）：BasicVSR → BasicVSR++ → RVRT → 扩散视频复原
+14.6       视频帧插值（VFI）：RIFE、FILM、AMT
+14.7       视频去模糊：空时非均匀退化与清晰瞬态利用
+14.8       视频修复（Inpainting）：时空掩码补全与老电影综合修复
+14.9       视频防抖（Stabilization）：轨迹平滑与边缘重投影
+14.10-14.11 生产级流水线组合与多维评估体系
 ```
 
-每个任务给一个代表模型加几个工程要点。本章不追求覆盖所有方法，只覆盖在 2024-2026 年生产环境里仍在被人用的几条主线。
+## 14.2 视频超分辨率（VSR）架构演进
 
-## 14.2 视频超分（VSR）的演进
-
-VSR 的演进路线和图像 SR 类似但晚两年：
+VSR 架构演进脉络主要经历了四个阶段：
 
 ```
-2017  VESPCN     - 第一个端到端 VSR
-2018  TDAN       - 隐式对齐（DCN）
-2019  RBPN       - 循环 + 多帧补偿
-2019  EDVR       - 滑动窗口 + DCN 对齐
-2021  BasicVSR   - 双向循环 + 显式光流对齐
-2022  BasicVSR++ - 二阶传播 + flow-guided DCN
-2022  VRT        - 时序 Transformer
-2022  RVRT       - 高效循环 Transformer
+2017  VESPCN     - 早期端到端视频超分辨率
+2018  TDAN       - 隐式可变形卷积对齐（DCN）
+2019  EDVR       - 滑动窗口 + 多级 DCN 对齐
+2021  BasicVSR   - 双向循环传播 + 显式光流对齐
+2022  BasicVSR++ - 二阶传播网格 + 光流引导可变形对齐
+2022  VRT / RVRT - 时空注意力机制与混合循环 Transformer
+2024+ STAR/SeedVR- 基于视频扩散模型与 DiT 先验的高保真生成式复原
 ```
 
-**BasicVSR++** 是 2022-2024 年的事实标准，简单、强、快。下面详谈。
+### 三大时序建模范式对比
 
-### 三种 VSR 架构的对比
+VSR 模型的本质区别在于时序信息的聚合与传递机制，对应三种工程权衡：
 
-把上面这条时间线压成结构，可以看到 VSR 模型主要在三种"时序聚合模式"之间选择，分别对应三种工程权衡：
+- **滑动窗口范式（Sliding Window，代表：EDVR）**：输出目标帧时，独立采集其前后固定窗口（如 $N=5$ 或 $7$）内的邻帧并对齐融合。**工程优势**在于结构解耦、支持任意帧随机寻址（Random Access）、多卡并行度高；**工程代价**在于相邻窗口间缺乏特征级复用，无法捕捉长程依赖。
+- **单向因果循环范式（Causal Recurrent，代表：BasicVSR 前向路径）**：通过隐状态 $h_t$ 沿时间轴单向演化更新。**工程优势**在于长程历史信息被压缩在隐状态中，显存开销恒定，天然适配实时直播与边缘端流式场景；**工程代价**在于无法利用未来帧的先验信息，且存在隐状态遗忘。
+- **双向循环范式（Bidirectional Recurrent，代表：BasicVSR / BasicVSR++）**：并发执行前向与后向两次完整的隐状态传播，并在各时间步融合双向特征。**工程优势**在于每帧均能充分聚合全序列历史与未来信息，时序一致性与重建精度达到极高水平；**工程代价**在于必须持有整段视频输入，不适用于低延迟实时场景。
 
-- **Sliding window**（滑动窗口，代表 EDVR）：每输出一帧，独立取该帧周围 N 帧（典型 N=5 或 7），把它们对齐到中心帧后融合。**好处**是结构简单、训练直接、天然支持随机访问；**代价**是相邻输出帧之间没有显式的特征复用，长程时序信息只能通过更大的窗口堆出来。
-- **Recurrent**（循环，代表 BasicVSR 的前向方向）：维护一个沿时间方向不断更新的隐状态 $h_t$，每帧用前一时刻的 $h_{t-1}$ 加当前帧的特征算出新的 $h_t$。**好处**是长程信息被压在隐状态里、显存友好、计算高效；**代价**是单向 RNN 看不到未来帧，对运动反向的细节恢复有上限。
-- **Bidirectional**（双向，代表 BasicVSR / BasicVSR++）：同时跑前向和后向两个 RNN，在每一时刻把两者的隐状态融合。**好处**是任意一帧都能同时拿到过去和未来的信息，长程时序一致性最好；**代价**是必须有整段视频（或者一个足够长的 buffer）才能跑，实时场景受限。
-
-下面这张图把三种模式画在同一张图上做对比，注意箭头方向和聚合发生的位置：
+三种范式的架构数据流对比如下图所示：
 
 ```mermaid
 graph TB
-    subgraph SW[Sliding window：EDVR 风格]
-        SW1[t-2] --> SWA[align + fuse]
+    subgraph SW[滑动窗口范式: EDVR 结构]
+        SW1[t-2] --> SWA[特征对齐与融合]
         SW2[t-1] --> SWA
-        SW3[t 中心] --> SWA
+        SW3[t 中心帧] --> SWA
         SW4[t+1] --> SWA
         SW5[t+2] --> SWA
-        SWA --> SWO[输出 帧 t]
+        SWA --> SWO[输出目标帧 t]
     end
 
-    subgraph RC[Recurrent 单向：BasicVSR 前向]
+    subgraph RC[单向因果循环范式: BasicVSR 前向]
         RC1[帧 t-2] --> RCH1[h_t-2]
         RCH1 --> RCH2[h_t-1]
         RC2[帧 t-1] --> RCH2
         RCH2 --> RCH3[h_t]
         RC3[帧 t] --> RCH3
-        RCH3 --> RCO[输出 帧 t]
+        RCH3 --> RCO[输出目标帧 t]
     end
 
-    subgraph BD[Bidirectional：BasicVSR / BasicVSR++]
-        BD1[帧 t] --> BDF[前向 h^f_t]
-        BD1 --> BDB[后向 h^b_t]
+    subgraph BD[双向循环范式: BasicVSR / BasicVSR++]
+        BD1[帧 t 特征] --> BDF[前向隐状态 h^f_t]
+        BD1 --> BDB[后向隐状态 h^b_t]
         BDFprev[h^f_t-1] --> BDF
         BDBnext[h^b_t+1] --> BDB
-        BDF --> BDM[融合]
+        BDF --> BDM[双向特征融合]
         BDB --> BDM
-        BDM --> BDO[输出 帧 t]
+        BDM --> BDO[输出目标帧 t]
     end
 
     style SWO fill:#e3f2fd
@@ -127,168 +118,156 @@ graph TB
     style BDO fill:#e8f5e9
 ```
 
-工程上的选择规则：
+工程选型判据：
+1. **离线高保真增强（转码、影视后期）**：优先选用双向循环（BasicVSR++）或扩散先验模型；
+2. **实时交互场景（直播连麦、视频会议）**：强制采用单向因果循环架构；
+3. **镜头切换频繁或独立切片序列**：采用滑动窗口架构，避免跨场景隐状态污染。
 
-1. 如果**输入是离线视频文件**且对质量上限敏感（修复、剪辑、转码增强），优先 bidirectional。
-2. 如果**输入是实时流**（直播、视频会议、AR 透视），必须用 causal recurrent（只允许看历史），bidirectional 不可用。
-3. 如果**输入是图像序列但场景之间没有强连续性**（比如批量幻灯片增强），sliding window 反而比 RNN 更鲁棒，因为隐状态在场景切换时会污染。
+## 14.3 BasicVSR++ 深度剖析
 
-这三种模式之间不是非此即彼，BasicVSR++ 的整体结构本质上是"双向 + 二阶传播 + DCN 修正光流"，而后面的 RVRT 是"循环 + 跨帧注意力"的混合。架构上的差异主要决定了**显存占用、延迟、对未来帧的依赖、跨场景鲁棒性**这四个维度。
+Chan 等人于 2022 年提出的 **BasicVSR++** 是双向循环架构的集大成者，其在训练稳定性、推理显存可预测性及重建质量上建立了卓越的基准。
 
-## 14.3 BasicVSR++ 详解
-
-Chan et al. 在 2022 年提出 BasicVSR++，是第 13 章 13.8 节讲的双向循环架构的代表。它的设计选择在 2024-2026 年的多数 VSR 产品（包括离线视频转码增强、长视频后处理）里仍然是首选 baseline，原因是结构简单、训练稳、推理时显存可预测。
-
-### 整体结构
+### 整体架构数据流
 
 ```
-                    特征提取
-LR frames ─────────────→ feature maps F_t
-                              │
-                              ↓
-        ┌─────────────────────┴─────────────────────┐
-        │                                            │
-        ▼ Forward propagation                        ▼ Backward propagation
-        h^f_1 ─→ h^f_2 ─→ ... ─→ h^f_T              h^b_T ─→ h^b_{T-1} ─→ ... ─→ h^b_1
-        每一步用光流对齐前一步隐状态
-        │                                            │
-        └─────────────────────┬─────────────────────┘
-                              ↓
-                      Aggregation (concat + conv)
-                              │
-                              ↓
-                      Upsample (PixelShuffle)
-                              │
-                              ↓
-                      HR frames
+                    浅层特征提取
+输入低分辨率序列 ─────────→ 特征图序列 F_t
+                               │
+                               ↓
+        ┌──────────────────────┴──────────────────────┐
+        │                                             │
+        ▼ 前向传播 (Forward)                          ▼ 后向传播 (Backward)
+        h^f_1 ─→ h^f_2 ─→ ... ─→ h^f_T               h^b_T ─→ h^b_{T-1} ─→ ... ─→ h^b_1
+        （每步采用二阶对齐与光流引导 DCN）
+        │                                             │
+        └──────────────────────┬──────────────────────┘
+                               ↓
+                      多维聚合 (Concat + Conv)
+                               │
+                               ↓
+                      亚像素卷积升采样 (PixelShuffle)
+                               │
+                               ↓
+                      输出高分辨率帧序列
 ```
 
-### 关键创新 1：二阶传播
+### 关键机制 1：二阶网格传播（Second-Order Grid Propagation）
 
-普通双向 RNN 每一步只用前一步：
+经典一阶循环网络仅接收上一时间步的隐状态：
 
 $$
 h_t = G(F_t, h_{t-1})
 $$
 
-BasicVSR++ 用**二阶**：
+BasicVSR++ 引入**跨时间步的二阶直接连接**：
 
 $$
 h_t = G(F_t, h_{t-1}, h_{t-2})
 $$
 
-为什么有用？
+设计机理与优势：
+- **误差累积阻断**：在一阶循环中，$h_{t-1}$ 由 $h_{t-2}$ 经 Warping 得到，单步光流对齐误差会沿时间轴级联放大；二阶连接允许网络直接访问 $h_{t-2}$ 的原始特征，有效跳过中间步的插值损失；
+- **时序拓扑鲁棒性**：在物体被短暂遮挡（1 至 2 帧）后重新显露时，二阶连接能直接跨越遮挡帧检索历史特征。
 
-- 一阶：$h_{t-1}$ 是从 $h_{t-2}$ warp 过来的，$h_{t-2}$ 又是从更早的 warp 过来的，光流误差一路累积
-- 二阶：直接接触 $h_{t-2}$，绕过 $h_{t-1}$ 的累积误差
-- **修正光流的局部错误**
+### 关键机制 2：光流引导可变形对齐（Flow-Guided Deformable Alignment）
 
-### 关键创新 2：Flow-Guided Deformable Alignment
+将显式物理光流的几何约束与可变形卷积（DCN）的自适应调制能力结合：
 
-把光流和可变形卷积结合。在解释代码之前，先把数据流画清楚。"flow-guided"是说**先用光流把前一隐状态 warp 到当前帧的视角**，然后让 DCN 在 warp 后的特征上做局部修正；DCN 的偏移量并不是从零开始学，而是以光流为基准做微调。
-
-下面这张图把"warp + occlusion mask + DCN refinement"这条链画了出来：
+数据流演进机制：
 
 ```mermaid
 graph LR
-    HPrev[前一隐状态 h_t-1] --> Warp[Backward warp<br/>用光流 f_t-1 → t 重采样]
-    Flow[光流 f_t-1 → t<br/>由 SPyNet 估计] --> Warp
-    Ft[当前帧特征 F_t] --> OffsetNet[偏移预测网络<br/>输入 warped_h + F_t + flow]
+    HPrev[前一隐状态 h_t-1] --> Warp[反向采样 Warping<br/>依据光流 f_t-1 → t]
+    Flow[光流场 f_t-1 → t] --> Warp
+    Ft[当前帧特征 F_t] --> OffsetNet[偏移预测网络<br/>输入: warped_h + F_t + flow]
     Warp --> OffsetNet
     Flow --> OffsetNet
-    OffsetNet --> Sum[偏移 = flow + 学到的修正量]
+    OffsetNet --> Sum[最终偏移量 = 光流基准 + 学习残差]
     Flow --> Sum
-    Sum --> DCN[Deformable Conv<br/>在修正位置采样 h_t-1]
+    Sum --> DCN[可变形卷积 DCN<br/>在修正坐标处重采样 h_t-1]
     HPrev --> DCN
-    DCN --> Mask[Occlusion mask<br/>遮挡区域弱化贡献]
+    DCN --> Mask[遮挡掩码加权]
     Ft --> Mask
-    Mask --> Out[对齐后的特征<br/>送入循环单元]
+    Mask --> Out[对齐特征输出<br/>送入循环传播单元]
 
     style Warp fill:#fff3e0
     style DCN fill:#e3f2fd
     style Mask fill:#ffebee
 ```
 
-这条链里 occlusion mask 通常作为 DCN 的额外通道隐式学，或者由光流的 forward-backward 一致性误差直接算出来（误差大就当遮挡处理，降低 warp 出的特征权重）。
+机理优势：
+- **物理先验注入**：光流场为 DCN 提供准确的初值锚点，避免 DCN 在训练早期因无约束探索而导致的偏移量发散；
+- **亚像素级误差修正**：DCN 能够自适应学习针对复杂非刚体运动、光照跳变以及光流估计缺陷的微观修正量。
 
-为什么"光流 + DCN"比单纯光流更鲁棒：
-
-- 用光流给可变形卷积一个**初始的采样位置**，相当于把物理意义注入 DCN
-- 让 DCN 学习**对光流的修正**，光流估错了一两像素时，DCN 还能拉回来
-- 在快速运动 / 部分遮挡场景下，纯光流 warp 会产生明显鬼影，DCN 的多采样点融合能缓解
+核心实现代码骨架：
 
 ```python
+import torch
+import torch.nn as nn
+from torchvision.ops import DeformConv2d
+
 class FlowGuidedDCN(nn.Module):
-    """Flow-guided deformable alignment (BasicVSR++)。"""
+    """BasicVSR++ 光流引导可变形卷积对齐模块。"""
 
     def __init__(self, channels: int, num_groups: int = 8):
         super().__init__()
-        # 预测 DCN 的 offset 修正量 (相对光流)
+        # 预测相对于光流基准的 DCN 偏移量残差
         self.offset_conv = nn.Conv2d(
-            channels * 2 + 2,         # h_prev + features + flow
-            num_groups * 2 * 9,        # 9 个采样点 × 2 维 × num_groups
-            3, padding=1,
+            channels * 2 + 2,          # 输入拼接: warped_h + features_t + flow
+            num_groups * 2 * 9,         # 3x3 卷积核包含 9 个采样点, 每个点对应 (x, y) 偏移
+            kernel_size=3, padding=1,
         )
-        # 实际的 deformable conv (这里用 torchvision 的 DeformConv2d)
-        from torchvision.ops import DeformConv2d
-        self.dcn = DeformConv2d(channels, channels, 3, padding=1, groups=num_groups)
+        self.dcn = DeformConv2d(channels, channels, kernel_size=3, padding=1, groups=num_groups)
 
-    def forward(self, h_prev, features_t, flow):
+    def forward(self, h_prev: torch.Tensor, features_t: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
         """
-        h_prev: 前一步隐状态 (B, C, H, W)
-        features_t: 当前帧特征 (B, C, H, W)
-        flow: 光流 (B, 2, H, W)
+        h_prev: 前一时刻隐状态 (B, C, H, W)
+        features_t: 当前时刻空间特征 (B, C, H, W)
+        flow: 由当前帧指向前一帧的光流场 (B, 2, H, W)
         """
-        # 1. 用光流先把 h_prev warp 到当前视角
+        # 1. 显式光流几何预对齐
         warped_h = warp_with_flow(h_prev, flow)
 
-        # 2. 网络预测 DCN offset (修正量)
+        # 2. 网络自适应预测偏移残差
         x = torch.cat([warped_h, features_t, flow], dim=1)
         offsets = self.offset_conv(x)
-        # offsets shape: (B, num_groups * 2 * 9, H, W)
 
-        # 3. 加上光流作为 offset 基准 (重要!)
-        # 让 DCN 起始于光流的位置, 学的是修正量
+        # 3. 将物理光流叠加为基准锚点 (核心步骤)
         offsets = offsets + flow.repeat(1, offsets.shape[1] // 2, 1, 1)
 
-        # 4. DCN 在修正后的位置采样
+        # 4. 可变形卷积在修正坐标处执行特征采样
         return self.dcn(h_prev, offsets)
 ```
 
-flow + DCN 组合的优势：光流提供物理意义，DCN 提供局部修正能力，**对快速移动 / 部分遮挡场景比纯光流稳**。把这个机制放在二阶传播里，效果叠加：二阶减少光流误差累积，flow-guided DCN 减少单步光流误差，整段视频的时序一致性显著提升。
+### 训练与工程指标
 
-### BasicVSR++ 的训练
+- **训练配方**：通常在 REDS（240 段）与 Vimeo-90K 数据集上联合训练，采用 Charbonnier 重建损失；
+- **时序稳定性来源**：其优异的时序一致性主要源于双向网格传播与 Flow-Guided DCN 带来的强大归纳偏置；
+- **基准性能**：在 REDS4 基准上实现 ~32.4 dB PSNR，显著超越 EDVR（31.1 dB）与初代 BasicVSR（31.4 dB），且单卡推理延迟控制在 30 ms 左右。
 
-- **数据集**：REDS（240 训练片段）+ Vimeo-90K + 自合成的退化对
-- **退化**：标准 VSR 走 REDS / Vimeo 那套，即高斯模糊 + 双三次下采样合成 LR；若目标是真实退化视频，则改走 RealBasicVSR 的配方，用 Real-ESRGAN 式的二阶退化加 ffmpeg 视频压缩
-- **损失**：主要是 Charbonnier 重建损失（在每一输出帧上）。时序一致性主要靠**双向传播 + flow-guided alignment 的架构归纳偏置**自然涌现，而非显式时序损失项
-- **训练时长**：1.6M 步在 8× A100，约 10 天
+## 14.4 VSR 训练数据与退化合成规范
 
-### 性能
+主流视频超分辨率数据集规格对比：
 
-在 REDS4 4× VSR 上 PSNR ~32.4 dB，明显高于 EDVR (31.1) 和 BasicVSR (31.4)。同时**保持实时性**，单帧约 30ms 在 A100 上。
+| 数据集名称 | 序列规模 | 分辨率 | 主要适用任务 |
+|-----------|---------|-------|-------------|
+| **REDS** | 240 训练 / 30 验证 / 30 测试 | 720P | 通用 VSR 与动态场景去模糊 |
+| **Vimeo-90K** | 64,612 个 7 帧子片段 | 448×256 | 大规模预训练与帧插值 |
+| **Vid4** | 4 个经典测试序列 | 720P | 经典通用基准评测 |
+| **UDM10** | 10 个高清测试序列 | 1080P | 高清 VSR 泛化性评估 |
+| **YouHQ40** | 40 个高质量 4K 序列 | 4K | 真实超高清退化评测 |
 
-## 14.4 VSR 的训练数据
-
-VSR 的数据要求比图像 SR 更高：
-
-| 数据集 | 视频数 | 分辨率 | 用途 |
-|-------|-------|-------|------|
-| **REDS** | 240 训 + 30 验 + 30 测 | 720P | 通用 VSR 标准 |
-| **Vimeo-90K** | 64,612 个 7-frame 片段 | 448×256 | 帧插值 + VSR |
-| **Vid4** | 4 个片段 | 720P | 测试 |
-| **UDM10** | 10 个片段 | 1080P | 测试 |
-| **YouHQ40** | 40 个 4K 片段 | 4K | 真实高质量 |
-
-### 视频退化合成
+### 片段级退化合成逻辑
 
 ```python
-def synthesize_video_pair(hr_video):
-    """从 HR 视频合成 LR 训练对。"""
-    
-    # 1. 时序一致的退化 (同段视频用同样参数)
-    blur_kernel = sample_blur_kernel()        # 一段视频固定
-    noise_sigma = sample_noise_sigma()        # 一段视频固定
+def synthesize_video_pair(hr_video: torch.Tensor) -> torch.Tensor:
+    """
+    从高清视频片段合成低质训练对。
+    hr_video: (T, 3, H, W)
+    """
+    # 1. 约束: 片段内部共享全局静态/慢变退化参数
+    blur_kernel = sample_blur_kernel()        # 模糊核在整段内固定
+    noise_sigma = sample_noise_sigma()        # 噪声方差在整段内固定
     
     lr_frames = []
     for hr_frame in hr_video:
@@ -299,55 +278,53 @@ def synthesize_video_pair(hr_video):
     
     lr_video = torch.stack(lr_frames)
     
-    # 2. 视频专用退化 (整段一起)
+    # 2. 注入视频编码专属压缩退化 (整段统一编码)
     lr_video = h264_compression(lr_video, bitrate=random.uniform(500, 5000))
-    
     return lr_video
 ```
 
-注意：**退化参数对一段视频固定**。这是和图像不同的地方：如果每帧用不同的退化参数，会引入"模型学到的不一致"，模型在推理时反而把帧间退化的微小差异放大成时序闪烁。
+工程原则：**片段内部退化参数严禁单帧完全独立重采样**，否则会导致网络误学习到"退化自身在剧烈闪烁"的错误先验，在真实测试中引发高频振荡。
 
-## 14.5 VRT 与 RVRT：Video Restoration Transformer
+## 14.5 从 VRT / RVRT 到生成式视频复原
 
-Liang et al. 在 2022 年提出 VRT，同年又改进为 RVRT（VRT 是 arXiv 2201，RVRT 是 NeurIPS 2022，两者都属于 2022 年）。这条线把 Transformer 引入 VSR，对应的思路是"放弃 RNN 隐状态那种串行依赖，让所有帧通过注意力机制互相看到"。它的代表性来自两点：在 SOTA benchmark 上常年压过 BasicVSR++ 约 0.5 dB；在实现复杂度和显存压力上也明显更高。
+### VRT 与 RVRT（时空注意力网络）
 
-### 核心思想
-
-不再用循环 RNN，而是**直接用 self-attention 跨帧聚合**：
+Liang 等人于 2022 年提出 **VRT（Video Restoration Transformer）** 与 **RVRT**，将自注意力机制拓展至视频时空多维特征聚合：
 
 ```
-F_1, F_2, F_3, F_4, F_5
-   │   │   │   │   │
-   └───┴───┼───┴───┘
-           ▼
-    Cross-frame attention
-           │
-           ▼
-       聚合特征
+多帧输入特征: F_1, F_2, F_3, F_4, F_5
+                │   │   │   │   │
+                └───┴───┼───┴───┘
+                        ▼
+            时空多头自注意力 (Spatio-Temporal Attention)
+                        │
+                        ▼
+                    全局聚合特征
 ```
 
-### 计算量
+计算复杂度优化解耦策略：
+1. **空域局部窗口注意力**：在单帧内部划分 8×8 局部窗口，将空间计算复杂度从 $(HW)^2$ 压缩至 $HW \cdot w^2$；
+2. **时域联合注意力**：跨越时间轴在同位置特征间计算长度为 $T$ 的长程注意力；
+3. **RVRT 混合切片**：RVRT 将整视频切分为短片段（Clip），片段内执行局部自注意力，片段间通过循环连接传递隐状态，在计算开销与长程建模间取得平衡。
 
-天然的多帧 attention 复杂度爆炸，5 帧 $H \times W$ 的 attention 是 $(5HW)^2$，相对一帧的 $(HW)^2$ 直接 25 倍。VRT 的工程化做法是把 attention 分两个轴拆开：
+性能取舍对比：
 
-1. **窗口空间 attention**：先在每帧内的局部窗口里做 self-attention（沿用 Swin 的 7×7 或 8×8 窗口），把空间复杂度从 $(HW)^2$ 压到 $HW \cdot w^2$，其中 $w$ 是窗口边长。
-2. **沿时间轴 attention**：把同一空间位置的 T 个 token 当作一个序列做 attention，长度从 $T \cdot HW$ 降到 $T$。
+| 评估维度 | BasicVSR++ (循环卷积派) | VRT / RVRT (注意力派) |
+|---------|-----------------------|----------------------|
+| **PSNR 指标** | 优秀基准 | **领先约 0.5 dB** |
+| **推理算力消耗** | 极低（高吞吐） | 较高（2 至 3 倍开销） |
+| **显存占用** | 恒定受控 | 随序列与分辨率扩张显著 |
+| **工业落地适配** | 易于边缘端与实时化部署 | 主要面向离线高画质产线 |
 
-RVRT 在 VRT 的基础上再加一层"循环"：把整段视频切成若干段，段内用 VRT-style attention，段间用循环连接传递隐状态，进一步压计算量。这种设计相当于在"完全循环 (BasicVSR++)"和"完全 attention (VRT)"中间找了一个折中。
+### 2024-2026：生成式视频扩散复原新前沿
 
-### VRT vs BasicVSR++
+回归式模型（如 BasicVSR++、RVRT）在数学上本质是逼近像素均值（$\ell_1 / \ell_2$ 优化），在面对极端重度退化时容易产生平滑模糊。自 2024 年起，业界全面探索将**大尺度视频扩散模型（Video Diffusion）与 DiT（Diffusion Transformer）作为强时序先验**的增强技术：
 
-| 维度 | BasicVSR++ | VRT/RVRT |
-|------|-----------|---------|
-| 性能 | 强 | **更强**（PSNR +0.5 dB） |
-| 速度 | 快 | 慢（2-3×） |
-| 显存 | 中 | **大**（attention） |
-| 实时性 | 可以 | 难 |
-| 实现复杂度 | 简单 | 复杂 |
+- **Upscale-A-Video（CVPR 2024）**：将图像潜空间扩散先验拓展至视频，配合时序层与光流引导约束维持帧间稳定；
+- **VEnhancer（2024）**：通过统一的视频生成扩散架构联合执行超分辨率与帧插值；
+- **STAR 与 SeedVR / SeedVR2（2025-2026）**：基于大规模视频生成模型的世界先验完成真实场景极限细节生成，SeedVR2 进一步推进单步扩散推理以降低延迟。
 
-工程实践 2026 年：
-
-- 离线、追求最高质量：优先考虑扩散 / DiT 视频复原（见下一小节）；若只要纯回归式 baseline，仍是 RVRT 或 VRT
+生成式视频增强的工程核心在于**严密平衡生成创造力与时序一致性**，防范物体身份漂移与物理失真。
 - 实时 / 接近实时：BasicVSR++
 - 端侧：BasicVSR 或更轻量
 
@@ -359,319 +336,222 @@ RVRT 在 VRT 的基础上再加一层"循环"：把整段视频切成若干段�
 
 代价也很清楚，正好对应第 13 章反复强调的两个维度。其一是时序一致性：视频扩散先验的生成性更强，若时序建模不到位，帧间"沸腾"和身份漂移会比回归式模型更明显，所以这些工作的很大一部分精力都花在时序层、光流引导、潜空间传播上。其二是延迟：多步扩散叠上视频这条时间轴，推理成本比 BasicVSR++ 高一到两个数量级，目前基本只能用于离线增强，一步化（如 SeedVR2）是把它推向实时的关键方向。更细的谱系和取舍放在第 18 章讨论，这里只给方向与代表工作。
 
-## 14.6 帧插值（VFI）
+## 14.6 视频帧插值（VFI）：从中间流估计到多假设变换
 
-帧插值是另一类视频任务，把低帧率视频提到高帧率（24 fps → 60 fps，60 fps → 240 fps）。
+视频帧插值（VFI）旨在提升视频时间采样率（如 24 fps 升至 60 fps，或 60 fps 升至 240 fps 超慢动作）。
 
-### 任务定义
+### 任务定义与监督范式
 
-给定相邻两帧 $F_t$ 和 $F_{t+1}$，生成中间帧 $F_{t+0.5}$。
+给定时间步相邻的两帧输入 $F_t$ 与 $F_{t+1}$，合成任意中间时刻（如 $t+0.5$）的未知帧 $F_{t+0.5}$。
 
-注意"中间帧"的两个不同语境：
+- **推理阶段**：目标中间帧在物理上未被采样，属于纯粹的生成性重建任务；
+- **训练阶段**：从高帧率基准视频（如 240 fps GoPro 序列）中抽取连续三帧，以首尾两帧作为网络输入，以真实中间帧作为强监督真值。
 
-- **推理时**：用户给的视频里没有中间帧，这是任务难点
-- **训练时**：标准做法是从高 FPS 视频（240 fps GoPro 等）取连续 3 帧，第一第三帧作为输入、第二帧作为真值监督，所以**训练时是有真值的**
+### RIFE：实时双向中间流直接估计
 
-### RIFE（2022）
+Huang 等人于 2022 年提出的 **RIFE（Real-time Intermediate Flow Estimation）** 奠定了现代高效帧插值的基础：
 
-Huang et al. 的 RIFE（Real-time Intermediate Flow Estimation，实时中间流估计）是当前帧插值的事实标准。核心创新：
+- **核心创新**：规避从端到端单向光流 $F_{0 \to 1}$ 反向推导中间流引发的孔洞与遮挡伪影，设计 **IFNet** 直接端到端联合预测中间时刻到两端的双向流场 $F_{0.5 \to 0}$ 与 $F_{0.5 \to 1}$；
+- **自适应融合**：IFNet 同步输出融合掩码（Blending Mask），指导两端 Warping 结果的逐像素动态加权。
 
-- 不显式估计前向/后向光流，**直接估计中间帧到两端的光流**
-- 一个 IFNet 同时输出 $F_{0.5 \to 0}$ 和 $F_{0.5 \to 1}$
-- 用这两个光流分别 warp $F_0$ 和 $F_1$，融合得到 $F_{0.5}$
-
-为什么不直接复用 RAFT、FlowNet 这种通用光流模型？答案是 VFI 真正需要的是"中间帧到两端"的光流（$F_{0.5 \to 0}$ 和 $F_{0.5 \to 1}$），而通用光流模型给的是"前一帧到后一帧"（$F_{0 \to 1}$）。要从后者（通用模型给的 $F_{0 \to 1}$）反推出前者（VFI 真正需要的 $F_{0.5 \to \{0,1\}}$），得做一次反向投影，过程里会引入大量遮挡、孔洞、半像素误差。RIFE 的做法是**直接训练一个网络输出 $F_{0.5 \to \{0, 1\}}$**，省掉反推这一步。
-
-下面把 RIFE 双向流估计 + 加权融合的数据流画清楚：
+RIFE 的端到端数据流如下图所示：
 
 ```mermaid
 graph LR
-    F0[F_0 帧] --> IFNet[IFNet<br/>同时预测中间帧到两端的双向流]
-    F1[F_1 帧] --> IFNet
-    IFNet --> Fto0[光流 F_0.5 → 0]
-    IFNet --> Fto1[光流 F_0.5 → 1]
-    IFNet --> Mask[融合 mask M ∈ 0,1]
-    F0 --> Warp0[backward warp]
+    F0[输入帧 F_0] --> IFNet[中间流网络 IFNet<br/>联合预测中间时刻双向光流]
+    F1[输入帧 F_1] --> IFNet
+    IFNet --> Fto0[中间流 F_0.5 → 0]
+    IFNet --> Fto1[中间流 F_0.5 → 1]
+    IFNet --> Mask[动态融合掩码 M ∈ 0,1]
+    F0 --> Warp0[反向重采样 Warping]
     Fto0 --> Warp0
-    F1 --> Warp1[backward warp]
+    F1 --> Warp1[反向重采样 Warping]
     Fto1 --> Warp1
-    Warp0 --> Blend[M ⊙ warp0<br/>+ 1-M ⊙ warp1]
+    Warp0 --> Blend[掩码加权融合<br/>M ⊙ Warp0 + 1-M ⊙ Warp1]
     Warp1 --> Blend
     Mask --> Blend
-    Blend --> Refine[FusionNet 细化<br/>修补遮挡区]
+    Blend --> Refine[FusionNet 残差细化<br/>修复遮挡与非刚体失真]
     F0 --> Refine
     F1 --> Refine
-    Refine --> Mid[中间帧 F_0.5]
+    Refine --> Mid[合成中间帧 F_0.5]
 
     style IFNet fill:#e3f2fd
     style Blend fill:#fff3e0
     style Mid fill:#e8f5e9
 ```
 
-这张图里 mask 是 IFNet 的副产物，物理含义是"中间帧的某个像素更应当从 F_0 还是 F_1 取"。在 disocclusion（新出现的物体）和遮挡边界上，mask 会偏向其中一端；在两端都能看到的区域，mask 接近 0.5。FusionNet 是一个 refinement 网络，专门修补"两端都被遮挡导致 warp 出错"的孔洞。
+融合掩码的物理意义在于量化两端特征的可信度：在发生单侧遮挡或新内容显露（Disocclusion）的边缘，掩码自适应偏向未受遮挡的一侧。
+
+实现代码骨架：
 
 ```python
+import torch
+import torch.nn as nn
+
 class RIFEStub(nn.Module):
-    """RIFE 简化骨架。"""
+    """RIFE 帧插值核心架构骨架。"""
 
     def __init__(self):
         super().__init__()
-        self.ifnet = IFNet()        # 输出中间帧到两端的光流
-        self.fusion_net = FusionNet()  # 融合 warp 结果
+        self.ifnet = IFNet()          # 多尺度中间流估计网络
+        self.fusion_net = FusionNet()  # 特征残差细化网络
 
     def forward(self, f0: torch.Tensor, f1: torch.Tensor) -> torch.Tensor:
         """
-        f0, f1: 相邻两帧 (B, 3, H, W)
-        返回: 中间帧 f_0.5
+        f0, f1: 输入相邻帧 (B, 3, H, W)
+        返回: 合成中间帧 f_mid (B, 3, H, W)
         """
-        # 1. 估计中间帧到两端的光流
+        # 1. 联合估计目标时刻双向光流与动态掩码
         flow_to_0, flow_to_1, mask = self.ifnet(f0, f1)
 
-        # 2. 用光流 warp 两端帧
+        # 2. 对两端输入帧执行运动补偿重采样
         warped_0 = warp_with_flow(f0, flow_to_0)
         warped_1 = warp_with_flow(f1, flow_to_1)
 
-        # 3. mask 加权融合
-        f_mid = mask * warped_0 + (1 - mask) * warped_1
+        # 3. 动态掩码加权粗融合
+        f_coarse = mask * warped_0 + (1.0 - mask) * warped_1
 
-        # 4. (可选) 用一个 refine 网络最后微调
-        f_mid = self.fusion_net(f_mid, f0, f1)
+        # 4. 残差细化网络修补边缘孔洞
+        f_mid = self.fusion_net(f_coarse, f0, f1)
         return f_mid
 ```
 
-### RIFE 的优势
+### FILM 与 AMT：面向大位移与复杂遮挡的进阶架构
 
-- **快**：原版 RIFE 在 1080P 上能跑 30 FPS
-- **简洁**：单网络端到端
-- **可扩展**：递归调用就能做 $4\times$, $8\times$ 帧率提升
+- **FILM（Google, 2022）**：采用多尺度特征金字塔递归细化光流，在剧烈体育运动与大位移镜头下具备更强的拓扑保持能力；
+- **AMT（CVPR 2023）**：借鉴 RAFT 构建全像素对（All-Pairs）4D 相关体，并引入多流场假设（Multi-Field）机制联合探索多种潜在运动轨迹，在大范围遮挡边界上的平滑度显著优于 RIFE。
 
-### FILM（Google, 2022）
+### 帧插值的高频失效场景
 
-Reda et al. 的 FILM 用了不同思路，多尺度光流估计 + 渐进合成：
+1. **超大位移击穿感受野**：高速运动导致位移超出搜索窗口，插值帧产生断裂重影；
+2. **非刚体流动与半透明介质**：水流、火焰、烟雾与玻璃反光破坏亮度恒定假设；
+3. **高频周期性几何纹理**：栅栏、百叶窗等重复纹理引发光流匹配歧义。
 
-- 不依赖单步光流估计
-- 在多个分辨率上递归细化
-- **对大位移更鲁棒**（运动剧烈的场景）
+## 14.7 视频去模糊：时空非均匀退化与清晰瞬态利用
 
-实测：
+与单帧图像盲去模糊相比，视频去模糊具备决定性的**时序信息互补优势**：
+- 物体运动往往伴随瞬时加减速，某一帧严重模糊时，相邻帧往往恰好处于运动转折或静止的清晰瞬态；
+- 手持相机抖动的空间方向呈高频交替分布，各帧之间的清晰纹理区域互不重叠。
 
-- **慢速运动**（普通视频）：RIFE 和 FILM 接近
-- **快速运动**（体育、舞蹈）：FILM 优于 RIFE
+### 核心解题策略
 
-### AMT（CVPR 2023）
+视频去模糊的关键不在于单帧反卷积，而在于**通过精准的时序对齐与时空注意力，从相邻帧中借用高频未退化纹理补偿当前模糊帧**（典型代表如 EDVR 的去模糊分支与 CDVD-TSP）。
 
-更新的 SOTA，但它并不是"RIFE 加 attention"这么简单。AMT（All-pairs Multi-field Transforms）的核心是像 RAFT 那样构建 **all-pairs 相关体**来捕捉大范围对应关系，再用 **multi-field**（对同一处给出多组光流假设）做光流细化，最后融合。正因为多组假设加上大范围相关体，它在**大位移和遮挡边界**上比只估一组中间流的 RIFE 更稳。
+### 基准数据集：GoPro Benchmark
 
-### 帧插值的失败模式
+由 240 fps 高速相机拍摄真实清晰场景，对相邻多帧连续加权累加合成带有真实曝光积分效应的运动模糊帧，以中心原始帧作为基准真值。
 
-- **大位移**：物体跨度超过感受野，插出鬼影
-- **新物体出现**（disocclusion）：相邻帧没有这个物体的信息，无法插出
-- **半透明物体**：光流假设失效（玻璃、烟雾）
-- **重复纹理**：光流容易匹配错位置（栅栏）
+## 14.8 视频修复（Inpainting）与老电影综合复原
 
-## 14.7 视频去模糊
+### 视频内容补全（Video Inpainting）
 
-视频去模糊和图像去模糊的不同：**相邻帧提供清晰参考**。这是视频任务相对图像任务最具结构性的一项优势，所有视频去模糊模型本质上都在利用这一点。
+给定视频序列与待移除物体的二值时空掩码（Mask），目标是在保持时空连续性的前提下消除物体并补全背景。
 
-### 关键观察
+- **E2FGVI（CVPR 2022）**：提出端到端光流引导的视频补全架构；
+- **ProPainter（ICCV 2023）**：引入**循环光流补全模块（Recurrent Flow Completion）**，首先在掩码区域推导补全光流矢量场，再基于补全光流引导跨时间步的可变形自注意力机制聚合长程背景纹理，有效解决了大尺度移动物体消除后的背景漂移伪影。
 
-视频里的模糊往往是**间歇性**的，某一帧模糊（运动瞬间），下一帧清晰（运动停止）。利用这个特性能大幅提升去模糊质量。具体来说有两种典型情境：
+### 历史老影像综合修复工程流水线
 
-- 长曝光下的运动模糊只发生在物体高速移动的几帧，物体减速或停下后下一帧立刻清晰
-- 手持相机抖动是高频的，模糊核方向每帧都在变，相邻帧的清晰区域往往位置不同
-
-工程上的直接推论是：视频去模糊不能像图像去模糊那样只看单帧反卷积，必须做帧间对齐，从相邻帧"借"清晰像素。这又回到了 13 章的光流 / DCN 对齐套路。
-
-### EDVR
-
-EDVR 不只是 VSR 的事实经典，也是视频去模糊的代表：
-
-- 滑动窗口（5 或 7 帧）
-- DCN 对齐
-- 时空 attention 融合
-
-### MIMO-UNet（单图去模糊，这里只借它的多尺度思想）
-
-需要澄清一个常见的误归类：MIMO-UNet（ICCV 2021）其实是**单图去模糊**网络，名字里的"multi-input multi-output"指的是把同一张图做成多尺度金字塔，各尺度分别输入、分别输出再融合，和"多帧"没有关系。之所以在视频去模糊这一节提它，是因为它"在不同分辨率上分别处理不同尺度的模糊、再融合"的多尺度思路可以嫁接到视频去模糊的每一帧上；真正让视频占优势的，仍然是前面说的帧间对齐、从相邻帧借清晰像素。
-
-### 数据：GoPro 数据集
-
-视频去模糊的标准 benchmark：用高速相机拍摄（240 fps），把多个邻近帧平均得到"模糊帧"，原始帧作为真值。
-
-## 14.8 视频修复（Inpainting / Restoration）
-
-视频修复包含两类：
-
-- **视频 inpainting**：补全被遮挡或被去除的区域
-- **老电影修复**：去除划痕、闪烁、缺失帧
-
-### Video Inpainting
-
-给定一段视频和一个 mask（每帧标注要补全的区域），输出补全后的视频。
-
-代表方法：**E2FGVI**（End-to-end Flow-Guided Video Inpainting，CVPR 2022）、**ProPainter**（ICCV 2023）
-
-核心思路：
-
-1. 用光流找到 mask 区域在其他帧的"对应像素"
-2. 把这些信息聚合到当前帧
-3. 用 transformer 在时空上融合
-
-ProPainter 的关键改进：用一个 recurrent flow completion 模块，**先补全光流**（mask 区域光流也是缺的，因为 mask 区域没有原像素，无法直接估流），再用补全的光流引导帧补全。这一步是关键，因为没有补全的光流，长程时序对齐根本无从谈起，去除整段视频里的人物或物体时，会出现"补出来的填充内容在前后帧之间漂移"的失败模式。
-
-### 老电影修复
-
-老电影的退化有几种特殊模式：
-
-- **划痕**：随机位置的线条
-- **闪烁**：整帧亮度/对比度抖动
-- **缺失帧**：某些帧完全缺失
-- **颜色衰减**：cyan/红色偏移
-
-工程 pipeline：
+老电影的退化并非单一高斯退化，而是多种物理损伤的复杂级联（划痕、霉斑、噪波闪烁、帧丢失、严重褪色）。生产级修复必须遵循多阶段串行流水线：
 
 ```
-Step 1: 划痕去除 (用相邻帧的对应位置)
-Step 2: 闪烁稳定 (校正帧间亮度)
-Step 3: 缺失帧补全 (用 RIFE 类插值)
-Step 4: 颜色还原 (Lab 空间统计校正 + 学习的色彩还原)
-Step 5: 增强 (VSR + 帧插值到 60 fps)
+原始低质历史胶片序列
+  │
+  ├─ 阶段 1: 几何物理划痕与污斑剔除 (时序邻帧对应补全)
+  ├─ 阶段 2: 曝光与色调闪烁平抑 (时间轴统计一致性校正)
+  ├─ 阶段 3: 缺失帧与坏帧重构 (基于 RIFE 的时序插值)
+  ├─ 阶段 4: 语义色彩恢复 (Lab 空间统计映射与深度着色网络)
+  └─ 阶段 5: 高保真超分与帧率倍增 (BasicVSR++ / 生成式复原)
+  │
+输出 4K 60fps 数字化修复成片
 ```
 
-代表项目：
+## 14.9 视频防抖（Video Stabilization）
 
-- **DeepRemaster**（Iizuka & Simo-Serra 2019）：老电影上色 + 修复
-- **Bringing Old Films Back to Life**（Wan et al. 2022）：完整的电影修复 pipeline
+手持拍摄引发的高频颠簸需通过几何变换予以平抑，核心难点在于**解耦相机的无意抖动与摄影师的主动运镜轨迹**。
 
-## 14.9 视频去抖（Stabilization）
+### 算法实现三部曲
 
-抖动来自相机移动（手持手机、动作相机）。**和真实运动区分**是难点。
+1. **全局运动场估计**：通过跨帧稀疏特征点追踪或稠密光流估计相邻帧间的单应性矩阵（Homography）或仿射变换参数；
+2. **时序轨迹平滑**：对相机运动轨迹序列施加高斯低通滤波、卡尔曼滤波或样条平滑优化，滤除高频抖动分量；
+3. **空间重采样与边缘补全**：计算平滑轨迹与原始轨迹的差分矩阵，对各帧执行逆向重投影。
 
-### 经典方法
+### 视场裁剪（Crop）权衡
 
-1. 用光流/特征点追踪估计相机的全局运动
-2. 平滑这个全局运动轨迹
-3. 用平滑后的轨迹反向 warp 每一帧
+空间重投影会导致画面边缘出现黑色无效区，必须按比例执行中心裁剪与微小放大。防抖强度与视场损失呈正相关：激进防抖会显著缩小有效画面视角。
 
-```
-原始: 相机抖动 + 真实场景运动
-     ↓
-轨迹估计 + 平滑
-     ↓
-重 warp: 相机平滑 + 真实场景运动
-```
+## 14.10 生产级视频增强流水线组合范式
 
-### 现代方法
+真实工业场景中，需根据算力预算与延迟约束组合多子任务模块：
 
-- **Stabnet**（学习的去抖）
-- **Google 的 Pixel Camera 内置**（手机厂商各家方案）
-- 部分手机用 IMU 数据辅助（陀螺仪比图像光流准）
-
-### Crop 问题
-
-去抖必然要**裁切边缘**，相机 warp 后画面边缘会留空白。一般的 trade-off：
-
-- 强去抖：裁切多（视野变小）
-- 弱去抖：裁切少（视野保留）
-
-## 14.10 视频增强的工程组合
-
-实际产品里通常不是单一模型，而是 pipeline：
-
-### 例：手机视频后处理（vlog 增强）
+### 1. 移动端 Vlog 视频离线后处理流水线
 
 ```
-原始 1080P 30fps 视频
-  ↓ 去抖 (StabNet)
-  ↓ 去噪 (BasicVSR 系)
-  ↓ 帧插值 (RIFE) → 60 fps
-  ↓ 超分 (BasicVSR++) → 4K
-  ↓ 颜色校正 (LUT-based)
-4K 60 fps 增强视频
+原始 1080P 30fps 手机录像
+  ↓ 视频防抖平滑 (StabNet / 局部单应变换)
+  ↓ 时序去噪与画质净化 (轻量 BasicVSR 架构)
+  ↓ 帧插值倍增 (RIFE) → 升频至 60 fps
+  ↓ 4 倍超分辨率重建 (BasicVSR++) → 输出 4K
+  ↓ 3D LUT 色彩映射与胶片颗粒合成
+4K 60fps 高保真视频
 ```
 
-每个步骤可能用不同模型，整体在 GPU 上大约是 0.1-0.2× 实时（处理 1 秒视频需要 5-10 秒），并非快于实时。
-
-### 例：直播视频增强
-
-实时性要求严格（< 33ms/帧）：
+### 2. 超低延迟在线直播增强流水线（帧耗时 $< 33$ ms）
 
 ```
-原始 720P 30fps 直播流
-  ↓ 轻量去噪 (NAFNet 小版本, < 5ms)
-  ↓ 端侧超分 (ESRGAN-Lite 蒸馏, < 20ms) → 1080P
-  ↓ 颜色 LUT (< 1ms)
-1080P 30fps 增强流
+原始 720P 30fps 实时视频流
+  ↓ 极轻量因果去噪 (NAFNet-Tiny, 耗时 < 5ms)
+  ↓ 单向端侧超分辨率 (蒸馏轻量 CNN, 耗时 < 20ms) → 输出 1080P
+  ↓ 硬件级 1D/3D LUT 调色 (< 1ms)
+1080P 30fps 低延迟输出流
 ```
 
-不能用扩散、不能用厚 transformer、不能用滑动窗口（太慢），只能用极轻量 CNN。
+实时流强制规避双向循环与大尺度 Transformer，严格采用因果单向模型并结合 TensorRT / CoreML 算子融合。
 
-### 例：老电影修复（离线）
+## 14.11 视频综合质量评估指标
 
-不要求实时，质量优先：
+评估视频模型需结合单帧空间保真度与时序动态指标：
 
-```
-原始 480P 24fps 黑白老电影
-  ↓ 划痕去除 (DeepRemaster)
-  ↓ 闪烁稳定
-  ↓ 上色 (DeepRemaster + 手工调整)
-  ↓ 修复 (Bringing Old Films Back to Life)
-  ↓ 帧插值 (RIFE) → 48 fps
-  ↓ 超分 (Real-ESRGAN 调用每帧 + 时序一致性后处理)
-2K 48fps 彩色修复版
-```
+| 评估指标 | 度量维度 | 核心物理含义与工具链 |
+|---------|---------|-------------------|
+| **PSNR / SSIM** | 单帧像素/结构 | 衡量均方误差与局部结构相关性 |
+| **LPIPS / DISTS** | 单帧感知保真 | 深度特征空间距离，反映微观纹理质量 |
+| **tOF** | 时序光流一致性 | 输入与输出视频光流矢量场的一致程度 |
+| **tLPIPS** | 时序感知连续性 | 经运动补偿对齐后相邻帧间的感知距离 |
+| **VMAF** | 视频多维主观质量 | Netflix 开源行业标准，融合 VIF、ADM 与运动评分 |
+| **FVD** | 时空分布散度 | 衡量生成视频在时空特征分布上的真实感 |
 
-## 14.11 评估视频增强模型
-
-复习第 13 章 13.10 节，加几个具体指标：
-
-| 指标 | 类型 | 工具 |
-|------|------|------|
-| PSNR / SSIM | 单帧 | 标准 |
-| LPIPS | 单帧感知 | 标准 |
-| **tOF** | 时序光流一致 | 自实现 |
-| **tLPIPS** | 时序感知一致 | 自实现 |
-| **VMAF** | 视频质量评估 | Netflix 开源 |
-| **FVD** (Fréchet Video Distance) | 分布距离 | 生成式视频用 |
-
-### VMAF
-
-Netflix 在 2016 年推出的视频质量指标，融合多个子指标（VIF、ADM、运动评分），训练数据是真实人评。**生产环境视频质量的标准**。
+### 生产级 VMAF 评估调用
 
 ```python
-# 调用 VMAF (用 ffmpeg)
 import subprocess
+import json
 
-def compute_vmaf(reference_video, distorted_video):
-    """用 ffmpeg + libvmaf 算 VMAF score。"""
+def compute_vmaf(reference_video: str, distorted_video: str) -> float:
+    """
+    通过 FFmpeg libvmaf 插件计算客观 VMAF 分值 (取值 0 至 100)。
+    """
     cmd = [
         'ffmpeg', '-i', distorted_video, '-i', reference_video,
-        '-lavfi', 'libvmaf=log_path=vmaf.json:log_fmt=json',
+        '-lavfi', 'libvmaf=log_path=vmaf.json:log_fmt=json:n_threads=8',
         '-f', 'null', '-'
     ]
-    subprocess.run(cmd)
-    # 解析 vmaf.json
-    import json
-    with open('vmaf.json') as f:
-        result = json.load(f)
-    return result['pooled_metrics']['vmaf']['mean']
+    subprocess.run(cmd, check=True)
+    
+    with open('vmaf.json', 'r') as f:
+        data = json.load(f)
+    return data['pooled_metrics']['vmaf']['mean']
 ```
 
 ## 14.12 小结
 
-1. **VSR 演进**：滑动窗口（EDVR）→ 双向 Recurrent（BasicVSR++）→ Transformer（VRT / RVRT）→ 扩散 / DiT 视频复原（2024 起，STAR、SeedVR 等）
-2. **BasicVSR++ 是 2022-2024 年回归式 VSR 的事实标准**：双向循环 + 二阶传播 + flow-guided DCN；2024 年后的最高质量已转向扩散派
-3. **VSR 数据要求高**：合成时退化参数对一段视频固定，避免引入不一致
-4. **帧插值（VFI）三巨头**：RIFE（快）、FILM（大位移强）、AMT（遮挡强）
-5. **视频去模糊** 利用相邻帧的清晰副本，这是图像去模糊没有的优势
-6. **视频修复** 老电影是经典场景，工程是多步 pipeline 而不是单一模型
-7. **视频去抖** 关键是区分相机抖动和真实运动
-8. **生产 pipeline 是组合**：不是单模型，是去抖+去噪+插值+SR 的链
-9. **实时增强严格受限**：< 33ms/帧只能用轻量 CNN
-10. **VMAF 是生产视频质量评估的事实标准**
-
-到这里 Part IV 视频两章完成。Part V 进入工程部署：前面讲了模型本身，这部分讲怎么把模型推到生产环境（量化、TensorRT、CoreML、移动端、tile）。
+1. **VSR 架构演进**：滑动窗口（EDVR）受限于时序视野，单向因果循环主导低延迟实时流，双向网格循环（BasicVSR++）统治离线高保真基准，扩散与 DiT 先验引领极限生成式复原；
+2. **BasicVSR++ 双引擎**：二阶传播阻断光流累积误差，Flow-Guided DCN 实现物理引导下的亚像素形变微调；
+3. **退化合成一致性**：视频训练数据必须保持片段内部退化参数的时序强相关，杜绝帧间独立扰动引发的模型高频振荡；
+4. **帧插值机制**：RIFE 通过 IFNet 直接预测中间时刻双向流场，FILM 与 AMT 分别通过多尺度金字塔与多流场假设攻克大位移和遮挡边界；
+5. **视频修复体系**：ProPainter 通过循环光流补全为掩码区域提供几何锚点，结合时空注意力实现大尺度内容平滑消除；
+6. **生产工程落地**：实际业务依赖去抖、去噪、插值与超分辨率的多阶段串行流水线；线上部署以 VMAF 结合时序指标作为核心准入标尺。
 
 ---
 
-> 下一章 [推理优化](15-inference.md) → 量化、TensorRT、CoreML、torch.compile、动态分辨率、tile 推理。
+> 下一章 [推理加速与端侧部署](15-inference.md) 深入工业级模型部署：量化蒸馏、TensorRT / CoreML 算子优化、动态分辨率切块与显存极致压缩。

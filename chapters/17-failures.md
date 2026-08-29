@@ -1,62 +1,52 @@
 # 第 17 章 · 失败案例集
 
-> 平均指标好的模型在生产里依然会失效。
+> 平均指标优异的模型在生产环境中仍可能遭遇严重失效。
 >
-> 这一章把过去几年影像增强里**最常见的失败模式**收集起来 - 每一种都给具体场景、原因、应对。
+> 本章系统梳理工业界影像增强系统中最高频的 15 类失效模式：逐一剖析具体场景、物理根因与工程防御策略。
 >
-> 这是这本书里最"实战"的一章，也是最值得反复读的一章。
+> 这是连接算法研发与生产高可用防线最关键的一环。
 
 ## 17.0 章首铺垫
 
-读完前面 16 章，你已经掌握了一个完整的增强系统从数学定义、表达空间、损失设计、评估指标、数据合成、网络架构、训练动力学、视频时序、到部署优化的全套工具链。理论上，这套工具足以训出一个在大部分公开 benchmark 上拿得出手的模型。
+在前 16 章中，我们系统构建了从退化建模、表征空间、损失函数、评估指标、数据合成、网络架构、训练动力学到硬件部署优化的完整技术闭环。在标准测试集与学术 Benchmark 上，这套方法论足以训练出具有竞争力的模型。
 
-但工程世界里有一个不对称的事实：一个增强模型上线之后，**用户记住的不是你在平均指标上比上一版高了多少，而是它在某一张图上的崩坏**。一张被修成糖纸的脸、一段在场景切换处闪烁的视频、一个把"日"字修成"目"字的文档，足以让所有的 PSNR 提升归零。媒体上传播的失败案例从来不是"平均 PSNR 涨 0.2 dB"的反面，它们是模型在 OOD（out-of-distribution，分布外样本，即训练时没见过的输入分布）上的剧烈错误。
+然而在工业级生产实践中存在一个显著的体验不对称规律：**用户不会关注模型在平均指标（PSNR / SSIM）上相比上一代提升了零点几分贝，但会清晰记住某一张图像上出现的灾难性崩坏**。一张被过度幻觉平滑的人脸、一段在镜头切镜处剧烈闪烁的视频、一个将字符笔画重构错误的文档，足以彻底摧毁整个产品的用户信任。线上被广泛反馈与投诉的质量事故，其根源往往是模型在分布外样本（Out-of-Distribution, OOD）上不可预测的剧烈扰动。
 
-这一章把这些剧烈错误整理成一份目录。目录里的每一项都源自真实的产品事故，来自社交媒体的截图、用户的投诉、内部回归测试的红色行。它们是这个领域过去十年积累的教训，是前人付出代价之后留下的航海图。读这一章和读前面任何一章都不同：前面在告诉你怎么造一辆车，这一章在告诉你车在哪些路口会翻。
+本章将这些典型失效模式进行系统化归纳。每一个条目均源自真实的工业落地故障、线上报警与自动化回归测试红线。它们是影像增强领域多年工程试错与代价换来的防空图谱。
 
-每个失败模式按同一个模板组织：先给具体的产品场景（让你能"看见"问题），再给根因分析（让你理解为什么会发生），最后给一组可执行的应对（让你知道在自己系统里加什么防线）。三段之间不可省略：只看场景不分析根因会让你以为是"模型不够好"，只看根因不给应对会让你停在抱怨而不改进，只给应对而跳过根因会让你做无用功（修补的位置错了）。
+针对每一种失效模式，本章均按照标准工程三联体展开分析：
+1. **具体表现场景**：直观复现故障形态；
+2. **底层机理剖析**：从数学分布、网络归纳偏置或硬件算子层面定位根本诱因；
+3. **防御与规避策略**：提供工程可落地的代码方案与系统拦截兜底机制。
 
-本章最后还会做两件事：把所有失败模式归纳成五条通用应对原则，以及把测试集工程化为可以接入 CI 的回归套件。前者帮你在遇到一个新失败模式时知道往哪里看，后者帮你保证今天发现的问题不会在下一个版本悄悄回来。
+本章后半部分将这些防御措施提炼为五条系统工程通用准则，并提供可直接集成至 CI/CD 流水线的自动化回归评测套件，确保已知缺陷在后续迭代中不再复发。
 
-## 17.0.1 缩写与术语注
+## 17.0.1 缩写与核心术语
 
-本章和上下游章节会反复用到这些缩写，集中放在这里方便回查：
+- **OOD**（Out-Of-Distribution，分布外样本）：指超出模型训练阶段数据覆盖流形的异常输入，模型在此类输入上的映射行为缺乏泛化保证；
+- **PSNR / SSIM**：经典的像素均方差与结构相似度保真度度量；
+- **LPIPS**：基于深度特征空间的学习型感知距离；
+- **MANIQA / CLIP-IQA / Q-Align**：无参考图像质量评估（NR-IQA）前沿网络；
+- **FFHQ**（Flickr-Faces-HQ）：广泛用于人脸预训练的高清人脸数据集（7 万张），在年龄与种族分布上存在固有统计偏置；
+- **ArcFace**：基于加性角余量损失构建的高精度人脸特征提取模型，输出 512 维单位超球面嵌入向量；
+- **CodeFormer**：基于离散代码本（Vector-Quantized Codebook）先验的人脸盲复原模型，支持可调保真度权重；
+- **SUPIR / OSEDiff / TSD-SR**：代表性的多步与单步生成式扩散超分辨率架构；
+- **SDXL / FLUX / DiT**：主流文生图骨干网络，在生成式超分中常用作大容量语义先验主干；
+- **ControlNet**：向预训练生成主干注入空间条件约束（如边缘、深度、低质输入）的旁路调节网络；
+- **QAT / PTQ**：量化感知训练与训练后量化；
+- **ACES / WCG**：广色域与影视级色彩编码工作流规范；
+- **CFG**（Classifier-Free Guidance）：扩散采样阶段调控条件引导强度的超参数；
+- **ROI**（Region of Interest）：计算图中需实施局部特化增强的感兴趣子区域。
 
-- **OOD**（Out-Of-Distribution，分布外样本）：训练分布没覆盖到的输入。模型在 OOD 上的行为没有理论保证，多数失败模式的本质都是这件事。
-- **PSNR**（Peak Signal-to-Noise Ratio，峰值信噪比）：像素级 MSE 取对数的指标，主导学术 benchmark。
-- **SSIM**（Structural Similarity，结构相似度）：考虑亮度、对比度、结构三项的指标。
-- **LPIPS**（Learned Perceptual Image Patch Similarity，深度网络感知距离）：用 VGG / AlexNet 特征算的感知距离。
-- **MANIQA / CLIP-IQA / Q-Align**：无参考的 IQA（Image Quality Assessment，图像质量评估）模型。
-- **FFHQ**（Flickr-Faces-HQ）：StyleGAN 用的 70K 张高清人脸数据集，主要来源 Flickr，分布偏白人和年轻人。
-- **ArcFace**：业界最常用的人脸识别模型，把人脸映射到 512 维的角度可分超球面 embedding。
-- **CodeFormer**：用 VQ codebook 给人脸做强先验的修复模型，含可调 fidelity 参数。
-- **SUPIR / OSEDiff / TSD-SR / SinSR / DiffBIR / PASD / SeeSR / ResShift / StableSR / AdcSR**：扩散派 SR 路线上的不同工程方案。下一章会逐个展开，本章只需要知道它们的共同问题是"猜得太自由"。
-- **SDXL**（Stable Diffusion XL）：2.6B 参数的文生图基模，多数扩散派 SR 在它的 UNet 上接 ControlNet 或 LoRA 微调而来。
-- **SD3 / SD3.5 / FLUX**（2024-2025 出现的新一代 DiT 主干）：MM-DiT 结构的文生图基模，部分新派扩散 SR 把它们作为 backbone 替换 SDXL。
-- **ControlNet**：把额外的视觉条件（边缘图、深度图、低质量图等）注入预训练 UNet 的旁路网络。
-- **LLaVA**（Large Language and Vision Assistant）：多模态大模型，给一张图能生成自然语言描述，SUPIR 用它给输入图自动生成 prompt。
-- **QAT / PTQ**（Quantization-Aware Training / Post-Training Quantization）：训练时和训练后两种量化方案。
-- **HDR / SDR**（High / Standard Dynamic Range，高/标准动态范围）：HDR 指亮度范围远超 0-255 的图像 / 视频格式。
-- **WCG**（Wide Color Gamut，广色域）：色域范围超过 Rec.709（HDTV 色域标准）的色彩空间，例如 Rec.2020、DCI-P3。
-- **ACES**（Academy Color Encoding System，学院色彩编码系统）：电影工业的色彩管线标准。
-- **CFA / Bayer / RGGB**（Color Filter Array / Bayer Pattern / Red-Green-Green-Blue Pattern）：相机传感器上的颜色滤镜阵列，多数手机相机用 RGGB 排布。
-- **OCR**（Optical Character Recognition，光学字符识别）：把图像里的文字识别成可编辑文本。
-- **CDN**（Content Delivery Network，内容分发网络）：图像在网络上经多层代理传输时常被重新压缩，是真实世界 D 链条的最后一站。
-- **CFG**（Classifier-Free Guidance，无分类器引导）：扩散采样里调节 prompt 强度的旋钮。
-- **VAE**（Variational AutoEncoder，变分自编码器）：扩散派把图像编码到潜空间用的网络。
-- **ROI**（Region of Interest，感兴趣区域）：图像中需要单独处理的子区域，如人脸框、文字行框。
+## 17.0.2 失败模式的分类维度
 
-## 17.0.2 失败模式的分类视角
+15 类具体失效模式从根本诱因上可划分为三大工程家族：
 
-15 类具体失败模式按"根因层级"可以归到三个家族，理解这个分类比单独记每一类更有用：
+**家族 A：先验过度生成类（Prior Hallucination）**。当输入图像的低频与高频信息严重缺失时，生成扩散或 GAN 模型强行从训练先验分布中采样“视觉合理”的细节填补空白。包括人脸形变、肢体/毛发错乱与身份漂移。其本质在于模型的生成行为与用户对“原真性（Fidelity）”的刚性预期产生冲突。
 
-**家族 A：先验编造类**。扩散和 GAN 派模型在 LR 信息严重不足时，从训练分布里采样"合理"的细节填进去。这一族包括人脸编造、毛发失败、手指错位、姿势变形、人物身份漂移，本质都是模型在执行其训练任务（采样最合理的 $\hat{x}$），只是这个"合理"和用户期望的"忠实"冲突。
+**家族 B：分布失配与退化越界类（Distribution Mismatch）**。模型在合成退化数据上学习到的逆映射流形未覆盖线上复杂的真实工况。包括放大不可逆对抗噪声、水印伪影变异、全局色调漂移、文字拓扑受损与极端输入数值溢出。其本质是数据合成管线与真实世界物理退化之间存在分布鸿沟。
 
-**家族 B：训练-推理失配类**。模型在合成数据上学到的退化分布不覆盖真实输入。这一族包括放大对抗噪声、放大水印、色调漂移、文字损坏、训练数据偏差、极端输入崩溃，本质是 D 的合成 pipeline 没有 cover 用户实际遇到的退化。
-
-**家族 C：工程链路类**。模型本身在单帧静态测试上没问题，但在工程链路里出问题。这一族包括视频闪烁、场景切换、长序列累积误差、量化崩溃、tile 接缝、batch size 不一致，本质是单帧模型被组装进更大的系统时暴露的接缝。
-
-把这三族在一张图里串起来：
+**家族 C：系统流水线与工程集成类（Pipeline Integration）**。模型在离线单帧静态评估中表现优异，但在组装进复杂系统工程链路后暴露出端到端缺陷。包括视频帧间闪烁、场景转场隐状态污染、长序列误差漂移累积、定点量化精度坍塌、Tile 拼接接缝及批次尺寸非确定性波动。
 
 ```mermaid
 graph LR
@@ -120,513 +110,401 @@ graph LR
     style MC fill:#e8f5e9
 ```
 
-这张图是本章的"地图"。后面 15 节是按现象的顺序展开（方便查找），但回到根因的时候，记得它们落在哪一族 - 落在同一族的失败模式，应对手段往往可以共用。
+## 17.1 建立失败防线的工程必要性
 
-## 17.1 为什么需要这一章
+工业级增强系统的成熟度，不在于其在标准基准集上的平均峰值，而取决于其对最恶劣的 5% 极端输入的防御与容错能力。学术论文侧重平均指标最大化，而工业交付聚焦**最差边界条件下的优雅降级**。
 
-第 12 章 12.15 节讲过"失败案例集"作为评估方法。这一章是它的内容版 - **把领域里反复出现的失败模式系统化**。
+## 17.2 失败模式 1：扩散模型幻觉生成与细节篡改
 
-经验法则：
+### 现象场景
 
-> 一个工业级增强模型的成熟度，不看它在 Set5 上 PSNR 多高，看它的失败案例集多大。
->
-> SOTA 论文优化的是平均指标。生产环境优化的是**最差的那 5%**。
+在老照片人像修复业务中，输入严重模糊或低分辨率的面部，扩散模型输出了极度清晰但面容完全陌生的面部结构，引发用户强烈的违和感与投诉。
 
-下面 15 类失败模式，每一类配场景、原因、应对。读的时候建议在脑中保留 17.0.2 节的三族分类：当读到"扩散模型把婴儿脸修成另一个人"时，提醒自己这属于家族 A（先验编造），它和后面"手指多一根"、"身份漂移"是同根问题；读到"视频闪烁"时，提醒自己这属于家族 C（工程链路），它和"场景切换崩坏"、"长序列累积误差"共享应对模式。
+### 根本诱因剖析
 
-## 17.2 失败模式 1：扩散模型编造内容
+扩散超分辨率模型的核心机制是估计后验条件概率分布 $p(x \mid y)$（给定低质输入 $y$ 求解高质图像 $x$）。当 $y$ 中的高频信息在物理层面完全湮灭时，后验分布 $p(x \mid y)$ 呈现出多模态与极大的方差，导致分布的众数被迫由预训练主干中的强先验（如 FFHQ 统计均值）主导。
 
-### 场景
+从数学上看，网络采样的输出并非算子计算错误，其在数学上确实是满足观测约束 $y$ 的一个高概率解；然而，该解与用户对“物理真实身份唯一性”的工程预期存在本质冲突。
 
-老照片修复时，扩散模型把"模糊的小婴儿脸"修成了"清晰但不像本人的脸" - 爷爷拿着照片说"这不是我儿子"。这是这个领域过去三年里出现频率最高、对产品口碑伤害最大的失败模式之一，社交媒体上不止一次出现"AI 修复把奶奶修成另一个人"的转发。
+### 工程防御方案
 
-### 原因
-
-扩散模型在严重退化的人脸上做的是**生成**，不是恢复：
-
-- LR 信息不够，模型从训练分布里采样一个"合理人脸"
-- 这个采样出来的脸**视觉上真实**，但**不是原始那个脸**
-- 训练数据里 FFHQ（Flickr-Faces-HQ，70K 张高清人脸数据集）主要是欧美人脸，其他人种的"合理脸"分布偏
-
-更细一点解释这件事的数学性质。扩散模型估的是 $p(x | y)$ - 给定低质量观测 $y$，高质量图像 $x$ 的后验分布。当 $y$ 的信息量不足以把这个后验分布"挤窄"时，分布的众数（模型最可能输出的样本）落在训练集的"平均脸"附近，但具体采到哪一个由噪声决定。爷爷的儿子和模型采到的那张脸，在数学上都是"$y$ 的合理后验样本"。模型并没有"犯错"，它执行的就是采样任务。错的是**用户期望（恢复）和模型行为（采样）的不匹配**。
-
-### 应对
-
-1. **fidelity 参数给用户**：CodeFormer 的 `w` 参数允许调节
-2. **检测严重退化区域，禁用生成式模型**：LR 太差就只用 bicubic 上采样
-3. **后处理身份验证**：用 ArcFace 比对原图和增强图，相似度过低警告用户
-4. **明确产品定位**：标明"AI 增强可能改变细节"，让用户有心理预期
+1. **暴露保真度参数（Fidelity Control）**：通过调节代码本采样权重或 ControlNet 注入强度，抑制无约束生成；
+2. **欠采样区域判别式回退**：对有效分辨率低于 $16\times 16$ 像素的人脸区域，自动禁用纯生成模型，回退至确定性双三次插值或轻量回归网络；
+3. **后置特征空间一致性校验**：利用预训练 ArcFace 网络提取增强前后面部的 512 维特征向量并计算余弦相似度，相似度低于预设安全阈值时触发告警并启动保底回退。
 
 ```python
-def safe_face_enhance(lr_face, model, identity_threshold=0.4):
+def safe_face_enhance(lr_face: torch.Tensor, model: nn.Module, identity_threshold: float = 0.4) -> dict:
+    """具备人脸特征一致性校验的安全增强管线。"""
     enhanced = model(lr_face)
     
-    # 用 ArcFace 比对
+    # 基于 ArcFace 提取身份表征并计算余弦距离
     sim = arcface_similarity(lr_face, enhanced)
     
     if sim < identity_threshold:
-        # 警告用户 (或回退到保守方法)
+        # 特征偏离过大时回退至保守上采样并记录审计日志
         return {
-            'output': bicubic_upscale(lr_face, 4),
-            'warning': '原图细节不足，AI 修复结果与原始可能差异较大',
+            'output': bicubic_upscale(lr_face, scale=4),
+            'warning': '原图有效信息不足，已触发保底回退以避免面容失真',
+            'fallback': True,
         }
-    return {'output': enhanced, 'warning': None}
+    return {'output': enhanced, 'warning': None, 'fallback': False}
 ```
 
-## 17.3 失败模式 2：放大对抗噪声 / 伪影
+## 17.3 失败模式 2：逆向放大对抗噪声与锐化伪影
 
-### 场景
+### 现象场景
 
-用户上传一张已经被 PS 软件 oversharpen 过的图，再用 Real-ESRGAN 处理，伪影被放大成"糖纸"纹理。
+用户上传经过修图软件过度锐化（Over-sharpened）或多次有损压缩的图片，经通用超分模型处理后，原本微弱的高频振铃被极度放大，生成刺眼的网状纹理与类“糖纸”伪影。
 
-### 原因
+### 根本诱因剖析
 
-模型学到的是"低质量到高质量"的映射。"低质量"的训练数据没有 oversharpen 过的图，所以模型把锐化伪影**当成需要恢复的细节**，进而锐化它。
+经典超分辨率网络（如 Real-ESRGAN）将高频信号一律建模为“待重建的微弱纹理”。当输入图像包含非自然的高频锐化白边或对抗噪声时，这些结构落入训练数据退化空间（Degradation Space）的盲区，模型错误地将其作为真实边缘进行非线性增益放大。
 
-更广义地：训练数据没 cover 的退化分布上，模型行为不可预测。
+### 工程防御方案
+## 17.4 失败模式 3：人脸身份特征漂移（Identity Drift）
 
-### 应对
+### 现象场景
 
-1. **退化检测前置**：用一个分类器预测输入图的"退化类型"
-2. **多分支模型**：不同退化类型用不同的增强模型
-3. **训练数据补全**：加入更多"奇怪退化"（包括 oversharpen、过度饱和、过度去噪）
+在实时视频会议或相册人像增强中，单帧画面经网络处理后虽然面部瑕疵被抹平、五官清晰度提升，但用户主观反馈“不像本人”，独特的轮廓特征与面部拓扑发生异化。
 
-```python
-def adaptive_enhance(image, classifier, models):
-    """根据检测到的退化类型选择模型。"""
-    degradation_type = classifier(image)
-    
-    if degradation_type == 'normal_lr':
-        return models['real_esrgan'](image)
-    elif degradation_type == 'oversharpened':
-        return models['mild_smooth_then_sr'](image)
-    elif degradation_type == 'oversaturated':
-        return models['color_normalize_then_sr'](image)
-    else:
-        return models['safe_baseline'](image)
-```
+### 根本诱因剖析
 
-## 17.4 失败模式 3：人脸身份漂移
+通用人像盲复原模型在训练时以像素级重构损失与感知损失为主导，面部身份保持损失（如基于 ArcFace 的角度距离）权重配置不足：
+- 模型倾向于将面部向预训练先验中的“标准统计均值脸”拉拢；
+- 特征性弱特征（如不对称眼角、特定痣点、特定唇形弧度）容易被网络当作局部退化残差滤除。
 
-### 场景
+### 工程防御方案
 
-视频会议增强模型，每一帧增强后看起来"美化"了，但同事发现**用户看起来像变了个人**。
-
-### 原因
-
-第 10.3 节讲过身份保留损失，但训练时这个损失权重不够：
-
-- 像素损失主导 → 模型学到"标准脸"的统计
-- 模型推理时把每张脸都"标准化"，独特特征（鼻型、嘴角等）被磨平
-
-### 应对
-
-1. **身份保留损失权重提高**：从 0.1 提到 0.5
-2. **训练数据多样性**：FFHQ 之外加 IMDB-Face、Asian Face 等
-3. **推理时的身份引导**：每次推理给一个"参考脸 embedding"作为额外输入
+1. **强化身份保留特征损失**：在训练阶段将 ArcFace 特征距离权重提升至关键约束层级；
+2. **扩充人脸多样性先验分布**：引入跨人种、宽年龄跨度与非对称特征人像数据；
+3. **推理时注入参考锚点嵌入（Reference Anchor Embedding）**：在流式处理中提取首帧高质量注册图的 Embedding，作为后续帧的显式条件先验。
 
 ```python
 class IdentityGuidedEnhancer(nn.Module):
-    """每次增强用用户的参考人脸作为引导。"""
+    """基于注册参考人脸 Embedding 显式注入的身份保真增强网络。"""
 
-    def __init__(self, base_model, arcface):
+    def __init__(self, base_model: nn.Module, arcface_extractor: nn.Module):
         super().__init__()
         self.base_model = base_model
-        self.arcface = arcface.eval()
+        self.arcface = arcface_extractor.eval()
 
-    def forward(self, lr_face, reference_face):
+    def forward(self, lr_face: torch.Tensor, reference_face: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            ref_embedding = self.arcface(reference_face)
-        # 把 embedding 作为条件注入 base_model
+            ref_embedding = self.arcface(reference_face)  # 提取 512 维特征
+        # 将特征向量以 Cross-Attention 或 AdaIN 方式注入主干网络
         return self.base_model(lr_face, condition=ref_embedding)
 ```
 
-## 17.5 失败模式 4：视频闪烁
+## 17.5 失败模式 4：视频时序高频闪烁（Temporal Flickering）
 
-### 场景
+### 现象场景
 
-用 Real-ESRGAN 逐帧处理视频，输出视频中的纹理、平坦区域、人脸细节都在"沸腾"，肉眼难受。
+采用单帧超分模型逐帧独立处理视频序列，在平坦墙面、草地或复杂毛发区域，相邻帧生成的高频微弱纹理剧烈跳变，呈现出高频噪点“沸腾”的严重视觉伪影。
 
-### 原因
+### 根本诱因剖析
 
-第 13 章 13.1 节详谈过：单帧模型不考虑时序一致。同样的纹理在两个相邻帧中略有不同的 LR 输入 → 模型生成略有不同的细节 → 闪烁。
+单帧网络缺乏帧间时间维度的先验约束。输入视频中微弱的亚像素位移与传感器时间噪声，在经过单帧深度非线性映射时被独立解算为截然不同的高频解，打破了物理世界的光度一致性。
 
-### 应对
+### 工程防御方案
 
-1. **使用时序模型**（BasicVSR++ / VRT）替代单帧模型
-2. **后处理：时序滤波**
+1. **采用时序循环或双向传播架构**：在主干中引入 BasicVSR++ 或流式因果循环模块；
+2. **后置运动补偿时序滤波（MC-EMA）**：对单帧模型输出实施基于密集光流对齐的指数移动平滑；
+3. **引入帧间光流形变损失（Warping Loss）**：训练时施加严格的时序连续性正则化。
 
 ```python
 def temporal_filter_post(frames: list, alpha: float = 0.7) -> list:
-    """对增强后的视频做指数移动平均, 减少闪烁。
-    代价: 损失部分细节, 略带"运动模糊"感。
-    """
+    """基于光流前向对齐的指数移动平均后处理滤波器。"""
     smoothed = [frames[0]]
     for t in range(1, len(frames)):
-        # 用光流先对齐前一帧
+        # 估计当前帧与前一平滑帧之间的密集光流
         flow = estimate_flow(frames[t], smoothed[-1])
         warped_prev = warp_with_flow(smoothed[-1], flow)
-        # 加权平均
-        s = alpha * frames[t] + (1 - alpha) * warped_prev
-        smoothed.append(s)
+        # 执行加权融合
+        filtered = alpha * frames[t] + (1.0 - alpha) * warped_prev
+        smoothed.append(filtered)
     return smoothed
 ```
 
-3. **训练数据：视频对 + 时序一致性损失**，这才是根本解决方案
+## 17.6 失败模式 5：定点量化精度坍塌（Quantization Crash）
 
-## 17.6 失败模式 5：量化崩溃
+### 现象场景
 
-### 场景
+模型在 FP32/FP16 精度下推理表现稳定（PSNR 达 33 dB），但经 PTQ 转为 INT8 部署于端侧 NPU 后，输出图像出现大面积色阶断层、高频棋盘格与糖纸状斑块（PSNR 暴跌至 26 dB）。
 
-模型在 PyTorch FP32 推理 PSNR 33 dB，转 INT8 部署到端侧后 PSNR 跌到 26 dB，视觉上明显糖纸。
+### 根本诱因剖析
 
-### 原因
+低层视觉任务是端到端像素回归问题，对数值截断极其敏感：
+- **动态范围跨度极大**：特定特征层的中间激活值极差极大，均匀定点量化步长引入不可逆量化截断噪声；
+- **重构敏感层抗扰度弱**：首层卷积（原始像素映射）与末端上采样层（PixelShuffle）对权重量化极为敏感，局部扰动会被直接映射为结构性网格伪影。
 
-低层视觉对量化敏感（第 15.2.5 节）：
+### 工程防御方案
 
-- **激活分布异常**：某些层激活值范围广（max 远大于 mean），INT8 量化损失大
-- **首层 / 末层敏感**：图像 → 特征 / 特征 → 图像的转换特别精细
-- **PixelShuffle 后的卷积**：量化后产生明显棋盘伪影
-
-### 应对
-
-1. **混合精度量化**：第一层、最后一层、归一化层保留 FP16/FP32
+1. **首末层混合精度保护（Mixed-Precision Policy）**：首层、末层及 PixelShuffle 关联算子强制保留 FP16 精度，仅对中间残差骨干执行 INT8 量化；
+2. **量化感知训练（QAT）**：在微调阶段显式模拟定点截断算子，让网络自适应补偿量化误差；
+3. **采用逐通道量化（Per-Channel Quantization）**：替代传统的逐张量量化，提升权重缩放精细度。
 
 ```python
-quant_config = {
-    'first_conv':       'fp16',     # 输入 conv 不量化
-    'pixel_shuffle_conv': 'fp16',   # 上采样前不量化
-    'last_conv':        'fp16',     # 输出 conv 不量化
-    'others':           'int8',
+quant_policy = {
+    'input_stem_conv':      'fp16',  # 首层特征提取算子保留半精度
+    'pixel_shuffle_conv':   'fp16',  # 上采样卷积保留半精度
+    'final_reconstruction': 'fp16',  # 图像重构末层保留半精度
+    'backbone_resblocks':   'int8',  # 中间大算力残差体执行 INT8 加速
 }
 ```
 
-2. **QAT (Quantization-Aware Training)**：训练时加入量化扰动
-3. **per-channel 量化**：不要 per-tensor，per-channel 精度高
+## 17.7 失败模式 6：分块推理边界接缝（Tile Seam Artifacts）
 
-4. **直接放弃 INT8**：低层视觉很多场景 FP16 已经够，没必要冒精度风险
+### 现象场景
 
-## 17.7 失败模式 6：边界 / Tile 接缝
+在处理 4K/8K 超大分辨率图像时，因显存限制采用 Tile 切块独立推理，拼接后整图呈现清晰的网格状缝隙或明暗突变。
 
-### 场景
+### 根本诱因剖析
 
-4K 图分成 1024 tile 处理，输出图在 tile 边界有明显**接缝**，像方形拼图。
+卷积神经网络与局部注意力机制在图像边界处的感受野被硬性截断。不同 Tile 在边界处由于 Padding 策略以及邻域上下文信息的缺失，导致边界像素的特征响应与中心区域产生系统性偏差。
 
-### 原因
+### 工程防御方案
 
-不同 tile 独立推理：
+1. **滑窗重叠与余弦窗融合（Overlap & Linear Blending）**：相邻 Tile 保留至少 32-64 像素重叠区，在拼接阶段采用权重渐变加权融合；
+2. **反射填充替代零填充**：对边缘 Tile 采用反射填充，避免边界特征突变；
+3. **扩散先验共享噪声场**：针对扩散超分模型，全局预先生成大尺寸高斯噪声场并按坐标切片，确保隐空间采样的全局连续性。
 
-- 边界附近的像素**只看到 tile 内的上下文**
-- 邻 tile 的边界**看到不同的上下文**
-- 输出在边界处不连续
+## 17.8 失败模式 7：极端异常输入诱发数值发散
 
-### 应对
+### 现象场景
 
-1. **Overlap + blend**（第 15.9 节）：必须做，不是可选
-2. **更大 overlap**：256 像素 overlap 比 64 像素效果好（但慢）
-3. **Mirror padding 边缘**：图像边缘 tile 用反射 padding 而不是常数 padding
-4. **Shared noise（扩散）**：所有 tile 用同一个 noise seed，结构连续性
+用户上传全黑背景、高曝全白图或纯高斯噪点图，增强模型输出出现色彩斑斓的几何条纹、数值 NaN 或完全失真的抽象斑块。
 
-## 17.8 失败模式 7：极端输入崩溃
+### 根本诱因剖析
 
-### 场景
+极端输入破坏了网络内部归一化层与统计假设的数值稳定性：
+- 全平坦图像输入导致局部方差趋于 0，在特定归一化计算中引发除零异常或数值溢出；
+- 纯高斯噪声输入的高频能量谱与真实退化图像完全不同，网络将其误识别为极高密度的自然纹理并实施激进放大。
 
-用户上传一张**纯黑** / **纯白** / **纯随机噪声**图。增强模型输出的是各种艺术抽象。
+### 工程防御方案
 
-### 原因
-
-模型训练时没见过极端 OOD 输入：
-
-- 纯黑：所有激活接近 0，归一化层 div by 0
-- 纯白：饱和，激活异常
-- 噪声：高频分量主导，模型当作"细节"放大
-
-### 应对
-
-1. **输入校验**：极端输入直接 bypass 模型
+1. **前置数值健康度校验（Sanity Check Gate）**：统计输入张量的均值、方差与高频能量比，异常样本直接触发旁路直通（Bypass）；
+2. **数据增强注入极端分布**：在训练批次中按一定比例混入纯黑、纯白与全噪退化对。
 
 ```python
-def safe_inference(model, image):
-    # 输入特征检查
-    mean = image.mean()
-    std = image.std()
+def safe_inference_gate(model: nn.Module, image: torch.Tensor) -> torch.Tensor:
+    """具备数值健康度初筛的安全推理入口。"""
+    mean_val = float(image.mean())
+    std_val = float(image.std())
     
-    if std < 1e-3:                  # 几乎平坦
-        return image                # 直接返回, 不增强
+    # 判定是否为几乎无信息的平坦区域
+    if std_val < 1e-4:
+        return image  # 旁路直通原图
     
-    if mean < 0.02 or mean > 0.98:  # 极端亮暗
-        return image                # 跳过增强
+    # 判定是否处于极端过曝或死黑边界
+    if mean_val < 0.01 or mean_val > 0.99:
+        return image
     
-    # 检查噪声占比
-    high_freq_ratio = compute_high_freq_ratio(image)
-    if high_freq_ratio > 0.7:        # 噪声主导
-        # 走"先去噪再增强"分支
-        return enhance_after_denoise(image)
-    
-    # 正常路径
+    # 正常分发至推理主链路
     return model(image)
 ```
 
-2. **训练数据补全**：合成时加入极端样本（pure black、pure white、Gaussian noise）
+## 17.9 失败模式 8：全局色调漂移与偏色（Color Shift）
 
-## 17.9 失败模式 8：色调漂移 / 偏色
+### 现象场景
 
-### 场景
+原图具有强烈的艺术色调（如暖黄日落、暗调青橙氛围），经过超分辨率增强后色温显著变冷，导致原始艺术意境被抹除。
 
-用户拍的暖色调（夕阳）照片，经过增强后**色调变冷**，失去夕阳氛围。
+### 根本诱因剖析
 
-### 原因
+训练集中的高质量真实图像多来源于标准日光下曝光准确的自然图库（以 D65 标准白平衡为主）。网络在优化重构损失的过程中，隐式学习到了将输入色彩分布拉拢至训练集先验均值的倾向，将特化色调误判为光照偏差予以“纠正”。
 
-模型训练数据偏向"标准白平衡"图：
+### 工程防御方案
 
-- 训练 HR 经过"美化白平衡"
-- 模型把所有输入往这个方向拉
-- 暖色调被当作"色温偏差"修正掉
-
-### 应对
-
-1. **颜色一致性损失**（第 3 章 3.8 节）：训练时用
-2. **后处理：颜色匹配**
+1. **色彩解耦空间校准**：将增强输出与原图转换至 Lab 色彩空间，保留增强图的明度通道（L 通道），对颜色通道（a、b 通道）实施基于原图低频统计特性的仿射直方图匹配；
+2. **色彩一致性正则约束**：训练阶段在损失函数中增加大核高斯模糊后的色彩一致性约束。
 
 ```python
-def color_match(enhanced: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
-    """把 enhanced 的色调匹配到 original。
-    保留 enhanced 的细节, 借用 original 的颜色统计。
-    """
-    # 转 Lab 颜色空间
+def color_match_lab(enhanced: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
+    """在 Lab 空间将增强图像的颜色统计严格对齐至原始输入。"""
     enhanced_lab = rgb_to_lab(enhanced)
     original_lab = rgb_to_lab(original)
     
-    # L 通道用 enhanced (细节)
-    l = enhanced_lab[:, 0:1]
-    # a, b 通道做大幅模糊后用 original (颜色)
-    enhanced_ab_blur = F.avg_pool2d(enhanced_lab[:, 1:], 21, stride=1, padding=10)
-    original_ab_blur = F.avg_pool2d(original_lab[:, 1:], 21, stride=1, padding=10)
+    # L 通道完全继承增强后的高频纹理与对比度
+    l_channel = enhanced_lab[:, 0:1]
     
-    # 颜色"shift"
-    color_diff = original_ab_blur - enhanced_ab_blur
-    matched_ab = enhanced_lab[:, 1:] + color_diff
+    # 对 a、b 色彩通道施加大核平滑以提取全局色调
+    kernel_size = 21
+    pad = kernel_size // 2
+    enh_ab_blur = F.avg_pool2d(enhanced_lab[:, 1:], kernel_size, stride=1, padding=pad)
+    orig_ab_blur = F.avg_pool2d(original_lab[:, 1:], kernel_size, stride=1, padding=pad)
     
-    matched_lab = torch.cat([l, matched_ab], dim=1)
-    return lab_to_rgb(matched_lab)
+    # 求解局部色彩偏移并执行残差补偿
+    color_offset = orig_ab_blur - enh_ab_blur
+    calibrated_ab = enhanced_lab[:, 1:] + color_offset
+    
+    merged_lab = torch.cat([l_channel, calibrated_ab], dim=1)
+    return lab_to_rgb(merged_lab)
 ```
 
-3. **训练数据多样性**：覆盖各种白平衡
+## 17.10 失败模式 9：字符拓扑变形与 OCR 可读性下降
 
-## 17.10 失败模式 9：文字 / OCR 损坏
+### 现象场景
 
-### 场景
+在处理包含文字、车牌或截图的图像时，原本模糊但可勉强辨认的字符在超分后笔画被平滑磨灭，甚至发生形似字错误（如将“日”重构成“目”）。
 
-文档图增强后，原本能识别的字变成无法识别：比如"日"修复成"目"，或者笔画被磨平。
+### 根本诱因剖析
 
-### 原因
+通用超分主干建立在自然连续流形先验之上，对高阶平滑度具有强偏置；而文字是具有离散拓扑连通性的符号系统，平滑先验会直接破坏字符笔画的开闭环拓扑结构。
 
-第 10.7 节讲过：通用 SR 学到的是"自然图像先验"，与文字结构相反。
+### 工程防御方案
 
-### 应对
-
-1. **文字检测前置**：检测到文字区域用专用模型
-2. **OCR 引导损失训练专用模型**
-3. **保守策略**：文字区域只做最低限度增强（去模糊，不 SR）
+1. **文本区域检测与特化路由**：通过 DBNet/EAST 检测文字行，文字区域路由至专用的 DocSR 模型；
+2. **引入 OCR 语义感知损失**：在训练阶段将预训练识别网络的中间激活层相似度作为监督信号；
+3. **保守平滑策略**：对于小于 10 像素的超小字符，仅执行局部去锐化与对比度拉伸，禁止大倍率生成式超分。
 
 ```python
-def hybrid_enhance(image, text_detector, sr_model, doc_sr_model):
+def hybrid_text_aware_enhance(image: torch.Tensor, text_detector: nn.Module, 
+                               general_sr: nn.Module, doc_sr: nn.Module) -> torch.Tensor:
+    """文字与自然背景解耦增强的分流处理流水线。"""
     text_boxes = text_detector(image)
     
     if len(text_boxes) == 0:
-        # 纯图像 -> 通用 SR
-        return sr_model(image)
+        return general_sr(image)
     
-    # 有文字 -> 分区域处理
-    background = sr_model(image)
+    # 背景全局走通用超分辨率分支
+    enhanced_canvas = general_sr(image)
     
+    # 文字区域逐一裁剪后走文档超分分支并无缝贴回
     for box in text_boxes:
-        text_crop = crop(image, box)
-        enhanced_text = doc_sr_model(text_crop)
-        background = paste(background, enhanced_text, box)
+        crop_patch = crop_box(image, box)
+        enhanced_patch = doc_sr(crop_patch)
+        enhanced_canvas = paste_patch(enhanced_canvas, enhanced_patch, box)
     
-    return background
+    return enhanced_canvas
 ```
 
-## 17.11 失败模式 10：训练数据偏差
+## 17.11 失败模式 10：训练数据集人口统计偏置
 
-### 场景
+### 现象场景
 
-模型在白人/年轻人脸上效果好，在亚洲老年人/儿童脸上效果差，增强后人脸不像本人。
+人像增强模型在年轻人群与浅肤色样本上表现优秀，但在老年人（皱纹与老年斑被过度磨平）、儿童（面部比例被拉伸为成人特征）及特定深肤色族裔上出现明显的面部变形或假面感。
 
-### 原因
+### 根本诱因剖析
 
-FFHQ 数据集：
+主流预训练数据集（如 FFHQ、CelebA-HQ）在采集源头上存在显著的人口统计学偏置（欧美青年占比畸高）。神经网络在缺乏均衡样本监督的情况下，收敛至主流分布的几何与纹理均值点。
 
-- 70K 张人脸，主要来源 Flickr
-- 年龄分布偏年轻（20-40）
-- 种族分布偏白人
-- 性别分布相对均衡
+### 工程防御方案
 
-模型学到的是这个分布的"平均脸"。在分布外的人脸（老人、儿童、特定族裔）上表现差。
+1. **多源均衡数据集重构**：主动引入跨种族、全年龄段的高清人脸库进行联合微调；
+2. **细分人群指标评测隔离**：在评估体系中禁止仅汇报全集单一平均分数，必须按年龄、性别与肤色等级分别输出 PSNR、LPIPS 与 ArcFace 相似度；
+3. **自适应先验衰减**：针对检测为非主流先验分布的输入，主动降低代码本（Codebook）权重的强制先验约束。
 
-### 应对
+## 17.12 失败模式 11：视频场景镜头切镜时序崩坏
 
-1. **数据集多样性**：补充 IMDB-Face、Asian Face、African Face 等
-2. **公平性测试**：不同人群的指标分别报
-3. **失败案例集**：明确标注偏差场景，定期评估
+### 现象场景
 
-### 这不是"算法问题"，是**数据问题 + 工程纪律问题**
+在处理包含剪辑转场的视频流时，镜头切换后的首帧画面出现前一场景的半透明重影与严重的块状撕裂。
 
-很多 AI 公平性问题的根源都在数据。**评估时按人群分组**，是工程上的最低纪律。
+### 根本诱因剖析
 
-## 17.12 失败模式 11：视频场景切换
+时序循环网络（如 BasicVSR++ 或因果流式模型）依赖内部隐状态（Hidden State）传递历史特征。镜头发生瞬时空间切镜时，历史隐状态与当前帧内容完全正交，错误的空间特征注入引发特征图剧烈失真。
 
-### 场景
+### 工程防御方案
 
-视频在两个场景之间切换（剪辑），第二个场景的第一帧增强后**严重崩坏**，比之后的稳定状态差很多。
-
-### 原因
-
-循环模型（BasicVSR++）依赖隐状态：
-
-- 隐状态从前一帧传过来
-- 场景切换后，前一帧的隐状态对应**完全不同的视觉**
-- 第一帧的增强用了"错的"上下文
-
-### 应对
-
-1. **场景切换检测 + 隐状态重置**（第 16.5 节末尾的代码）
-2. **训练数据加场景切换**：合成时引入随机切换，让模型学会处理
+1. **切镜检测与隐状态瞬时清零**：计算连续帧特征差分，一旦超过切镜阈值立即重置模型内部循环张量；
+2. **切镜鲁棒性数据合成**：在视频训练片段中主动注入随机拼接转场样本。
 
 ```python
-class SceneAwareVideoModel(nn.Module):
-    def __init__(self, base_model):
+class SceneAwareStreamingModel(nn.Module):
+    """具备切镜感知与隐状态自适应重置的视频处理模块。"""
+
+    def __init__(self, recurrent_backbone: nn.Module, threshold: float = 0.35):
         super().__init__()
-        self.base_model = base_model
-        self.scene_threshold = 0.3
+        self.backbone = recurrent_backbone
+        self.threshold = threshold
 
-    def forward(self, frame, hidden_state, prev_frame=None):
+    def forward(self, curr_frame: torch.Tensor, prev_frame: torch.Tensor, 
+                hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if prev_frame is not None:
-            diff = (frame - prev_frame).abs().mean()
-            if diff > self.scene_threshold:
-                hidden_state = self.base_model.init_hidden(frame.shape)
-        out, new_hidden = self.base_model(frame, hidden_state)
-        return out, new_hidden
+            # 计算帧间均方根亮度差分判定转场
+            frame_diff = (curr_frame - prev_frame).abs().mean()
+            if frame_diff > self.threshold:
+                hidden_state = self.backbone.init_hidden(curr_frame.shape)  # 状态重置
+        
+        output_frame, next_hidden = self.backbone(curr_frame, hidden_state)
+        return output_frame, next_hidden
 ```
 
-## 17.13 失败模式 12：长序列累积误差
+## 17.13 失败模式 12：长序列隐状态漂移与误差累积
 
-### 场景
+### 现象场景
 
-视频处理几分钟后，增强质量**逐渐下降**，开头很好，结尾模糊。
+流式处理长达数十分钟的超长视频流时，视频开头的增强画质清晰锐利，但随着时间推移，画面逐渐模糊、色彩饱和度饱和度漂移，甚至在数千帧后出现数值发散。
 
-### 原因
+### 根本诱因剖析
 
-循环模型的隐状态不断累积：
+单向因果循环网络在长序列前向传播中，算子量化截断与残差累加误差形成正反馈回路。若系统缺乏耗散项或周期性锚定机制，隐状态流形将逐步脱离真实图像流形。
 
-- 每一帧的微小误差被传到下一帧
-- 长时间后误差累积到显著程度
-- 甚至发散
+### 工程防御方案
 
-### 应对
+1. **周期性 GOP 关键帧对齐重置**：强制与视频编码的 I 帧（GOP 边界，通常每 60-120 帧）同步重置隐状态，截断误差传播链；
+2. **引入自衰减遗忘门控（Decay Gating）**：在循环单元内部对历史状态施加模长衰减正则项；
+3. **双轨健康度监控**：实时监测隐状态张量的 $L_2$ 范数，超出健康阈值时触发异步重初始化。
 
-1. **定期重置隐状态**：每 N 帧（比如 60 帧）重置一次
-2. **双向 RNN（BasicVSR++）+ 端到端训练长序列**
-3. **检测异常并 fallback**：监控输出统计，异常时切换到单帧模型
+## 17.14 失败模式 13：非预期强化水印与台标伪影
 
-## 17.14 失败模式 13：放大 watermark / logo
+### 现象场景
 
-### 场景
+用户上传带有半透明半透明文字水印、电视台标或压缩噪点的图片，增强模型将半透明台标边缘误作为重点前景结构，重构出极高对比度的锐化硬边缘。
 
-用户上传带水印的图，增强后水印**变得更清晰、更显眼**。
+### 根本诱因剖析
 
-### 原因
+通用超分辨率网络将所有高对比度边缘视为高频结构予以提升。在缺乏语义解耦机制时，网络无法区分“承载内容的自然纹理”与“后期叠加的合成图层”。
 
-模型把水印当作"图像内容"，平等对待，平等增强。
+### 工程防御方案
 
-### 应对
+1. **水印区域检测前置**：利用轻量语义分割模型标定台标与文字水印位置；
+2. **局部掩码平滑或直通**：对标定的水印区域执行保真度降权或旁路直通处理；
+3. **合成数据增强**：在训练阶段大规模随机叠加密集半透明图层与水印，促使网络学会保持原状。
 
-1. **水印检测前置**：先识别水印位置
-2. **水印区域特殊处理**：可以选择忽略 / 增强 / 删除（但删除有版权风险）
-3. **训练数据**：训练时加 watermark 增广，让模型学到"watermark 就保持 watermark 不要锐化"
+## 17.15 失败模式 14：人体肢体拓扑畸变与微结构错乱
 
-## 17.15 失败模式 14：人物姿势改变与手指/毛发错乱
+### 现象场景
 
-### 场景
+在人像全景或大幅度动作图像中，生成式扩散超分导致手部手指数量增减、关节逆向折叠、毛发变成黏连的塑料束条、牙齿排列错位或镜框几何不对称。
 
-人物动作图（健身、舞蹈），扩散增强后**手的位置变了**、**手指多了一根**。同一族失败还包括头发被修成纠缠的塑料丝（hair failure，毛发失败）、笑容里的牙齿数量错误（teeth failure）、戴眼镜的人镜框被修成不对称、衣服褶皱与原图不对应。
+### 根本诱因剖析
 
-### 原因
+人体四肢与面部精细器官属于高度受约束的复杂运动学与解剖学流形。扩散生成模型在低维潜空间（Latent Space）采样时缺乏骨骼刚体拓扑先验与高精度亚像素几何约束，在多步去噪积分中容易跌入非物理局部极小点。
 
-扩散模型在结构理解上的著名弱点：
+### 工程防御方案
 
-- 训练数据里手的多样性远小于其他物体
-- 手的"细节"对模型来说不是"恢复"，是"生成"
-- 生成时容易违反结构（多/少手指、错位）
+1. **多模态几何先验注入（ControlNet Conditioning）**：引入 OpenPose 或 DWPose 骨骼关键点作为强引导条件；
+2. **解剖学敏感区域判别式替代**：检测手部与精细五官 ROI，高风险区域回退至确定性判别式超分；
+3. **局部先验引导降权**：降低肢体区域无分类器引导尺度（CFG Scale），严控自由度。
 
-毛发的失败有相同的根：每根头发是亚像素级的细线，LR 下采样后完全消失，模型在 HR 上"补"的时候没有几何约束告诉它"这根从哪里长出来、到哪里去"。SDXL 训练数据里头发的"统计平均"是大致顺滑的发束，缺少单根追踪的归纳偏置，所以采样出的细节看起来像 CG 而不是真实毛发。牙齿与镜框失败也是同理 - 它们都是低维流形上的精细结构，对位置和形状错误高度敏感。
+## 17.16 失败模式 15：批次尺寸（Batch Size）非确定性波动
 
-### 应对
+### 现象场景
 
-1. **避免用扩散做严重退化的手部增强**
-2. **如果必须用扩散，加 ControlNet 注入 pose**（手部 keypoints / OpenPose 骨架作为额外条件）
-3. **后处理：手部检测 + 用判别式模型替换**
-4. **毛发 / 牙齿区域降权**：训练时用 mask 给损失加权，推理时对这些区域降低 CFG 强度
-5. **多步扩散保留细化机会**：单步扩散在结构上比多步差，关键 ROI（Region of Interest，感兴趣区域）可以保留 4-8 步重采样
+模型在 `batch_size=1` 单元测试时输出与基准完全吻合，但在生产环境以动态 `batch_size=8` 并发处理时，输出像素出现轻微数值抖动，导致连续视频帧出现微小但肉眼可察觉的跳变。
 
-## 17.16 失败模式 15：批次尺寸推理差异
+### 根本诱因剖析
 
-### 场景
+底层 CUDA Kernel 与 cuDNN 算子在不同 Batch Size 下会选择不同的并行归约（Reduction）与分块调度策略。由于浮点数加法不满足结合律（$(a+b)+c \neq a+(b+c)$），累加顺序的变化引入了微弱的数值非确定性。
 
-模型在 `batch_size=1` 推理时正常，在 `batch_size=8` 推理时**输出有微小差异**，长视频累积后产生明显闪烁。
+### 工程防御方案
 
-### 原因
-
-CUDA 核 / cuDNN 的非确定性：
-
-- 不同 batch size 走不同的 kernel 路径
-- 某些操作（reduction）的顺序与 batch 大小相关
-- 浮点运算非结合性导致结果略不同
-
-### 应对
-
-1. **推理时固定 batch size**：生产推理 batch size 选定后不要随业务负载抖动；与训练 batch size 是否相同**不是关键**，关键是在生产里**保持稳定**
-2. **设置 cuDNN deterministic**：
+1. **固定生产推理 Batch 规格**：在流式微批处理服务中严格固定推理 Batch 尺寸，规避动态 Kernel 切换；
+2. **启用确定性算子标志位**：
 
 ```python
+import torch
+
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 ```
 
-代价：速度略降，但结果可复现。
+3. **后置时序平滑兜底**：在输出端配置统一的轻量级时序滤波链路。
 
-3. **在生产 pipeline 末端做后处理时序滤波**，掩盖微小不一致
+## 17.17 工业系统高可用决策流水线
 
-## 17.17 一个统一的应对哲学
-
-15 类失败模式归纳出一些通用原则：
-
-### 原则 1：边界处理 > 平均优化
-
-模型在 95% 场景上的指标涨 0.1 dB 不重要。在 5% 场景上从崩坏到能用更重要。
-
-### 原则 2：检测 + 路由
-
-不要试图让一个模型处理所有输入。前置一个分类器/检测器，把不同输入路由到不同处理路径。
-
-### 原则 3：失败时优雅退化
-
-模型崩坏时不能输出垃圾，要 fallback 到保守方法（bicubic、原图）。**永远有"保底"路径**。
-
-### 原则 4：训练数据是失败的根源
-
-绝大多数失败模式追溯回去都是**训练数据没 cover 那个分布**。补数据 > 调模型。
-
-### 原则 5：用户 UI 设计帮助管理失败
-
-- 给用户调节参数（fidelity）
-- 失败时给警告而不是默默输出
-- 设计 retry / undo 机制
-
-### 把五条原则画成一条决策流
-
-把上面五条原则组合成一个推理时的决策流，能直接对照实现成代码。流程的关键是"在调用大模型之前先做检测、调用之后先做验证、整条路径必须有保底"：
+将 15 类失效模式的防御策略整合为一套标准前向拦截拓扑图：
 
 ```mermaid
 graph TD
@@ -657,63 +535,61 @@ graph TD
     style RET fill:#fff3e0
 ```
 
-这张图的几个工程要点：
+### 五项通用防御铁律
 
-1. **Sanity check 在最前**：极端输入（纯黑 / 纯白 / 纯噪声）不进入模型，避免归一化层 div by 0。
-2. **退化分类器是路由器**：一个轻量分类网络（MobileNet 级别即可）足够把输入分到几条主路径。
-3. **后置验证不是可选**：人脸用 ArcFace，通用用 NR-IQA（MANIQA / CLIP-IQA / Q-Align）。验证失败不要硬输出。
-4. **失败案例日志**：每一次回退保底都要落盘，作为下一轮训练数据补全的素材。这是从生产反推训练的反馈回路。
-5. **整条路径不能有"无保底分支"**：每一条从 $y$ 到输出的路径都要能在最坏情况下退化到"原图或 bicubic"，绝不能把"模型崩坏的乱码图"递出去。
+1. **前置健康检查优先**：在张量送入重型网络前，完成纯色、过曝、纯噪与极端长宽比的物理初筛；
+2. **语义与退化解耦路由**：避免单一网络兼顾全部模态，依据语义检测动态分发至人脸、文字、视频或通用通道；
+3. **后置闭环特征校验**：关键场景（人脸、司法取证、医学）必须施加基于特征距离或 IQA 指标的输出复核；
+4. **必须预置保底降级路径**：任何子分支在遇到验证失败或数值异常时，均具备回退至原图或保守插值的机制；
+5. **异常样本自动捕获归档**：线上每一次触发 Fallback 的样本均需落盘入库，驱动训练退化管线的持续进化。
 
-## 17.18 失败案例集的工程化
+## 17.18 失败案例集的工程化与 CI/CD 集成
 
-把这一章的内容工程化为可执行的测试集：
+将失效模式防御体系固化为自动化回归评测套件，纳入版本交付的强制门禁：
 
 ```python
-class FailureCaseSuite:
-    """失败案例 regression 测试。"""
+class FailureRegressionSuite:
+    """生产级影像增强算法防御能力自动化回归测试套件。"""
 
     def __init__(self):
-        self.cases = [
-            # (name, input_loader, expected_property)
-            ('extreme_lr_face',  load_extreme_lr_face,  self.identity_preserved),
-            ('oversharpened',    load_oversharp_image,  self.no_amplified_noise),
-            ('pure_black',       load_pure_black,        self.no_artifacts),
-            ('text_document',    load_text_doc,          self.ocr_consistent),
-            ('non_white_face',   load_non_white_face,    self.identity_preserved),
-            # ... 几十个 case
+        self.test_cases = [
+            ('extreme_lr_face',  load_extreme_face_sample,  self.verify_identity_cosine),
+            ('oversharpened',    load_oversharp_sample,     self.verify_high_freq_bound),
+            ('pure_black_input', load_pure_black_sample,    self.verify_zero_divergence),
+            ('ocr_document',     load_document_sample,      self.verify_ocr_consistency),
+            ('tile_continuity',  load_large_4k_sample,      self.verify_no_seam_lines),
         ]
 
-    def identity_preserved(self, input_face, output_face):
-        sim = arcface_similarity(input_face, output_face)
-        return sim > 0.4
+    def verify_identity_cosine(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        sim = float(arcface_similarity(inp, out))
+        return sim >= 0.40  # 确保人脸关键特征未漂移
 
-    def no_amplified_noise(self, input_img, output_img):
-        return high_freq_energy(output_img) < 1.5 * high_freq_energy(input_img)
+    def verify_high_freq_bound(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        in_energy = float(compute_high_freq_energy(inp))
+        out_energy = float(compute_high_freq_energy(out))
+        return out_energy <= 1.5 * in_energy  # 杜绝高频振铃放大
 
-    def ocr_consistent(self, input_doc, output_doc):
-        return ocr(input_doc) == ocr(output_doc)
+    def verify_zero_divergence(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        return float(out.std()) < 0.01  # 全黑输入必须稳定输出纯色
 
-    def no_artifacts(self, input_img, output_img):
-        return output_img.std() < 0.05  # 纯黑输入应该输出几乎纯黑
+    def verify_ocr_consistency(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        return run_ocr_text_match(inp, out) >= 0.95  # 字符拓扑完整度
 
-    def run(self, model):
-        results = {}
-        for name, loader, check in self.cases:
-            input_img = loader()
-            output = model(input_img)
-            results[name] = {
-                'pass': check(input_img, output),
-                'output': output,
-            }
-        return results
+    def verify_no_seam_lines(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
+        return compute_tile_gradient_discontinuity(out) < 0.05
+
+    def run_suite(self, model: nn.Module) -> dict:
+        summary = {}
+        for name, loader, evaluator in self.test_cases:
+            sample_tensor = loader()
+            with torch.no_grad():
+                output_tensor = model(sample_tensor)
+            passed = evaluator(sample_tensor, output_tensor)
+            summary[name] = {'passed': passed}
+        return summary
 ```
 
-每个新模型版本必须跑这套测试。**单纯 PSNR 涨了不算 ship-ready** - 所有失败案例都通过才行。
-
-## 17.18.1 失败-修复反馈回路
-
-把失败案例集放进 CI 只解决"已知失败模式不会回归"的问题。真正长期降低失败率的机制是把生产环境暴露的新失败模式反推回训练。这是一条闭环：
+## 17.18.1 生产到研发的闭环质量迭代链路
 
 ```mermaid
 graph LR
@@ -736,45 +612,23 @@ graph LR
     style DEV fill:#ffebee
 ```
 
-这条回路的几个关键工程点：
+工业闭环的核心支撑点：
+1. **线上自动化弱质量采样**：通过 NR-IQA（MANIQA / Q-Align）前置过滤出预警样本；
+2. **多模态大模型智能归因**：利用多模态视觉模型初筛失效类型并归类至对应家族；
+3. **退化合成逆向扩充**：将捕获的 Bad Case 提炼为数据生成参数，实现模型免疫力主动升级。
 
-1. **线上低分样本必须自动采样**：靠用户投诉收集失败案例覆盖率太低（投诉率通常 < 0.1%），只有靠 NR-IQA 监控（MANIQA / CLIP-IQA / Q-Align）才能拿到足够多的样本。
-2. **复审环节是瓶颈**：早期可以人工，规模上去后用 LLM（GPT-4V / Claude / Gemini）做"这张失败属于哪一族"的分类，再人工抽查。
-3. **退化合成扩展是真正的杠杆**：把新失败模式 cover 进训练 pipeline，远比改网络结构有效。这与第 1.7 节、第 5 章一脉相承。
-4. **整条回路的周期决定团队的"反应速度"**：理想是 2-4 周一轮（采样 → 复审 → 扩 pipeline → 重训 → CI → 上线），慢于 8 周就基本只能被动应付客户。
+## 17.19 本章小结
 
-## 17.19 小结
-
-15 类常见失败模式：
-
-1. **扩散编造**：fidelity 调节 + 身份验证
-2. **放大对抗噪声**：检测分类 + 分支处理
-3. **身份漂移**：身份损失加权 + 引导参考
-4. **视频闪烁**：时序模型 + 时序后滤波
-5. **量化崩溃**：混合精度 + QAT
-6. **Tile 接缝**：overlap + blend + shared noise
-7. **极端输入崩溃**：输入校验 + bypass
-8. **色调漂移**：颜色一致性损失 + 颜色匹配
-9. **文字损坏**：检测路由 + 专用模型
-10. **训练数据偏差**：多样性 + 公平性测试
-11. **场景切换**：切换检测 + 隐状态重置
-12. **长序列累积误差**：定期重置 + 双向 RNN
-13. **放大水印**：检测 + 特殊处理
-14. **姿势/手部错乱**：避免扩散用于此 / ControlNet pose
-15. **batch size 不一致**：固定 batch + cuDNN 确定性
-
-通用应对哲学：
-
-- 边界处理 > 平均优化
-- 检测 + 路由分流
-- 失败时优雅退化
-- 训练数据是根源
-- UI 帮助管理失败
-
-这一章值得反复回看，你做的每个增强模型都会在这些失败模式里至少命中一半。**提前知道、提前应对、提前测试**比上线后补救便宜得多。
-
-最后一章，我们看 2026 年最值得关注的几个 SOTA 模型，作为这本书的"快速参考"。
+1. **失败防御是工业落地的生命线**：平均指标决定上限，极端失效防御决定系统下限；
+2. **三大失效根因族**：生成先验过度幻觉、训练与推理退化流形失配、复杂工程流水线系统集成缺陷；
+3. **核心防御手段**：
+   - 生成幻觉：暴露保真度参数，引入 ArcFace 特征校验与确定性回退；
+   - 对抗放大：前置退化分类路由，强化合成数据扰动覆盖；
+   - 视频时序：因果循环架构、光流指数平滑与切镜瞬时重置；
+   - 硬件量化：首末层敏感算子混合精度保护与 QAT 训练；
+   - 分块接缝：重叠窗加权融合与共享噪声场；
+4. **系统工程铁律**：前置初筛、解耦分流、特征复核、全链路保底与闭环持续进化。
 
 ---
 
-> 下一章 [SOTA 模型](18-sota.md) → 2026 年值得用的学术 SOTA 模型、新前沿主线与选型决策树。
+> 下一章 [SOTA 模型前沿](18-sota.md) → 系统评析 2026 年最具代表性的前沿架构（MambaIR、DiT 超分、单步扩散及统一全能复原）与选型决策树。

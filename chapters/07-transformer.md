@@ -1,73 +1,65 @@
 # 第 7 章 · Transformer 在低层视觉
 
-> CNN 的感受野是局部的，它通过堆深度间接获得大感受野。
+> 传统卷积的感受野受局部邻域约束，依赖深层堆叠间接扩大感受野。
 >
-> Transformer 的 self-attention 是全局的，但代价是 $O(N^2)$ 计算。
+> 自注意力机制（Self-Attention）天然具备全局上下文建模能力，但朴素实现的计算复杂度高达 $O(N^2)$。
 >
-> 低层视觉里 Transformer 怎么落地，是过去三年这个领域最有趣的工程故事之一。
+> 如何在低层视觉中兼顾长距离依赖与可控计算复杂度，是视觉 Transformer 工程落地的核心课题。
 
 ## 7.0 阅读须知
 
-本章是 Part II 第二站，承接第 6 章 CNN 时代，把 self-attention 引入低层视觉之后这四五年的设计演进梳理一遍。读完之后，你应当能：
+本章作为 Part II 的第二篇，承接第 6 章的 CNN 演进脉络，系统剖析自注意力机制引入低层视觉任务后的关键架构创新与工程权衡。完成本章阅读后，读者应当能够：
 
-- 理解为什么"长距离依赖"对低层视觉是真正有用的，而不是 Transformer 派的话术
-- 看懂 window attention（W-MSA / SW-MSA）和 transposed channel attention（MDTA）两条主流路线的取舍
-- 给一个新任务选 backbone 时，能在 CNN、SwinIR、Restormer、HAT、混合架构之间做出有依据的判断
-- 读懂 SwinIR / Restormer 的简化代码，知道每一行在解决什么
+- 从非局部先验与自相似性机理出发，严谨论证长距离依赖在图像恢复中的实际工程价值；
+- 深入掌握基于空间局部窗口（W-MSA / SW-MSA）与基于转置通道维度（MDTA）两条主流低复杂度路线的底层数学逻辑与权衡边界；
+- 针对具体任务场景（算力预算、输入分辨率、实时性要求），在 CNN、SwinIR、Restormer、HAT 及混合架构之间做出有依据的技术选型；
+- 熟练阅读并实现 SwinIR 与 Restormer 的核心算子代码，明确各模块的计算开销与数据流走向。
 
-本章预设你已经掌握：
+阅读前提：
 
-- 第 6 章 CNN 时代的演进（特别是残差块、PixelShuffle、channel attention 这几个概念）
-- 普通 self-attention 的形式 $\text{softmax}(QK^T / \sqrt{d}) V$ 和它的 $O(N^2)$ 复杂度
-- LayerNorm 与 BatchNorm 的差异（第 6 章 §6.9 已展开）
+- 第 6 章：CNN 架构演进（残差块、PixelShuffle 亚像素卷积、通道注意力机制）；
+- 标准自注意力计算形式 $\text{softmax}(QK^T / \sqrt{d}) V$ 及其 $O(N^2)$ 空间与计算复杂度；
+- 归一化层特性对比（LayerNorm 在像素级回归任务中的稳定性机理）。
 
-不预设你读过 ViT/Swin/SwinIR/Restormer/HAT 的原始论文，也不预设你写过 attention 的 CUDA 实现。
+**核心术语与缩写索引：**
 
-**本章首次出现或将反复出现的缩写。** 集中先列一遍，后面用到时还会再展开一句话定义：
+- **ViT**（Vision Transformer）：Dosovitskiy 等人于 2020 年提出，将图像划分为 16×16 的 Patch 作为序列 Token 输入标准 Transformer，奠定了视觉 Transformer 的基础范式。
+- **MSA**（Multi-head Self-Attention，多头自注意力）：标准 Transformer 的核心注意力算子，通过多个头在不同投影子空间并行捕获相关性。
+- **W-MSA**（Window-based Multi-head Self-Attention）：将特征划分为 $M \times M$ 不重叠局部窗口并在窗口内独立计算注意力，将计算复杂度由 $O((HW)^2)$ 降至 $O(HW \cdot M^2)$。
+- **SW-MSA**（Shifted Window MSA）：W-MSA 的协同算子，在连续层间将窗口划分偏移 $M/2$，使跨窗口边界的信息得以逐层交互流动。
+- **Swin Transformer**：Liu 等人于 2021 年提出的分层视觉 Transformer，通过交替堆叠 W-MSA 与 SW-MSA 实现兼具局部性与跨窗口通信的高效表征。
+- **SwinIR**（Swin Transformer for Image Restoration）：Liang 等人于 2021 年将 Swin 架构引入低层视觉，构建了覆盖超分、去噪与去模糊的统一恢复模型。
+- **RSTB**（Residual Swin Transformer Block）：SwinIR 的核心残差单元，由若干 Swin Transformer 层与末端卷积加残差直连构成。
+- **STL**（Swin Transformer Layer）：RSTB 内部的基础层，包含一次 W-MSA 或 SW-MSA 以及一次 MLP 变换。
+- **Restormer**（Restoration Transformer）：Zamir 等人于 2022 年提出，基于转置通道自注意力（MDTA）与门控前馈网络（GDFN），构建了通用图像恢复的高效架构。
+- **MDTA**（Multi-Dconv Head Transposed Attention）：Restormer 的核心注意力算子，将自注意力由 Token 空间维转向 Channel 通道维，计算复杂度优化为 $O(d^2 \cdot HW)$。
+- **GDFN**（Gated-Dconv Feed-Forward Network）：Restormer 的前馈网络模块，结合深度可分离卷积与通道门控机制。
+- **HAT**（Hybrid Attention Transformer）：Chen 等人于 2023 年提出，融合窗口自注意力、通道注意力与重叠跨窗口注意力（OCAB），进一步拓展有效感受野。
+- **HAB**（Hybrid Attention Block）：HAT 的基础模块，将大尺度窗口 W-MSA 与通道注意力块（CAB）并行集成。
+- **OCAB**（Overlapping Cross-Attention Block）：HAT 的增强模块，在相邻重叠窗口间计算 Cross-Attention，强化相邻局域的直接信息交互。
+- **CAB**（Channel Attention Block）：HAT 内部集成的通道注意力组件，用于弥补空间注意力对通道重要性建模的不足。
+- **LAM**（Local Attribution Map）：基于积分梯度的模型特征归因可视化工具，用于量化分析输入像素对输出重建的实际贡献区域。
+- **Self-similarity**（图像自相似性）：自然图像中相似纹理与结构在不同空间位置重复出现的统计学特性，是注意力机制在图像恢复中奏效的物理先验。
+- **Non-local Means**（非局部均值滤波）：经典图像处理中利用全图自相似性进行加权去噪的算法，自注意力机制可视为其高阶可学习推广。
 
-- **ViT**（Vision Transformer）：2020 年 Dosovitskiy et al. 提出，把图像切成 16×16 的 patch 当作 token 喂给标准 Transformer，是 Transformer 在视觉里的奠基工作
-- **MSA**（Multi-head Self-Attention，多头自注意力）：标准 Transformer 的核心算子，多个 attention head 各看一段子空间
-- **W-MSA**（Window-based Multi-head Self-Attention）：只在 $M \times M$ 的局部窗口内做 attention，把复杂度从 $O((HW)^2)$ 降到 $O(HW \cdot M^2)$
-- **SW-MSA**（Shifted Window MSA）：W-MSA 的搭档，每隔一层把窗口偏移 $M/2$，让相邻层的窗口边界错开，使信息跨窗口流动
-- **Swin Transformer**：2021 年 Liu et al. 提出，用 W-MSA / SW-MSA 交替的 hierarchical 视觉 Transformer
-- **SwinIR**（Swin Transformer for Image Restoration）：2021 年 Liang et al. 把 Swin 移到低层视觉，做 SR/去噪/去模糊的统一架构
-- **RSTB**（Residual Swin Transformer Block）：SwinIR 的中间层组件，多个 Swin Transformer Layer 套一层残差
-- **STL**（Swin Transformer Layer）：RSTB 内部的基本单元，由一次 W-MSA 或 SW-MSA + 一次 MLP 组成
-- **Restormer**（Restoration Transformer）：2022 年 Zamir et al. 提出，用通道维 attention（MDTA）+ 门控 FFN（GDFN）做去噪/去模糊/去雨的通用 SOTA
-- **MDTA**（Multi-Dconv Head Transposed Attention）：Restormer 的核心算子，把 self-attention 从 token 维转到 channel 维，复杂度从 $O((HW)^2 d)$ 降到 $O(d^2 \cdot HW)$
-- **GDFN**（Gated-Dconv Feed-Forward Network）：Restormer 的 FFN 模块，加入门控 + depthwise 卷积
-- **HAT**（Hybrid Attention Transformer）：2023 年 Chen et al. 提出，把 W-MSA、Channel Attention、Overlapping Cross-Attention 三种 attention 组合
-- **HAB**（Hybrid Attention Block）：HAT 的基础 block，W-MSA + CAB 并行
-- **OCAB**（Overlapping Cross-Attention Block）：HAT 的扩展 block，在重叠窗口上做 cross-attention，弥补 SW-MSA 的间接性
-- **CAB**（Channel Attention Block）：HAT 内部用的 channel attention 模块，结构上接近 RCAN 的 RCAB
-- **LAM**（Local Attribution Map）：可视化模型实际利用哪些输入像素的工具，HAT 用它分析 SwinIR 的"容量没用满"问题
-- **self-similarity**（自相似性）：自然图像里同一种纹理在多个位置出现的统计现象，是 attention 在低层视觉有用的核心理由
-- **non-local means**：经典图像处理里利用自相似性做去噪的方法，attention 可看作它的可学习版本
+## 7.1 为什么 Transformer 适用于低层视觉
 
-## 7.1 为什么 Transformer 来到低层视觉
+在 CNN 的演进过程中，诸多创新（加深、空洞卷积、密集连接）均在致力于扩展感受野。然而，标准卷积的有效感受野（Effective Receptive Field, ERF）受到卷积核尺寸与深度的物理限制。实证分析表明，深层 ResNet 的实际有效感受野通常仅为理论计算值的约三分之一，且在中心区域呈高斯衰减，对远距离空间上下文的利用效率有限。
 
-CNN 在第 6 章的演进里，每一步都在解决"感受野"问题：加深、加 attention、加 dense connection。但 CNN 的感受野受卷积核大小和深度限制，**理论感受野随深度线性增长，实际有效感受野远小于理论值**。多份研究做过实际感受野的可视化，发现 20 层 ResNet 的实际感受野只有理论值的 1/3 左右，且呈高斯衰减，越远的像素影响越弱。
+在图像恢复与增强任务中，远距离像素信息具有明确的重建价值：
 
-低层视觉的一个反直觉事实：
+- **图像去噪**：图像中相距较远的同质区域（如草坪、平整墙面、天空背景）包含相似的高频纹理；利用远距离干净像素的冗余采样进行加权平均，能够显著压制独立分布的加性噪声；
+- **图像超分辨率**：重复出现的规则几何细节（如建筑窗格、砖墙纹理、印刷字符）在不同空间位置高度相似，能够跨区域迁移先验高频信息；
+- **图像去模糊**：对于全图均匀的空间不变退化核，分散在不同区域的边缘响应能够共同约束逆滤波过程，提升点扩散函数（PSF）的联合估计精度；
+- **去雾与去雨**：整幅图像的大气光强与透射率分布具有全局连续性，远景天空区域的衰减先验能够直接辅助近景地物的颜色与对比度校正。
 
-> 远距离的像素在恢复任务里**有用**。
+这一机理在经典图像处理中对应于**非局部均值（Non-local Means）**先验：图像中的最优参考块往往不仅局限于几何邻域，而是广泛分布于全图的自相似区域。CNN 捕获这种全局自相似性需依赖深层堆叠间接传递，而自注意力机制（Self-Attention）天然支持任意两个空间坐标直接计算关联度，可在单层内直接建模跨区域特征聚合。
 
-举例：
+然而，全局自注意力的计算复杂度为 **$O((HW)^2 \cdot C)$**。对于分辨率为 $256 \times 256$ 的特征图，注意力矩阵包含 $65536 \times 65536 \approx 4.29 \times 10^9$ 个元素；在单精度浮点（FP32）下，仅存储单个 Head 的注意力权重即需消耗约 17.18 GB 显存，对于常规硬件是不可承受的。
 
-- **去噪**：图中某块区域有相似纹理（一片草、一面墙），远处的"干净复制品"能帮助恢复"噪声覆盖处"的细节，因为多个噪声样本平均后噪声方差降低
-- **超分**：图中重复出现的细节（一排窗户、一片瓦、印刷字体里的同一个字母）可以借用其他位置的高频信息
-- **去模糊**：模糊核在整个图上一致时，全图信息能联合估计核，单点的信息不够，需要远距离的边缘共同约束核
-- **去雾 / 去雨**：雾和雨的统计模型在整张图上是全局的，知道远处天空区域的雾浓度能帮助恢复近处建筑的颜色
+因此，低层视觉 Transformer 的核心技术演进，聚焦于**在保留长距离依赖建模能力的同时，将注意力机制的复杂度降至与空间分辨率呈线性关系的工程实现**。
 
-这是经典图像处理里 **non-local means**（非局部均值）的思想：**自相似性**（self-similarity）是自然图像的统计性质，每个像素的最佳邻居不一定是空间上紧邻的像素，而可能是图像另一端"长得像"的像素。CNN 利用这点要靠堆深度，效率低。
-
-Self-attention 天然适合这件事：每个像素直接和所有其他像素交互，自相似性可以**在一层内捕捉**。
-
-但代价是：**$O(H^2 W^2 \cdot C)$ 的计算复杂度**。$256 \times 256$ 图上 attention map 大小是 $65536 \times 65536$，FP32 下需要 17 GB 显存仅存一个 head 的 attention，连显存都装不下。
-
-Transformer 在低层视觉的整个故事，就是**怎么让 self-attention 既保留长距离能力，又能跑得起来**。
-
-为了把"全局 vs 窗口 vs 通道 attention"三种思路的差异立刻立起来，先画一张示意图：同一张 $H \times W$ 的特征图上，从一个像素出发，三种 attention 实际允许它"看到"哪些其他像素。
+下图概括了三种核心注意力计算范式在空间覆盖范围与计算开销上的根本差异：
 
 ```mermaid
 graph TD
@@ -91,47 +83,44 @@ graph TD
     style Channel fill:#e8f5e9
 ```
 
-颜色分组反映"代价 vs 长距离能力"的权衡。红色 Full 是理想但跑不起来。黄色 Window 跑得起来，但每层只能看局部，长距离能力要靠多层累积。绿色 Channel 既能跑也能在每层"看到全图"，代价是 attention 不在像素间算而在通道间算，需要重新理解它在做什么，下面 §7.5 会详细展开。
+- **全局注意力（Full Attention）**：空间感受野全图覆盖，但显存开销随图像尺寸呈四次方增长，工程不可行；
+- **局部窗口注意力（W-MSA）**：在 $M \times M$ 局部网格内约束计算，复杂度随 $HW$ 线性增长，长距离通信依赖层间窗口平移（Shifted Window）；
+- **转置通道注意力（MDTA）**：转置特征维度并在通道间计算关联度，显存与空间分辨率线性相关，天然支持大分辨率输入。
 
-## 7.2 朴素 ViT 的问题
+## 7.2 朴素 ViT 在低层视觉中的瓶颈
 
-直接把 Vision Transformer 用在低层视觉，几个直接的问题。
+直接将高层视觉的 Vision Transformer（ViT）应用于像素级恢复任务存在以下结构性缺陷：
 
-### 计算量爆炸
+### 1. 计算复杂度随分辨率平方级膨胀
 
-ViT 把图分成 $16 \times 16$ 的 patch。$256 \times 256$ 图分成 $16 \times 16 = 256$ 个 patch，attention 是 $256 \times 256$，可接受。$1024 \times 1024$ 图分成 $64 \times 64 = 4096$ 个 patch，attention 是 $4096 \times 4096$ 即 1600 万个元素，**显存爆**。低层视觉的输入分辨率往往比分类大一个数量级（分类是 224×224，去噪/超分常常是 1024×1024 或更大），ViT 的"分类专用预设"根本撑不住。
+ViT 针对分类任务设计，输入图像分辨率通常固定为 $224 \times 224$。而在图像超分辨率、去噪等低层视觉场景中，处理尺寸往往达到 $1024 \times 1024$ 甚至 4K。若采用全局自注意力，计算量与显存占用将直接引发硬件内存溢出（OOM）。
 
-### Patch 粒度太粗
+### 2. Patch 划分破坏高频像素级细节
 
-ViT 的 $16 \times 16$ patch 适合分类（语义级），不适合像素级任务。低层视觉需要**像素级细节**：SR 要恢复每个像素，去噪要保留每个像素的高频成分。把 16×16 像素打包成一个 token，等于在 attention 之前就把高频信息搅在一起，模型再怎么 attention 也找不回这些信息。
+ViT 通常将输入图像切分为 $16 \times 16$ 的 Patch 并线性映射为单个 Token。这种粗粒度划分在语义分类任务中能够有效压缩空间冗余，但在低层视觉中，将 256 个像素的空间高频信息强行压缩为单一向量，会在特征提取最前端造成不可逆的高频细节损失。低层视觉模型必须采用 $1 \times 1$ 或微小重叠的 Patch 映射，以保证像素级的保真度。
 
-低层视觉的 Transformer 要么用更小的 patch（1×1 或 2×2，等价于不打包），要么用别的方式保持像素级表达（比如 SwinIR 的 1×1 patch + 窗口划分）。
+### 3. 缺乏平移等变性与局部性归纳偏置
 
-### 缺少归纳偏置
+卷积算子天然具备平移等变性（Translation Equivariance）与空间局部性（Locality），高度契合自然图像中局部连续与空间不变的统计规律。纯 ViT 抛弃了这些归纳偏置，依赖海量数据（如 ImageNet-22K / JFT-300M）从零学习空间几何结构。而在低层视觉领域，配对训练集规模相对有限（通常为数千张高质量切片），纯 ViT 极易陷入过拟合或收敛困难。
 
-CNN 的局部性（locality）和平移等变性（translation equivariance）是低层视觉的合理归纳偏置：相邻像素相关、同一种纹理出现在不同位置应该被同样处理。ViT 完全抛弃了这些，需要更多数据才能学到。
+## 7.3 SwinIR（2021）：基于窗口注意力的通用图像恢复
 
-低层视觉数据集相对小（DF2K 几千张），不像分类有 ImageNet 一千万级。**ViT 在数据少的设置下劣势明显**。这也是 SwinIR 选择"窗口 + 相对位置编码"而不是纯 ViT 的原因：窗口划分把局部性偏置加回来，相对位置编码把平移等变性偏置加回来。
+Liang 等人提出的 SwinIR 借鉴了 Swin Transformer 的层次化设计，将基于局部窗口的自注意力机制引入低层视觉，构建了适用于超分辨率、去噪与去模糊的统一架构。
 
-## 7.3 SwinIR（2021）：窗口注意力
+### 核心机制：局部窗口自注意力（W-MSA）
 
-Liang et al. 把 Swin Transformer 引入低层视觉，提出 SwinIR，一个覆盖 SR、去噪、去模糊三任务的通用架构。
+SwinIR 将尺寸为 $(H, W)$ 的特征图均匀划分为大小为 $M \times M$ 的不重叠局部窗口（标准配置 $M = 8$），并在每个窗口内部独立执行多头自注意力计算。
 
-### 核心思想：局部窗口 self-attention
+复杂度对比分析：
+- 窗口数量：$\frac{H}{M} \times \frac{W}{M}$；
+- 单个窗口内部注意力复杂度：$M^2 \times M^2 \cdot C = M^4 C$；
+- 全图总计算复杂度：$\left(\frac{H}{M} \times \frac{W}{M}\right) \times M^4 C = HW \cdot M^2 C$。
 
-不在全图上做 attention，而是把图分成 $M \times M$ 的窗口（典型 $M = 8$），**每个窗口内独立做 self-attention**。
+相较于全局自注意力的 $O((HW)^2 C)$，W-MSA 的计算复杂度由空间尺寸的**二次方降至线性**。在 $256 \times 256$、通道数 $C=64$、窗口 $M=8$ 的典型设定下，注意力矩阵元素总量由全局注意力的 $4.29 \times 10^9$ 缩减为 $4.19 \times 10^6$，计算量降低三个数量级。
 
-- 窗口数量：$\frac{H}{M} \times \frac{W}{M}$
-- 每个窗口的 attention：$M^2 \times M^2$
-- 总复杂度：$\frac{H}{M} \times \frac{W}{M} \times M^4 \cdot C = HW \cdot M^2 \cdot C$
+### 平移窗口机制（Shifted Window MSA, SW-MSA）
 
-对比朴素 attention：$H^2 W^2 \cdot C$。当 $M = 8$ 时，复杂度从 $O((HW)^2)$ 降到 $O(HW \cdot 64)$，**从二次方降到线性**。$256 \times 256$ 输入下，朴素 attention 是 $256^4 = 4.3 \times 10^9$ 个 attention map 元素，W-MSA 是 $256^2 \times 64 = 4.2 \times 10^6$，降了三个数量级。
-
-### Shifted Window 解决窗口隔离问题
-
-W-MSA 的问题：窗口之间没有信息交换。第二层的 attention 仍然只能看到第一层的同一个窗口里的信息，长距离依赖在层数足够多之前完全建立不起来。
-
-解决方案：**SW-MSA**（Shifted Window MSA）。每隔一层把整个窗口划分偏移 $M/2$，让相邻层的窗口边界错开。这样一个像素在第 1 层属于窗口 A，在第 2 层属于窗口 B，A 和 B 部分重叠，像素之间的信息通过这种"重叠传播"在多层后覆盖全图。
+W-MSA 限制了注意力在固定窗口内运算，阻断了跨窗口的信息交换。为实现空间上下文通信，Swin 架构引入了**平移窗口机制（SW-MSA）**：在连续的 Transformer 层间，将窗口划分网格沿水平与垂直方向循环平移 $\lfloor M/2 \rfloor$ 个像素。
 
 ```
 Layer 1 (W-MSA):           Layer 2 (SW-MSA):
@@ -146,9 +135,9 @@ Layer 1 (W-MSA):           Layer 2 (SW-MSA):
 窗口对齐                    窗口偏移 M/2
 ```
 
-这样一次 W-MSA + 一次 SW-MSA 后，每个像素的有效感受野覆盖了 $2M \times 2M$ 区域。再过一对 W-MSA + SW-MSA 又翻倍，理论上 $\log(\max(H, W) / M)$ 对就能覆盖全图，SwinIR 的 6 个 RSTB × 6 个 STL = 36 层足以让任何位置的像素看到全图。
+通过这种交替变换，上一层位于同一窗口边缘的像素在下一层被划分至不同窗口，使得特征信息在网络深层堆叠中逐步扩散至全图空间。
 
-把"局部窗口 + shift"和"全局 attention"在同一张特征图上的可见范围画在一起：
+下图对比了全局注意力、单层 W-MSA 与交替 SW-MSA 的有效通信范围演进：
 
 ```mermaid
 graph LR
@@ -171,9 +160,7 @@ graph LR
     style L2View fill:#e8f5e9
 ```
 
-红色 Full 一次性看完所有像素但跑不起来；黄色 W-MSA 一层只看 64 个；绿色 SW-MSA 让下一层的窗口和上一层错开，跨界信息靠层数累积。SwinIR 选择"小窗口 + 浅层数"是显存可控的设计；HAT 的 OCAB 则进一步把窗口做大并允许重叠，下面 §7.6 会讲。
-
-### Window Attention 的实现
+### 窗口自注意力算子实现
 
 ```python
 import torch
@@ -250,11 +237,13 @@ class WindowAttention(nn.Module):
         return self.proj(x)
 ```
 
-**Relative position bias 在做什么。** 普通 ViT 用绝对位置编码：给每个 token 一个固定的位置向量。SwinIR 用相对位置 bias：给"窗口内两个 token 之间的相对偏移"一个可学的标量，直接加到 attention 分数上。这种 bias 满足"平移等变"，是低层视觉里很合理的归纳偏置：同样的纹理出现在窗口的左上还是右下，相对位置关系不变。
+### 相对位置偏置（Relative Position Bias）的设计机理
 
-### SwinIR 的架构
+普通 ViT 采用绝对位置编码，为每个 Token 分配固定的绝对坐标向量。SwinIR 采用相对位置偏置：为窗口内任意两点间的相对偏移量 $(\Delta x, \Delta y)$ 学习一个连续偏置标量，直接加注到自注意力矩阵上。该偏置天然满足平移等变性，高度符合低层视觉的物理先验：相同的纹理无论出现在图像的中心还是边缘，其内部像素间的几何相关性保持不变。
 
-SwinIR 在 LR 空间做特征提取，每个 stage 由几个 RSTB（Residual Swin Transformer Block）组成。RSTB 内部是 W-MSA / SW-MSA 交替。
+### SwinIR 宏观架构流程
+
+SwinIR 在 LR 空间完成全部深度特征表征，由若干个 RSTB（Residual Swin Transformer Block）串联构成主干，RSTB 内部交替堆叠 W-MSA 与 SW-MSA：
 
 ```
 LR Input
@@ -270,62 +259,52 @@ LR Input
 HR Output
 ```
 
-性能：在 Set5 4× 上约 32.9 dB，超过 RCAN（32.6 dB）和所有 CNN 模型。
+性能表现：在 Set5 4× 基准上达到约 32.9 dB，显著超越经典 CNN 模型 RCAN（32.6 dB）。
 
-## 7.4 SwinIR 的局限
+## 7.4 SwinIR 的局限性
 
-W-MSA 解决了 attention 的计算量问题，但它的**长距离能力其实有限**：
+W-MSA 虽然将计算复杂度压缩至线性，但在长距离依赖捕获上存在固有妥协：
 
-- 单层只看 $M = 8$ 像素的局部
-- 跨窗口信息要经过 SW-MSA 累积，每经一层窗口才偏移一次
-- 真正的"全图"长距离依赖需要堆很多层才能捕捉
+- 单层注意力仅覆盖 $M = 8$ 的微小空间局域；
+- 跨窗口特征交互完全依赖 SW-MSA 在深层堆叠中的间接传递，多层传播过程中高频梯度易衰减；
+- 局部归因图（LAM）分析表明，SwinIR 实际有效利用的输入像素范围仅占可见区域的约 30%，大量潜在的自相似信息未被充分激活。
 
-而且 SwinIR 的"看到全图"是间接的：信息要经过多次 attention 中转，每次中转都会丢失精度。HAT 论文用 LAM 可视化发现，SwinIR 实际利用的输入像素只占视野的 30% 左右，剩下的 70% 虽然理论上能看到，但梯度信号衰减到几乎不起作用。
+针对这一问题，Restormer 提出了将注意力转移至**通道维度**的工程解法。
 
-Restormer（下一节）发现了一个更巧妙的思路：**在通道维度做 attention**。绕开"空间维度上必须妥协"的问题。
+## 7.5 Restormer（2022）：转置通道自注意力
 
-## 7.5 Restormer（2022）：通道维度 Attention
-
-Zamir et al. 提出 Restormer，是去噪/去模糊/去雨/去雾的通用 SOTA 架构。它的核心创新是把 self-attention 从空间维度搬到通道维度。
+Zamir 等人提出的 Restormer 是图像去噪、去模糊、去雨与去雾任务的代表性架构。其核心突破在于将自注意力计算由传统的空间 Token 维度转移至特征通道维度。
 
 ### MDTA：Multi-Dconv Head Transposed Attention
 
-朴素 self-attention：
+标准空间自注意力的计算公式为：
 
 $$
-\text{attention}(Q, K, V) = \text{softmax}(QK^T / \sqrt{d}) V
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d}}\right) V
 $$
 
-其中 $Q, K, V \in \mathbb{R}^{N \times d}$，$N = HW$ 是空间长度，$d$ 是 head 维度。$QK^T$ 是 $N \times N$，**复杂度 $O(N^2 d)$**。空间维 $N$ 在大图上可能是几万到几十万，平方爆炸。
+其中 $Q, K, V \in \mathbb{R}^{N \times d}$，$N = HW$ 为空间 Token 数量，$d$ 为 Head 维度。$QK^T$ 的维度为 $N \times N$，计算复杂度为 **$O(N^2 d)$**。当处理高分辨率图像时，空间尺寸 $N$ 达到数万至数十万，显存与计算开销急剧爆炸。
 
-Restormer 的转置 attention：把 $Q, K, V$ 转置，变成 $\mathbb{R}^{d \times N}$。然后对 $Q, K$ 沿 token 维做 L2 归一化得到 $\hat{q}, \hat{k}$，再算：
+Restormer 的转置通道注意力将特征矩阵转置为 $\mathbb{R}^{d \times N}$。先对 $Q, K$ 沿空间 Token 维度执行 L2 归一化生成 $\hat{q}, \hat{k}$，随后计算通道间的相关性：
 
 $$
-\text{attention}(Q, K, V) = V \cdot \text{softmax}\!\left( \alpha \cdot \hat{k} \hat{q}^T \right)
+\text{Attention}(Q, K, V) = V \cdot \text{softmax}\left(\alpha \cdot \hat{k} \hat{q}^T\right)
 $$
 
-其中 $\alpha$ 是每个 head 一个的可学温度参数。注意这里**用 cosine 相似度 + 温度**，不是除以 $\sqrt{N}$，这是 Restormer 与 vanilla attention 的另一个差异。$\hat{k} \hat{q}^T$ 是 $d \times d$ 的小矩阵，**复杂度 $O(d^2 N)$**。
+其中 $\alpha$ 为每个 Head 独立的可学习温度缩放参数。$\hat{k} \hat{q}^T$ 的矩阵尺寸仅为 $d \times d$，**计算复杂度被严格限制在 $O(d^2 N)$**。
 
-$d$ 通常远小于 $N$（典型 $d / \text{head} = 24$ 到 64，$N = HW = 65536$），所以 $d^2 \ll N^2$。Restormer 在 $1024 \times 1024$ 输入上仍然可以训，朴素 attention 早就 OOM 了。
+在典型配置下，单个 Head 的通道维度 $d$（通常为 24 至 64）远小于空间像素总数 $N = HW$（例如 $256 \times 256 = 65536$）。因此 $d^2 \ll N^2$，Restormer 在处理 $1024 \times 1024$ 或更大分辨率输入时，显存开销依然保持线性可控。
 
-### 这个 attention 在做什么
+### 通道维注意力机制的物理机理
 
-理解 MDTA 的关键是想清楚"谁和谁算相似度"的差别。
+- **标准空间注意力**：计算各个空间像素坐标之间的相关性，输出为所有空间位置特征的加权组合，用于跨坐标更新特征；
+- **MDTA 通道自注意力**：计算不同特征通道之间的全局交叉协方差，输出为所有通道特征的自适应加权线性组合，用于跨特征映射重组表征。
 
-- **Vanilla attention**：每个**像素位置**和其他所有像素位置算相关性，输出是 $V$ 沿 token 维的加权和，即"用其他位置的特征来更新当前位置"
-- **MDTA**：每个**通道**和其他所有通道算相关性，输出是 $V$ 沿 channel 维的加权和，即"用其他通道的特征来更新当前通道"
+物理含义分析：不同通道编码了互补的特征响应（如水平边缘、高频纹理、平坦色阶与噪声分布）。MDTA 通过动态计算全图通道间的交互矩阵，自适应调节不同特征在各像素点的激活权重。
 
-直觉理解：
+**空间信息保留机理**：值矩阵 $V \in \mathbb{R}^{C \times HW}$ 完整保留了全部空间分辨率。$C \times C$ 的相关性矩阵作用于 $V$ 时，实质是在所有空间坐标点上执行通道间特征重组。输出张量尺寸保持 $(B, C, H, W)$ 完全不变，空间结构细节未发生任何压缩损失。
 
-- 不同通道学到不同 features（边缘通道、纹理通道、噪声通道、颜色通道）
-- 这些 features 之间有 dependency（边缘通道激活时，纹理通道往往也激活；颜色通道在某种纹理出现时常有特定取值）
-- 通道间 attention 让模型自适应地决定哪些 features 在当前位置组合在一起
-
-这本质是 channel attention 的**广义版本**：SE/CA 是给每个通道一个标量权重，MDTA 是让每个通道的输出是所有通道的加权和。换句话说，SE 是"对角矩阵"形式的 channel 变换，MDTA 是"完整 $C \times C$ 矩阵"形式的 channel 变换，而且矩阵的元素是从输入数据自适应算出来的。
-
-**空间信息怎么进入 attention？** 关键是 $V$ 仍然带有空间维度：$V \in \mathbb{R}^{C \times HW}$，每个通道在每个像素位置都有一个值。attention 矩阵 $\hat{k} \hat{q}^T$ 是 $C \times C$，乘以 $V$ 时是沿通道维 "重新组合"，但每个像素位置独立做这个组合。所以输出仍然是空间分辨率全保留的 $C \times HW$，只是每个像素的通道分布被全图通道间相关性重新组织了一次。
-
-把 MDTA 的数据流和朴素 attention 并排画出来，能立刻看出"维度颠倒"的本质：
+下图对比了标准空间自注意力与 MDTA 转置通道自注意力在数据流与矩阵尺度上的根本差异：
 
 ```mermaid
 graph TD
@@ -354,11 +333,11 @@ graph TD
     style MDTA fill:#e8f5e9
 ```
 
-两条 pipeline 的差别集中在中间的 attention 矩阵尺寸：vanilla 是 $HW \times HW$，MDTA 是 $C \times C$。对 $256 \times 256 \times 96$ 的特征图，vanilla 要 $65536 \times 65536$（17 GB FP32），MDTA 只要 $96 \times 96$（37 KB）。这是 Restormer 在大图上可用的根本原因。
+对于尺寸为 $256 \times 256 \times 96$ 的特征图，标准自注意力需构建 $65536 \times 65536$ 的超大矩阵（单头占用约 17.18 GB），而 MDTA 仅需维护 $96 \times 96$ 的紧凑矩阵（占用不足 40 KB）。
 
-### Depthwise Convolution 加局部性
+### 引入深度可分离卷积注入空间局部性
 
-MDTA 把 attention 搬到通道维后，自然失去了"空间局部性"：通道间 attention 不关心像素位置，对 SR/去噪这种局部任务并不友好。Restormer 的补救是在 $Q, K, V$ 投影前先做 3×3 depthwise conv，给 attention 注入空间局部信息：
+为补偿通道注意力对局部空间邻域感知的不足，Restormer 在生成 $Q, K, V$ 投影前，先经由 3×3 深度可分离卷积（Depthwise Conv）进行空间局部滤波：
 
 ```python
 class MDTA(nn.Module):
@@ -399,9 +378,9 @@ class MDTA(nn.Module):
         return self.proj(out)
 ```
 
-### Gated-Dconv Feed-Forward Network
+### 门控前馈网络（GDFN）
 
-Restormer 的 FFN 也做了修改，把普通 MLP 替换成 GDFN（Gated-Dconv Feed-Forward Network）：
+Restormer 重新设计了前馈网络，提出 Gated-Dconv Feed-Forward Network（GDFN），融合门控机制与局部深度可分离卷积：
 
 ```python
 class GDFN(nn.Module):
@@ -419,159 +398,79 @@ class GDFN(nn.Module):
         x = self.proj_in(x)
         x = self.dwconv(x)
         x1, x2 = x.chunk(2, dim=1)
-        x = F.gelu(x1) * x2          # gating
+        x = F.gelu(x1) * x2          # gating 门控相乘
         return self.proj_out(x)
 ```
 
-注意 `F.gelu(x1) * x2` 这个 gating，和 NAFNet 的 SimpleGate 是同样的思想，让模型自适应地决定每个通道在当前位置激活多少。这种"门控 FFN"在 Transformer 派和 CNN 派都已经成为现代默认，可以理解为对 vanilla FFN 的一次普适性改进。
+`F.gelu(x1) * x2` 结构使前馈网络能够受控调节各通道特征的激活程度，与 NAFNet 的 SimpleGate 原理一致，为现代恢复网络普遍采纳的标准前馈结构。
 
-### Restormer 整体
+### Restormer 宏观多尺度架构
 
-U-Net 形状的 encoder-decoder + skip connection + MDTA/GDFN block。每个 encoder/decoder level 由若干个 Transformer block 堆叠，level 之间通过 PixelShuffle/PixelUnshuffle 改变分辨率。在去噪、去模糊、去雨等任务上是 2022-2023 年的事实 SOTA，Real-World 数据集上比 SwinIR 提升约 0.3-0.5 dB。
+Restormer 采用 U-Net 拓扑的编码器-解码器架构配合跨层跳跃连接。各层级由若干 Transformer 块堆叠而成，层级间通过 PixelUnshuffle（下采样）与 PixelShuffle（上采样）变换空间尺度。该设计在大尺度去噪与高分辨率恢复中具备出色的吞吐量优势。
 
-它的工程优势在大图推理上特别明显：同样硬件下能跑的最大输入分辨率比 SwinIR 大一两倍，这对视频去噪和高分辨率照片修复是关键。
+## 7.6 HAT（2023）：空间与通道混合注意力
 
-## 7.6 HAT（2023）：混合注意力
+Chen 等人提出的 HAT（Hybrid Attention Transformer）在 SwinIR 基础上进一步融合了多种注意力机制，是 2023 年学术超分辨率评测中的代表性模型。
 
-Chen et al. 在 SwinIR 基础上提出 HAT（Hybrid Attention Transformer），是 2022-2023 年这一代注意力架构的代表；到 2024 年之后，DRCT、ATD 等在学术 SR benchmark 上又有进一步提升。
+### 架构设计要点
 
-### 关键观察
+1. **HAB（Hybrid Attention Block）**：将 W-MSA 与通道注意力块（CAB）并行集成。将 W-MSA 的窗口尺寸由 SwinIR 的 8 扩展至 16，单层直接覆盖的空间网格面积增加至 4 倍；
+2. **OCAB（Overlapping Cross-Attention Block）**：引入带重叠边界的局部窗口跨注意力机制（有效覆盖尺寸拓展至 $24 \times 24$），使相邻窗口的边缘特征在单层内实现直接通信，弥补平移窗口传递的滞后性。
 
-SwinIR 的 W-MSA 范围只有 $8 \times 8$。论文做实验发现：**SwinIR 只用了输入的一小部分**，通过 LAM（Local Attribution Map）可视化，模型实际利用的像素仅占可见输入的 30%。
+性能表现：HAT-Large 在 Set5 4× 基准上达到约 33.0 至 33.4 dB，相较 SwinIR 提升约 0.5 dB。其代价在于参数量扩展至约 40M，计算延迟显著增加，主要用于前沿技术验证与离线高质量处理。
 
-这意味着 SwinIR 的容量没用满。HAT 的目标：**让模型利用更多的输入信息**。
+技术拓展：除窗口自注意力外，以 MambaIR 为代表的状态空间模型（State Space Model, SSM）通过选择性扫描机制实现了线性计算复杂度与全图感受野建模，成为与窗口注意力并行的重要探索方向（详见第 18 章）。
 
-### 两类 attention block 组合
+## 7.7 自注意力机制在低层视觉中的核心价值归纳
 
-HAT 的核心 block 不是单一的"三合一 attention"，而是 group 级别的两类 block 组合：
+1. **跨区域自相似先验利用**：能够单步建立远距离相似纹理的关联，显著提高去噪与超分的高频纹理恢复质量；
+2. **退化非均匀性自适应建模**：标准卷积核在全图保持空间不变性，而自注意力机制根据输入内容动态生成聚合权重，能自适应调节不同退化强度局域的特征流动；
+3. **通道维度高阶相关性解耦**：MDTA 算子提供了全图通道间的全局动态重组能力，超越了传统 1×1 卷积的固定加权模式。
 
-1. **HAB**（Hybrid Attention Block）：W-MSA + CAB 在同一个 block 内
-   - **W-MSA**（窗口自注意力）：继承 SwinIR 的局部 + shifted window，但把窗口边长从 SwinIR 的 8 放大到 16。放大 window 本身就是 HAT 的关键设计之一，更大的窗口让每层能直接覆盖的空间范围成倍增加
-   - **CAB**（Channel Attention Block）：给 features 加 RCAN 风格的 channel attention，弥补 W-MSA 不会聚焦"重要通道"
-2. **OCAB**（Overlapping Cross-Attention Block）：作为独立 block 放在 residual group 内
-   - 把窗口进一步做成重叠窗口（overlap ratio 0.5 下有效窗口约 $24 \times 24$），在重叠窗口内做 cross-attention
-   - 让每个窗口能直接看到相邻窗口的边缘像素，不依赖 shifted window 的间接传播
+## 7.8 计算复杂度与资源消耗量化对比
 
-### 性能
+以输入特征图尺寸 $256 \times 256$、基础通道数 $C = 96$ 为基准：
 
-HAT-L（大版本）在 Set5 4× 上约 33.0-33.4 dB（取决于训练设置和是否预训练 ImageNet），比 SwinIR 提升约 0.5 dB，**这在 SR 领域是非常显著的提升**。
+| 架构类型 | 理论复杂度 | 典型配置 FLOPs | 注意力矩阵显存占用 |
+|---------|-----------|---------------|-------------------|
+| **Vanilla ViT (全局)** | $O((HW)^2 C)$ | ~16.0 TFLOPs | ~16.0 GB (单 Head) |
+| **SwinIR (窗口 M=8)** | $O(HW \cdot M^2 C)$ | ~250 GFLOPs | ~256 MB |
+| **Restormer (MDTA)** | $O(d^2 \cdot HW)$ | ~500 GFLOPs | ~64 MB |
+| **HAT (HAB + OCAB)** | 混合组合 | ~600 GFLOPs | ~512 MB |
 
-代价：参数量约 40M，推理慢。生产环境很少直接用 HAT-L，但它**展示了 attention 设计还有多少空间**。
+工程结论：
+- 朴素全局 ViT 在高分辨率低层视觉中工程不可行；
+- SwinIR 与 Restormer 均实现了与空间像素数呈线性的计算复杂度；
+- Restormer 的转置注意力显存开销最小，对超高分辨率图像与视频处理具有显著工程优势。
 
-这里需要补一句时代背景：注意力之外还有一条正在快速发展的非注意力主线。2024 年前后兴起的状态空间模型（State Space Model）路线，以 Mamba 及其视觉复原版本 MambaIR 为代表，用线性复杂度的选择性扫描替代注意力，是与 window / channel attention 直接竞争的一支。它在长序列和大图上的复杂度优势明显，这里点到为止，细节留到第 18 章展开。
+## 7.9 移动端与嵌入式部署考量
 
-## 7.7 为什么 attention 对低层视觉有用
+尽管窗口与通道注意力在理论 FLOPs 上可控，但端侧 NPU 部署依然面临硬件瓶颈：
 
-到这里可以归纳 attention 在低层视觉的具体贡献。
+- **Softmax 算子瓶颈**：移动端 NPU 针对密集矩阵乘（GEMM）与规则卷积提供了专用硬件加速单元，而 Softmax 涉及指数求和与归一化，硬件流水线利用率较低；
+- **动态 Reshape 与内存搬运开销**：多头注意力执行频繁的张量重排（Permute / Transpose / Reshape），在端侧属于受制于内存带宽（Memory-bound）的耗时操作。
 
-### 长距离自相似性
+**工程实践策略**：在端侧高帧率实时场景中，优先采用纯 CNN 架构（如 NAFNet、MobileNet 变体）；若需引入 Transformer，建议仅在网络最深层的低分辨率瓶颈部分配置少量注意力模块。
 
-§7.1 提过：自然图像有 self-similarity，远处的相似 patch 可以帮助恢复。CNN 通过堆深度间接做，attention 直接做。
+## 7.10 Transformer 架构的不适用场景
 
-具体场景：
+1. **超轻量端侧约束（参数量 < 1M）**：自注意力的投影层与位置编码存在固定的参数与计算基线，在极小预算下纯 CNN 的参数效率更高；
+2. **极小输入分辨率（< 128 px）**：局部窗口划分退化，难以体现多层分层优势；
+3. **二值文档与强边缘敏感任务**：自注意力的加权求和机制具有内在平滑倾向，在文本锐利边缘恢复中易引起轻微弥散；
+4. **小样本训练场景（数据量 < 10K）**：缺乏卷积的局部归纳偏置，容易产生过拟合。
 
-- **去噪**：远处干净的相似纹理 → 当前噪声位置的去噪先验
-- **超分**：图中重复的边缘/角点 → 借用高频细节
-- **去模糊**：同一物体的不同视角实例 → 联合约束去模糊结果
+## 7.11 骨干架构选型决策矩阵
 
-### 退化程度的不均匀性
+| 应用场景与需求 | 推荐架构类型 | 代表性模型 |
+|---------------|-------------|-----------|
+| 学术基准评测 / 离线极高保真度 | 混合注意力 Transformer | HAT / SwinIR |
+| 高分辨率图像去噪 / 去模糊 / 去雨 | 转置通道 Transformer | Restormer |
+| 真实场景盲超分辨率（生产环境） | 深度残差 CNN / 极简门控 CNN | RRDB (Real-ESRGAN) / NAFNet |
+| 移动端 / 嵌入式 NPU 实时部署 | 纯卷积架构 | NAFNet / MobileSR |
+| 视频时空联合恢复 | U-Net 拓扑通道 Transformer | Restormer 变体 |
+| 扩散模型主干网络 | 卷积与空间 Transformer 混合块 | SD / SDXL UNet |
 
-真实图像里不同位置的退化程度不一样：
-
-- 暗部噪声大、亮部噪声小
-- 中心清晰、边缘模糊（镜头像差）
-- 主体在焦内、背景在焦外
-- 局部过曝、局部正常
-
-CNN 的卷积是**位置无关**的：同一个 kernel 处理所有位置。attention 是**位置相关**的：可以让"轻退化区域"的信息流到"重退化区域"，自适应地分配修复力度。
-
-### 通道维度的特征聚合
-
-MDTA 揭示的：通道之间也有 dependency。channel attention（SE/CA）是简化版，MDTA 是完整版。这种通道间的信息交互在 CNN 里需要靠 1×1 卷积层间接做，效率低，且不能根据输入内容自适应调整通道间的混合权重。
-
-## 7.8 计算效率分析
-
-不同 attention 的计算量对比（输入 $256 \times 256$，$C = 96$）：
-
-| 方法 | 复杂度 | $256 \times 256$ FLOPs | 显存（attention map） |
-|------|-------|----------------------|---------------------|
-| Vanilla ViT | $O((HW)^2 C)$ | ~16 TFLOPs | ~16 GB |
-| SwinIR (M=8) | $O(HW \cdot M^2 C)$ | ~250 GFLOPs | ~256 MB |
-| Restormer (MDTA) | $O(C^2 \cdot HW / \text{head})$ | ~500 GFLOPs | ~64 MB |
-| HAT | SwinIR + CAB + OCAB | ~600 GFLOPs | ~512 MB |
-
-工程意义：
-
-- 朴素 ViT 完全不可用（除非小图）
-- SwinIR/Restormer 都是"线性复杂度"（FLOPs 与 $HW$ 成线性）
-- Restormer 的显存最低，对大图友好，这是它在视频去噪等大尺寸应用里的关键优势
-
-## 7.9 移动端的 attention
-
-理论上 attention 复杂度可控，但**端侧部署 attention 的瓶颈不在 FLOPs，在内存带宽和算子支持**。
-
-### softmax 是瓶颈
-
-NPU/移动 GPU 对 GEMM（General Matrix Multiply，矩阵乘）有硬件加速，对 softmax 没那么好。一个 attention 块的 softmax 可能比矩阵乘本身慢 2-3 倍，硬件流水线在 softmax 上利用率掉一半。
-
-### Reshape 开销
-
-attention 实现里大量 reshape/permute（把 $(B, C, H, W)$ 折成 $(B, \text{head}, C/\text{head}, HW)$ 之类）。在某些 NPU 上 reshape 是 memory-bound 操作，要把数据从一种内存布局搬到另一种，比浮点运算还慢。
-
-### 实际工程
-
-2026 年的端侧增强模型（手机 NPU）几乎全是 CNN，原因：
-
-- 移动端 NPU 对 CNN 的优化最成熟（硬件 + 编译器 + 内存布局）
-- attention 的 latency 不稳定（取决于输入大小），给推理引擎增加困难
-- 端侧 OCR/AI 滤镜对延迟极敏感（< 30 ms），attention 模型的不稳定 latency 很难满足
-
-何时端侧用 attention：
-
-- **少量 attention block + 大量 CNN**（混合架构），让 attention 只出现在低分辨率瓶颈层
-- **shape 固定的输入**（比如固定 $720 \times 1280$ 视频帧），编译器能做静态优化
-- **用 linear attention 变体**（MobileViT 系列），避开 softmax
-
-第 15 章会详细讲端侧部署。
-
-## 7.10 Transformer 不擅长什么
-
-Transformer 在低层视觉不是万能的，几个**不适合**的场景。
-
-### 极端轻量级（< 1M 参数）
-
-attention 本身有"基础开销"：QKV 投影、位置编码、相对位置 bias 等。这些固定开销在小模型里占比大。
-
-实测：1M 参数预算下，纯 CNN 比 SwinIR 风格的 attention 模型在 PSNR 上高 0.2 dB。
-
-### 极小输入
-
-输入 $< 128 \times 128$ 时，window attention 的窗口都覆盖不了几个，效率不如直接全图 attention 或者直接 CNN。
-
-### 对锐利度极敏感的任务
-
-attention 有 averaging 的本质（softmax 加权和）。轻微的 attention 偏差会让边缘略糊。在文档增强、二值化等任务上，CNN（特别是有 gradient loss 的）效果更好。
-
-### 训练数据少的场景
-
-attention 缺少 CNN 的归纳偏置，需要更多数据才能学到一样的能力。如果你的训练集 < 10K 张图，CNN 通常比 Transformer 好，这是 §7.2 缺归纳偏置的延续。
-
-## 7.11 选型决策表
-
-| 场景 | 推荐 |
-|------|------|
-| 通用 SR / 去噪 / 去模糊（学术 benchmark） | SwinIR / Restormer / HAT |
-| 真实退化 SR（生产） | RRDB（Real-ESRGAN）或 NAFNet |
-| 端侧部署 | NAFNet / MobileNet 风格 CNN |
-| 视频去噪 / 去模糊 | Restormer（U-Net 形状对长序列友好） |
-| 极小输入（< 128 px） | CNN |
-| 极端轻量（< 1M 参数） | CNN |
-| 高质量人脸修复 | RestoreFormer / CodeFormer（混合架构） |
-| 扩散派增强 | UNet 内部用 Transformer block（第 8 章） |
-
-## 7.12 一个简化的 SwinIR-style 模块
-
-把上面的概念拼成一个最小可读的 Transformer block：
+## 7.12 最小可运行 Swin 模块实现
 
 ```python
 import torch.nn as nn
@@ -602,49 +501,39 @@ class SwinTransformerBlock(nn.Module):
         shortcut = x
         x = self.norm1(x).view(B, H, W, C)
 
-        # Cyclic shift (SW-MSA)
+        # 循环平移 (SW-MSA)
         if self.shift_size > 0:
             x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size),
                            dims=(1, 2))
 
-        # 窗口分割 + attention + reverse
-        windows = window_partition(x, self.window_size)             # (B*nW, M, M, C)
+        # 窗口切分 -> 注意力运算 -> 逆重组
+        windows = window_partition(x, self.window_size)
         windows = windows.view(-1, self.window_size ** 2, C)
-        # 注意: 完整 SW-MSA 还需要传入 attention mask, 防止 cyclic shift 后的
-        # "环绕" 像素跨真实图像边界相互 attend。这里省略 mask 让代码可读,
-        # 实际 SwinIR / Swin Transformer 的 self.attn 接受一个 mask 参数。
         attn_windows = self.attn(windows)
         attn_windows = attn_windows.view(-1, self.window_size,
                                          self.window_size, C)
         x = window_reverse(attn_windows, self.window_size, H, W)
 
-        # Reverse shift
+        # 逆向循环平移
         if self.shift_size > 0:
             x = torch.roll(x, shifts=(self.shift_size, self.shift_size),
                            dims=(1, 2))
         x = x.view(B, L, C)
 
-        # 残差 + MLP
+        # 残差连接与前馈网络
         x = shortcut + x
         x = x + self.mlp(self.norm2(x))
         return x
 ```
 
-实际 SwinIR 的代码在这上面加 attention mask（处理 SW-MSA 的环绕问题）+ RSTB（多个 STL 包一层残差）+ patch merging（如果分多 stage）+ 上采样头。完整 SwinIR 大约 1000 行。
-
 ## 7.13 小结
 
-1. **CNN 的局部性是低层视觉的合理偏置**，但限制了长距离依赖
-2. **朴素 ViT 在低层视觉不可用**：计算量爆、粒度粗、缺归纳偏置
-3. **SwinIR 用窗口注意力 + shifted window 解决计算量**，是 SR/去噪/去模糊的统一架构
-4. **Restormer 用通道维度 attention（MDTA）** 把复杂度从 $O(N^2)$ 降到 $O(C^2)$，是去噪/去模糊 SOTA
-5. **HAT 通过组合三种 attention 进一步提升**，但参数量大、推理慢
-6. **attention 对低层视觉有用**：自相似性、退化不均匀、通道间依赖
-7. **端侧仍然是 CNN 主场**：attention 在 NPU 上效率不好
-8. **CNN 和 Transformer 不是替代关系**：现代增强网络（特别是扩散）通常是混合架构
-
-到这里 Part II 的判别式架构（CNN + Transformer）讲完。下一章进入扩散模型，这是过去三年这个领域最大的范式转变，把"判别式恢复"扩展到"生成式恢复"。
+1. **自注意力机制突破了局部感受野限制**：为建模自然图像的全局自相似先验提供了直接路径；
+2. **朴素 ViT 在低层视觉中面临双重困境**：计算复杂度过高且粗粒度 Patch 损失高频细节；
+3. **SwinIR 确立了窗口自注意力范式**：结合 W-MSA 与 SW-MSA 实现线性复杂度与跨窗口通信；
+4. **Restormer 开拓了通道自注意力路线**：MDTA 算子在通道维度解耦特征，显存占用极小，适合高分辨率处理；
+5. **现代网络多采用混合范式**：卷积负责浅层高频与局部偏置，Transformer 负责深层上下文建模，二者互为补充。
 
 ---
 
-> 下一章 [扩散模型基础](08-diffusion.md) → 从 DDPM 到 LDM，为什么扩散能"无中生有"，以及它在影像增强里的特殊角色。
+> 下一章 [扩散模型基础](08-diffusion.md) → 从确定性判别回归走向概率生成建模，探索扩散先验在复杂图像增强中的理论与工程实现。

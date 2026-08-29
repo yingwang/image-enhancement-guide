@@ -1,92 +1,76 @@
-# 第 18 章 · SOTA 模型
+# 第 18 章 · SOTA 模型前沿与技术选型
 
-> 这一章是这本书的"快速参考" - 9 个值得记住的 SOTA 模型 + 选型决策树。
+> 本章是全书的技术选型快速参考手册：系统梳理 9 个工业级核心基座模型与前沿技术演进决策树。
 >
-> 模型本身会过时，**思路不会** - 所以每个模型都讲：核心思路、何时用、何时别用、被谁接班。
+> 算法模型会随时间迭代，但底层的系统设计思想与权衡逻辑历久弥新。每个模型均聚焦于核心原理、适用工况、边界禁忌与演进分支。
 
 ## 18.0 章首铺垫
 
-走到这一章，前面 17 章已经把"为什么"、"怎么做"、"如何评"和"会怎么坏"都讲清楚了。这一章退一步，回答一个非常具体的工程问题：**在 2026 年这个时间点，如果今天就要从零搭一个增强系统，应该选哪些模型当基座？**
+在完成前 17 章关于退化机理、表征空间、损失约束、评估体系、网络架构、训练动力学、时序连续性与硬件部署的系统讨论后，本章聚焦于具体的工程决策问题：**站在 2026 年的技术节点，若需从零构建一套高可用影像增强系统，应当如何选取底层模型基座？**
 
-回答这个问题的难点不在"哪个模型在 benchmark 上最高"，而在**学术 SOTA 与工程 SOTA 几乎从不重合**。每年顶会出现的"刷分最高"的模型，落到产品上往往因为推理慢、部署难、对真实退化分布不鲁棒、社区维护停滞，最终用不进生产。反过来，真正在工业界被广泛部署的模型（Real-ESRGAN、CodeFormer、BasicVSR++）在论文发表时未必是当年的最高分，但它们的工程性 - 鲁棒性、可部署性、社区活跃度、可维护性 - 让它们成为五年时间尺度上的"事实标准"。
+工程落地的难点在于：**学术 Benchmark 榜首与工业生产最优解几乎从不重合**。学术顶会上不断涌现的刷榜模型，往往伴随着极高的推理延迟、复杂的非标准算子、对开放域真实退化脆弱的泛化性以及缺乏维护的代码生态，难以直接交付生产。相反，在工业界被广泛采用的基准（如 Real-ESRGAN、CodeFormer、BasicVSR++），其核心优势在于系统鲁棒性、硬件亲和度与生态完备性，成为长期稳定的工业事实标准。
 
-这一章选的 9 个模型是按"工程胜算"标准筛出来的，每一个都满足下面三条至少两条：在生产环境被广泛部署、开源代码长期维护、对真实退化分布有合理覆盖。它们不是论文榜单的子集，而是**这本书前 17 章所有论点在落地时的最佳兑现**。
+本章遴选的模型均遵循严格的工程可行性标准：已在生产环境中规模化部署、具备活跃稳定的开源工程实现，且在真实退化流形上具备经过验证的泛化能力。
 
-模型本身会过时。SUPIR 2024 年还是扩散派的标杆，到 2025 年已经被一系列单步蒸馏接班；HAT 一度是 PSNR 派的天花板，现在 DRCT、Hi-IR、ATD 在各种 benchmark 上轮流登顶。这种"半衰期"在低层视觉领域大约是 12-18 个月。所以这一章除了介绍模型，还会在每个模型后面写"当前位置"和"被谁接班"，帮你在两年后回头读时知道哪一段已经过时、哪一段还活着。最后一节会给出"换 SOTA"的工程纪律：什么时候应该把生产模型换掉、什么时候应该按兵不动。
+在低层视觉领域，单一模型的学术生命周期通常为 12 至 18 个月。因此，本章不仅解析各代表模型的内部机理，更重点剖析其技术演进脉络与后继接班体系，并总结工业选型中的模型替换纪律。
 
-需要提前交代的是，这一章在 2026 年这一版做过一次系统性的补课。2024 年下半年到 2026 年之间，低层视觉又生出几条此前不在这份名单里的主线：状态空间模型（以 Mamba 为代表）作为线性复杂度的架构分支，开始和注意力正面竞争；一个模型同时应对多种退化的"全能复原"与"指令式复原"成为热门方向；扩散复原的主干从 UNet 向 DiT（Diffusion Transformer，扩散式 Transformer）迁移，并出现了 DreamClear 这样的高容量标志性工作；把扩散复原从数十步压到一到四步的单步蒸馏在 2025 年继续深化；真实退化视频的复原也从循环卷积网络转向了扩散与 DiT。于是这一章保留原来那 9 个"工程胜算最高"的主力模型当脊梁，同时在相关小节里把这几条新主线接上，以便这份参考在 2026 年年中仍然站得住。
+在 2026 年的技术全景中，低层视觉领域形成了数条明确的前沿主线：
+1. **状态空间模型（以 Mamba 为代表）**：作为线性复杂度的序列架构分支，在保持全局感受野的同时与自注意力机制展开竞争；
+2. **全能复原（All-in-One）与指令驱动复原（Instruction-based Restoration）**：实现单一网络权重自适应统一处理混合退化；
+3. **扩散复原主干向 DiT（Diffusion Transformer）演进**：以 DreamClear 等为代表，依托高容量多模态架构探索生成质量新上限；
+4. **单步与少步扩散蒸馏工程落地**：通过变分得分蒸馏与目标得分蒸馏将扩散超分从数十步压缩至 1 至 4 步，打通实时生产通路；
+5. **真实退化视频复原的生成式转向**：从确定性循环时序网络向扩散与 DiT 时空先验拓展。
 
-读这一章的方式建议是：第一遍按顺序读完，建立"在 2026 年这个时间点，每个子任务的默认选择是谁"的全景；之后遇到具体项目时再回到对应的小节，看"何时用 / 何时别用 / 关键参数"。9 个模型加起来覆盖了 90% 以上的增强需求场景，剩下的 10% 在 18.13 节"哪些 SOTA 没列"里给了出口。
+## 18.0.1 缩写与核心术语
 
-## 18.0.1 缩写与术语注
+- **SR / VSR**（Super-Resolution / Video Super-Resolution）：图像与视频超分辨率；
+- **NR-IQA**（No-Reference Image Quality Assessment）：无参考图像质量评估（如 MANIQA、CLIP-IQA、Q-Align）；
+- **DDPM / DDIM**：扩散概率模型与确定性隐式采样器；
+- **SD / SDXL / SD3 / FLUX**：代表性文生图基模，涵盖 UNet 与 MM-DiT（Multi-Modal Diffusion Transformer）主干；
+- **ControlNet**：向预训练生成主干注入空间条件约束的对齐网络；
+- **LoRA**（Low-Rank Adaptation）：低秩参数微调技术；
+- **LLaVA**：多模态大语言模型，用于为低质图像逆向生成文本语义提示词；
+- **ZeroSFT**（Zero-init Spatial Feature Transform）：用于空间特征调制的零初始化空间变换层；
+- **VSD / TSD**（Variational / Target Score Distillation）：变分得分蒸馏与目标得分蒸馏；
+- **MambaIR / MambaIRv2 / VMambaIR**：基于状态空间模型（SSM）的图像复原网络家族；
+- **PromptIR / InstructIR / DA-CLIP**：全能复原与指令引导复原模型；
+- **DreamClear**：基于 PixArt DiT 主干的高容量真实世界复原网络；
+- **Restormer / NAFNet**：通用低层视觉骨干网络；
+- **CodeFormer / DifFace / PGDiff**：代码本先验与扩散派人脸复原模型；
+- **BasicVSR++ / SeedVR / STAR**：时序循环网络与视频扩散复原网络；
+- **RIFE / GIMM-VFI**：光流插帧与隐式连续运动场插帧网络；
+- **Retinexformer / LightenDiffusion**：物理先验与潜空间扩散低光增强网络。
 
-这一章涉及的缩写横跨四个家族（生成派、Transformer 派、视频派、特化派），集中放在这里：
-
-- **SR**（Super-Resolution，超分辨率）：把低分辨率图升采样到高分辨率。
-- **VSR**（Video Super-Resolution，视频超分辨率）。
-- **NR-IQA**（No-Reference Image Quality Assessment，无参考图像质量评估）。
-- **PSNR / SSIM / LPIPS / DISTS**：常用 IQA 指标，详见第 4 章。
-- **MANIQA / CLIP-IQA / Q-Align**：当前主流 NR-IQA 模型。
-- **DDPM / DDIM**（Denoising Diffusion Probabilistic / Implicit Model）：扩散模型两类基础采样器。
-- **SD / SDXL / SD3 / SD3.5 / FLUX**（Stable Diffusion 系列与同代 DiT 主干）：文生图基模。SDXL 是 2.6B 参数 UNet 主干；SD3 / SD3.5 / FLUX 是 2024-2025 出现的 MM-DiT（Multi-Modal Diffusion Transformer）主干。
-- **ControlNet**：把额外视觉条件（边缘 / 深度 / LR 图）注入预训练 UNet 的旁路网络，给扩散派增强提供"对齐输入图"的能力。
-- **LoRA**（Low-Rank Adaptation）：低秩适配器，仅训练原模型权重的低秩残差，用来在 base 模型上低成本特化任务。
-- **LLaVA**（Large Language and Vision Assistant）：开源多模态大模型，SUPIR 用它给输入图自动生成 prompt 作为文本条件。
-- **VAE**（Variational AutoEncoder）：扩散派把图像编码到 4× 或 8× 下采样的潜空间用的网络。
-- **ZeroSFT**（Zero-init Spatial Feature Transform）：SUPIR 用的零初始化空间调制层，把 ControlNet 特征注入 SDXL 主干而不破坏预训练权重。
-- **CFG**（Classifier-Free Guidance）：扩散采样里的 prompt 强度旋钮。
-- **SUPIR / OSEDiff / TSD-SR / PiSA-SR / InvSR / SinSR / DiffBIR / PASD / SeeSR / ResShift / StableSR / AdcSR**：扩散派 SR 路线上的不同工程方案，本章和上一章都会反复提到。
-- **VSD / TSD**（Variational / Target Score Distillation）：把多步扩散蒸馏到单步的两个代表损失。
-- **GAN**（Generative Adversarial Network）：判别器-生成器对抗训练。
-- **ESRGAN / Real-ESRGAN / BSRGAN**：GAN 派 SR 的代表，Real-ESRGAN 的核心贡献在退化合成 pipeline。
-- **HAT / SwinIR / DRCT / Hi-IR / ATD**：Transformer 派 PSNR-导向 SR 模型。
-- **MambaIR / MambaIRv2 / VMambaIR / RetinexMamba**（Mamba for Image Restoration，状态空间图像复原）：以状态空间模型（SSM）替代注意力的复原架构分支，主打线性复杂度。
-- **PromptIR / InstructIR / DA-CLIP / AutoDIR / DiffUIR**：全能复原 / 指令式复原（all-in-one / instruction-based restoration）模型，一个模型应对多种退化。
-- **DreamClear / SD3 / FLUX / PixArt**：DiT（Diffusion Transformer，扩散式 Transformer）主干及其上的复原工作。
-- **Restormer / NAFNet / MAXIM / Uformer**：通用底层视觉 backbone（去噪 / 去模糊 / 去雨）。
-- **CodeFormer / GFPGAN / GPEN / RestoreFormer++ / DifFace / PGDiff / DR2**：人脸修复模型（后三者为扩散派盲脸复原）。
-- **BasicVSR++ / VRT / RVRT / EDVR / SeedVR / STAR / Upscale-A-Video**：视频超分与视频复原模型（后三者为视频扩散 / DiT 路线）。
-- **RIFE / FILM / AMT / GIMM-VFI / EMA-VFI / VFIformer**：帧插值模型。
-- **Retinexformer / LightenDiffusion / GLARE / QuadPrior / RetinexMamba / LLFormer / SCI / EnlightenGAN**：低光增强模型。
-- **HDR / SDR**（High / Standard Dynamic Range，高/标准动态范围）：HDR 指亮度范围超出 8-bit SDR 的格式，常见 10-bit / 12-bit。
-- **WCG**（Wide Color Gamut，广色域）：色域超过 Rec.709 的色彩空间。
-- **Rec.709 / Rec.2020**：HDTV 与 UHD（4K / 8K）的色域与电光转换函数（EOTF）标准。
-- **ACES**（Academy Color Encoding System，学院色彩编码系统）：电影工业的统一色彩管线。
-- **ProRes**：Apple 的视觉无损中间编码格式，电影后期常用。
-- **Bayer / CFA / RGGB**（Color Filter Array / Red-Green-Green-Blue Pattern）：相机传感器颜色滤镜阵列。
-- **CDN**（Content Delivery Network）：图像在网络传输中常被边缘节点重压缩。
-- **TensorRT / CoreML / ONNX**：常见推理引擎与中间表示。
-- **QAT / PTQ**（Quantization-Aware Training / Post-Training Quantization）：训练时量化与训练后量化。
-- **OCR**（Optical Character Recognition）：光学字符识别。
-
-## 18.1 选型概览
+## 18.1 选型总览
 
 ```
-通用增强 SOTA (5)
-  ┌─ SUPIR              — 扩散派 / 创意放大（完整 50 步）
-  ├─ OSEDiff / TSD-SR   — 扩散派 / 单步蒸馏（生产实时）
-  ├─ Real-ESRGAN        — 真实退化建模派
-  ├─ HAT                — Transformer 非扩散派
-  └─ Restormer          — 去噪 / 去模糊 / 去雨通用 backbone
+通用图像增强核心基座 (5)
+  ├─ SUPIR              : 扩散先验 / 离线高保真生成（50 步采样）
+  ├─ OSEDiff / TSD-SR   : 扩散蒸馏 / 生产级准实时（单步前向）
+  ├─ Real-ESRGAN        : 真实退化建模 / 工业基准（CNN-GAN 架构）
+  ├─ HAT                : 深度注意力超分 / PSNR 导向（Transformer 架构）
+  └─ Restormer          : 去噪 / 去模糊 / 去雨通用主干（通道自注意力 U-Net）
 
-任务特化 (4)
-  ┌─ CodeFormer   — 人脸修复
-  ├─ BasicVSR++   — 视频超分
-  ├─ RIFE         — 帧插值
-  └─ Retinexformer — 低光增强
+垂直任务特化基座 (4)
+  ├─ CodeFormer         : 人像盲复原（离散代码本先验 + 可调保真度）
+  ├─ BasicVSR++         : 视频超分（双向时序循环 + 二阶对齐）
+  ├─ RIFE               : 视频帧插值（中间流实时估计）
+  └─ Retinexformer      : 低光增强（Retinex 物理先验 + 光照引导 Transformer）
 ```
 
-9 个模型，每个代表一种思路。其中 SUPIR 与 OSEDiff/TSD-SR 是同一扩散派的两个工程位面 - 前者 50 步追极致质量，后者 1 步推产品落地。
+上述 9 个基座模型构成工程落地的核心支柱，而状态空间（Mamba）、全能复原、DiT 架构与单步扩散等 2026 前沿分支则作为演进脉络协同展开。
 
-这份 9 个模型的名单是"默认从这里选"的工程主力。除此之外，2024 年下半年以来成形的几条新主线（状态空间 / Mamba、全能复原 / 指令式复原、DiT 复原、单步扩散 SR、视频扩散复原）会在对应小节里接进来。它们目前更多是"必须知道、值得跟踪"的走向，还没有整体取代上面这 9 个的部署地位；换句话说，这一章的组织方式是"以 9 个主力为骨、以 5 条新线为脉"。
+## 18.1.1 演进脉络：从卷积三层到单步扩散
 
-## 18.1.1 时间线：从 SRCNN 到单步扩散
-
-把过去十年低层视觉的关键节点拉成一条时间线，能看到一个清晰的多段演化：2014-2020 是判别式派的天下，从 SRCNN 到 SwinIR 是网络架构的演进；2021 以后真实退化建模（Real-ESRGAN）和扩散派（StableSR / DiffBIR / SUPIR）分庭抗礼；2024 起单步蒸馏让扩散派第一次具备生产部署条件，与此同时低层视觉又同时长出三条新线：状态空间 / Mamba 架构、全能复原 / 指令式复原，以及从 UNet 迁向 DiT（SD3 / FLUX / PixArt）的扩散复原。到 2025-2026 年，这些线各自往前推进，真实退化视频的复原也整体转向扩散与 DiT。
+低层视觉技术的发展经历了清晰的阶段性演进：
+- 2014-2020 年：从 SRCNN 到 RCAN，聚焦于深层残差、密集连接与通道注意力的网络结构探索；
+- 2021-2023 年：真实退化建模（Real-ESRGAN）与大容量 Transformer（SwinIR / HAT / Restormer）确立了判别式复原的主导地位；
+- 2023-2024 年：预训练文生图先验全面注入超分辨率任务（SUPIR、DiffBIR），生成画质大幅跃升但受困于多步采样延迟；
+- 2024-2026 年：单步蒸馏技术打通扩散生产链路，Mamba 状态空间架构提供线性复杂度新范式，DiT 主干与全能指令式复原重塑前沿技术版图。
 
 ```mermaid
 timeline
-    title 低层视觉 SOTA 时间线
+    title 低层视觉 SOTA 演进时间线
     2014 : SRCNN<br/>三层卷积开山
     2017 : EDSR<br/>深度残差去 BN
     2018 : ESRGAN / RCAN<br/>GAN 派 + 通道注意力
@@ -102,18 +86,14 @@ timeline
     2026 : SeedVR2<br/>一步扩散从图像走到视频
 ```
 
-这条时间线的几个观察值得记住：
+工程启示：
+1. **纯结构创新的边际收益递减**：单一依靠增加网络层数带来的 PSNR 增益已趋于平缓；
+2. **数据流形建模是性能质变的根本**：以 Real-ESRGAN 为代表的高阶退化合成，解决了模型在真实开放域的泛化问题；
+3. **单步蒸馏抹平了生成派的落地鸿沟**：通过将多步迭代先验浓缩至单步前向推理，扩散模型首次满足了亚秒级工业部署要求。
 
-1. **架构创新的边际收益在递减**：从 SRCNN 到 SwinIR 是网络层数和 attention 形态的探索，每一代的 PSNR 涨幅约 0.5-1 dB；2021 之后单纯的架构改进很少超过 0.2 dB。
-2. **数据创新的边际收益在上升**：Real-ESRGAN 把"训练-推理失配"从 3-5 dB 的鸿沟收回，这是单纯换网络做不到的。这与第 1.7 节呼应。
-3. **生成式派从"研究"到"生产"花了大约 4 年**：DDPM 在 2020 年提出，到 2024 年单步蒸馏才让它真正能进生产 pipeline。
-4. **DiT 主干替换已经落地为具体工作**：SDXL 主导了 2023-2024 的扩散派 SR，此后主干开始从 UNet 迁向 DiT。到 2024 年底，DreamClear（基于 PixArt 这一代 DiT）已经证明高容量 DiT 能撑起真实复原，2025 起又有基于 FLUX 的复原工作。换句话说，"DiT 复原还缺一个标志性成果"这个 2024 年中的判断已经被推翻，只是它的部署生态仍落后 UNet 派一到两代。
-5. **架构谱系从两条主线变成三条主线**：卷积与注意力之外，状态空间模型（Mamba）以线性复杂度另起一支，MambaIR、MambaIRv2 在超分 benchmark 上已经能与注意力互有胜负，成为值得单独跟踪的第三条架构分支。
-6. **"一个模型吃多种退化"与"单步扩散进视频"同时成形**：从 PromptIR 到 InstructIR，全能复原与指令式复原把"先判别退化、再选专用模型"的传统 pipeline 压进一张网络；与此同时，SeedVR2 这类工作在 2026 年把图像那边的"单步扩散"思路搬到了真实退化视频上。
+## 18.1.2 质量与延迟权衡象限
 
-## 18.1.2 速度-质量权衡象限
-
-另一个对选型最直接有帮助的视角是把候选模型放进"速度-质量"二维平面。质量用主观/NR-IQA 评分（横轴），速度用 1080P 单张推理时间（纵轴，越小越快）。落在不同象限的模型对应不同的产品定位：
+将候选模型映射至“主观感知质量 × 单图推理耗时”的二维坐标系中，可清晰界定不同模型的业务定位：
 
 ```mermaid
 graph LR
@@ -146,674 +126,364 @@ graph LR
     style Q4 fill:#ffebee
 ```
 
-读这张图的几个工程结论：
+- **象限 I（工业交付首选区）**：由单步扩散（OSEDiff / TSD-SR）与经典判别模型（Real-ESRGAN、BasicVSR++、RIFE）占据，兼备优秀画质与亚秒级响应；
+- **象限 II（离线极致计算区）**：SUPIR、DreamClear 等高容量多步模型适用于无严格时延限制的高端后期处理；
+- **象限 III（端侧嵌入式部署区）**：轻量化 NAFNet、SwinIR-Light 满足移动端 SoC 实时运行要求。
 
-- **象限 I 是产品理想区**：2025 年起，扩散派单步蒸馏（OSEDiff / TSD-SR）和真实退化派（Real-ESRGAN）共同占据这个区域。开新项目时默认从这里选。
-- **象限 II 是离线极致区**：当延迟约束被放松（电影后期、出版印刷、高端用户的"批量处理"模式），SUPIR / VRT 仍然有不可替代的质量上限。
-- **象限 III 是端侧主流区**：手机 / 嵌入式部署的事实标准，质量低于象限 I 但能在手机 SoC 上实时跑。
-- **象限 IV 是要避免的区域**：质量没到极致、速度又不快的模型基本会被同代竞品挤掉，是"换 SOTA"的首要候选。
-- **多步扩散到单步扩散是从象限 II 跳到象限 I**：这是 2024-2025 年最重要的工程位移，OSEDiff / TSD-SR / SinSR 的核心价值就在这次跨象限跳跃。
+## 18.2 SUPIR：大容量扩散模型离线高保真增强
 
-## 18.2 SUPIR：扩散派创意放大
+### 核心原理
 
-### 核心思路
-
-把 SDXL（2.6B 参数文生图模型）的生成能力**拼接到 SR 任务上**：
-
-```
-LR Image
-  ↓ ControlNet 注入
-  ↓ SDXL UNet (frozen) + ZeroSFT 调制
-  ↓ LLaVA 自动生成 prompt 作为文本条件
-  ↓ Restoration-Guided Sampling
-HR Image (创意丰富)
-```
-
-### 一句话记住
-
-"用文生图大模型的世界知识，给一张烂图猜出最合理的高清版"。
-
-### 何时用
-
-- **严重退化的老照片**（人脸糊、纹理丢失）
-- **追求视觉真实感的应用**（艺术放大、自媒体修复）
-- **可以接受 5-10 秒/张推理**
-
-### 何时别用
-
-- 需要严格保真（法医、监控）
-- 需要实时（视频、直播）
-- 端侧部署
-
-### 关键参数
-
-```python
-{
-    'num_inference_steps': 50,      # 默认 50
-    'guidance_scale': 7.5,          # CFG 强度
-    'control_scale': 0.7,           # ControlNet 强度
-    's_stage1': -1,                 # 自适应噪声起点
-    'restoration_guidance': True,   # 使用 restoration-guided sampling
-}
-```
-
-### 当前位置
-
-2024 年扩散派 SR 的代表标杆。2025-2026 年方向往**单步 / 少步扩散**走：OSEDiff、TSD-SR、PiSA-SR、InvSR、AdcSR 等**一步或少步出图**的工作把扩散派从数十步推理降到一到几步，质量向 SUPIR 一档看齐而速度提升一两个数量级。需要澄清的是，这些工作并不是 SUPIR 的直接后代（它们各自基于 SD2.1、SD3、ResShift 等不同基座），而是同一"扩散派 SR"大方向下并行的高效化路线。生产环境如果开始一个新项目，应该先看这些高效后续，而不是直接上完整的 SUPIR。与此同时，追极致质量的离线场景里，DiT 复原（DreamClear 一类）也提供了 SUPIR 之外的另一个高容量选项。
-
-### 论文与代码
-
-- 论文：Yu et al. "Scaling Up to Excellence: Practicing Model Scaling for Photo-Realistic Image Restoration In the Wild"（方法名 SUPIR，CVPR 2024）
-- 代码：[github.com/Fanghua-Yu/SUPIR](https://github.com/Fanghua-Yu/SUPIR)
-- 并行的高效化路线（非 SUPIR 后代）：OSEDiff（NeurIPS 2024）、TSD-SR / PiSA-SR / InvSR / AdcSR（CVPR 2025）等
-
-## 18.3 Real-ESRGAN：真实退化建模派
-
-### 核心思路
-
-和 ESRGAN 相比，**网络几乎没变**（仍是 RRDB），**贡献全在数据**：
-
-- 二阶退化 pipeline（第 5 章 5.4 节）
-- 复杂噪声合成（高斯 + 泊松 + 真实传感器）
-- sinc 滤波模拟过锐化伪影
-
-### 一句话记住
-
-"同样的网络，让训练数据见到真实世界的退化分布，效果质变"。
-
-### 何时用
-
-- **生产环境的通用增强**：平衡质量、速度、稳定性
-- **不能接受 GAN 编造**（虽然 Real-ESRGAN 也用 GAN 损失，但比扩散保守得多）
-- **需要在普通 GPU / 端侧跑**
-
-### 何时别用
-
-- 严重退化（扩散派更合适）
-- 极轻量端侧（用蒸馏版 Real-ESRGAN-Mini）
-
-### 当前位置
-
-是工业界增强模型的事实标准。Topaz Photo AI、剪映、各种修图 App 底层都基于 Real-ESRGAN 或它的变体。
-
-### 论文与代码
-
-- 论文：Wang et al. "Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data" (ICCVW 2021)
-- 代码：[github.com/xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
-
-## 18.4 HAT：Transformer 非扩散派 SOTA
-
-### 核心思路
-
-在 SwinIR 基础上**加更多 attention 模块**，提升模型利用输入信息的能力：
-
-- Window Self-Attention (W-MSA + SW-MSA) — 继承 SwinIR
-- **Channel Attention Block (CAB)** — 加 RCAN 风格通道注意力
-- **Overlapping Cross-Attention Block (OCAB)** — 跨窗口直接交换
-
-### 一句话记住
-
-"把 Transformer 的容量挖到极限，是当前 PSNR 派的天花板"。
-
-### 何时用
-
-- **学术 benchmark 比赛**（PSNR/SSIM 优先）
-- **需要客观保真**且能接受较慢推理
-- **作为知识蒸馏的教师**（用 HAT 蒸馏出小模型）
-
-### 何时别用
-
-- 真实退化场景（HAT 在 bicubic 退化上训，对真实退化不鲁棒）
-- 实时应用
-- 资源受限
-
-### 关键数字
-
-- HAT-L 在 Set5 4× 上 **约 33.0–33.4 dB**（视训练设置/是否 ImageNet 预训练）
-- 参数量 ~40M
-- 推理：单张 256×256 在 A100 ~80ms
-
-### 当前位置
-
-PSNR-导向 Transformer SR 的代表 baseline。**不是当前唯一 SOTA**：2024-2025 年 DRCT、Hi-IR、ATD 等模型在多个 benchmark 上与 HAT 互有胜负，与此同时状态空间 / Mamba 路线（MambaIR、MambaIRv2，见下一小节）也在同一批超分 benchmark 上加入竞争，在质量上与注意力互有高下。但 HAT 仍是教学、蒸馏教师、对比基准的好选择。生产环境用得不多，因为这个领域的"工程上限"和"benchmark 上限"是两回事。
-
-### 论文与代码
-
-- 论文：Chen et al. "Activating More Pixels in Image Super-Resolution Transformer" (CVPR 2023)
-- 代码：[github.com/XPixelGroup/HAT](https://github.com/XPixelGroup/HAT)
-
-## 18.4.1 状态空间 / Mamba：与注意力竞争的架构分支
-
-前面从 SRCNN 一路讲到 HAT，架构的主线一直在"卷积"和"注意力"两条路之间摆动。2024 年前后，低层视觉多出了第三条值得认真对待的架构分支：状态空间模型（State Space Model，简称 SSM），其中最有代表性的是 Mamba。
-
-要理解它为什么被引进来，先回到注意力的老问题。自注意力（self-attention）对一张图里的每个位置都要和其它所有位置两两算相关，计算量随像素数成平方增长，处理高分辨率图时显存和时间都相当紧张。Restormer 之所以把注意力搬到通道维，正是为了绕开这条平方复杂度。状态空间模型给了另一条出路：它把二维图像展开成序列，用一个可以随位置滑动、带隐状态的线性扫描来传递全局信息，复杂度随序列长度线性增长。换句话说，它想同时拿到"全局感受野"和"线性开销"这两样通常互相冲突的东西。
-
-把这条思路落到图像复原上的代表工作，是 MambaIR（Mamba for Image Restoration，ECCV 2024）。它给出了一个基于状态空间模型的复原骨干，在超分等任务上以相近甚至更省的算力，做到了和 SwinIR 一档乃至更好的质量。它的续作 MambaIRv2（CVPR 2025）针对纯序列扫描"只能沿扫描方向看"的局限，补上了类似注意力的非因果建模能力，让远处但相似的像素也能直接互相参照，在经典超分与轻量超分上都进一步逼近甚至超过了 HAT 一档的 Transformer。与此同时，这条线还生出若干分支：VMambaIR 用二维视觉扫描来处理图像，RetinexMamba 则把状态空间模型接到低光增强的 Retinex 框架上。
-
-需要对它的位置有一个清醒的判断。到 2026 年年中，Mamba 路线在学术 benchmark 上已经能和注意力正面较量，是一条必须知道、值得跟踪的架构分支；但在工程部署上，它的算子生态（尤其是各推理引擎对选择性扫描核的支持）还远不如卷积和注意力成熟。归根结底，它现在的价值更多在"架构可能性"这一侧，离 Real-ESRGAN、HAT 那种"随手就能部署"还有一段距离。
-
-## 18.5 Restormer：去噪 / 去模糊 / 去雨的 U-Net Transformer
-
-### 核心思路
-
-第 7 章 7.5 节讲过 MDTA（Multi-Dconv Head Transposed Attention）：把 self-attention 从空间维搬到通道维，复杂度从 $O(N^2)$ 降到 $O(C^2)$，对大图友好。配上 GDFN（Gated-Dconv Feed-Forward Network），整体是 4 层 U-Net 结构：
+将 26 亿参数的 SDXL 文生图主干先验与图像复原任务深度融合：
+- 采用 ControlNet 提取低质图像的多尺度空间条件；
+- 利用 ZeroSFT 零初始化空间特征调制层将先验注入冻结的 SDXL 主干；
+- 引入 LLaVA 多模态大模型实时为输入图生成细粒度文本 Prompt；
+- 配合保真度引导采样（Restoration-Guided Sampling）约束扩散轨迹。
 
 ```
-Input
-  ↓ Encoder (4 levels of MDTA + GDFN)
-  ↓ Latent (深层 MDTA + GDFN)
-  ↓ Decoder (4 levels, with skip connections)
-Output
+输入低质图像
+  ↓ ControlNet 空间特征提取
+  ↓ SDXL UNet（冻结权重）+ ZeroSFT 空间调制
+  ↓ LLaVA 自动生成文本提示词注入语义条件
+  ↓ Restoration-Guided Sampling 多步去噪积分
+输出高清晰度重构图像
 ```
 
-不同任务用同一架构，只换训练数据：高斯/真实噪声去噪、运动去模糊、失焦去模糊、去雨。
+### 适用场景与边界
 
-### 一句话记住
+- **适用**：严重退化的历史老照片修复、艺术插画高倍率超分、可容忍数秒级离线渲染的业务；
+- **禁忌**：毫秒级实时系统、对虚构细节零容忍的安防与医学取证；
+- **典型配置**：采样步数 50 步，CFG 引导系数 7.5，ControlNet 强度 0.7。
 
-"通道维 attention + 多任务通用 U-Net backbone，**SR 之外**所有底层视觉的事实标准 baseline"。
+## 18.3 Real-ESRGAN：真实退化建模工业基准
 
-### 何时用
+### 核心原理
 
-- **去噪**（高斯、真实传感器、合成噪声）
-- **去模糊**（运动、失焦）
-- **去雨 / 去雾 / 去摩尔纹**
-- **大图推理**（MDTA 显存友好，1080P 单张可整图过模型）
-- **视频底层任务的单帧 baseline**（接 BasicVSR++ 的对比）
+在网络拓扑保持 RRDB 结构稳定的前提下，将核心创新完全倾注于**高阶退化合成数据流（Higher-Order Degradation Pipeline）**：
+- 级联多次模糊、下采样、噪声注入与有损压缩；
+- 引入振铃与过冲滤波（Sinc Filter）模拟数字图像过度锐化伪影；
+- 建立与真实相机传感器特性一致的泊松-高斯混合噪声分布。
 
-### 何时别用
+### 适用场景与边界
 
-- **纯 SR**（HAT / SwinIR / DRCT 在 SR benchmark 上更强；Restormer 不是为 upsampling 设计的）
-- **极轻量端侧**（推理偏慢，参数 ~26M，需要蒸馏）
-- **任务里包含放大**（要么改成 Restormer + sub-pixel head，要么直接选 SR 派）
+- **适用**：通用在线图像增强服务、要求高吞吐且需杜绝严重生成幻觉的业务流水线；
+- **禁忌**：信息完全缺失的极端极小图放大；
+- **工程地位**：当前各主流修图软件与云端批处理流水线的工业事实标准。
 
-### 关键数字
+## 18.4 HAT：混合注意力机制的 PSNR 标杆
 
-- GoPro 去模糊：32.92 dB / 0.961 SSIM
-- SIDD 真实去噪：40.02 dB / 0.960 SSIM
-- 参数量 ~26M
-- A100 上 256×256 推理 ~50ms
+### 核心原理
 
-### 当前位置
-
-2022 至 2026 年**去噪/去模糊/去雨的事实标准 baseline**：任何一篇底层视觉论文做这三个任务必须和 Restormer 比。MDTA 模块本身被后续大量工作沿用（包括视频派和扩散派的部分实现）。**HAT 是 SR 派代表，Restormer 是 restoration 派代表**，两者的位置不冲突，工程上常常同时部署（一个管 deblur/denoise，一个管 upsample）。
-
-后续工作如 GRL、X-Restormer、PromptIR 在某些 benchmark 上略胜，但没有一个把 Restormer 完全替掉。
-
-### 论文与代码
-
-- 论文：Zamir et al. "Restormer: Efficient Transformer for High-Resolution Image Restoration" (CVPR 2022)
-- 代码：[github.com/swz30/Restormer](https://github.com/swz30/Restormer)
-
-## 18.5.1 全能复原与指令式复原：一个模型吃多种退化
-
-Restormer 的做法是"一套架构、每个任务单独训一份权重"：去噪一份、去模糊一份、去雨一份。这在工程上意味着，产品要先判断输入图坏在哪里，再把它路由到对应的模型。2023 年以后，一条新的思路开始挑战这套流程：能不能训一个模型，让它同时应对多种退化，甚至让用户用一句话告诉它要修什么？这就是"全能复原"（all-in-one restoration）与"指令式复原"（instruction-based restoration）。
-
-最早把这件事做清楚的代表之一是 PromptIR（Prompting for All-in-One Image Restoration，NeurIPS 2023）。它在复原网络里插入一组可学习的"提示"（prompt），这些提示会根据输入图自动编码出"这是哪一类、哪种程度的退化"，再回过头去动态调制复原过程。于是同一套权重就能在去噪、去雨、去雾之间自适应切换，而不需要外面先挂一个退化分类器。
-
-沿着这条线往前，InstructIR（High-Quality Image Restoration Following Human Instructions，ECCV 2024）把条件从"模型自己猜的提示"换成"人写的自然语言指令"。用户给一张退化图，再给一句话，比如让它去噪、去模糊、提亮或去雨，模型据此在多种复原任务之间选择并执行。它是较早一批用人类文字指令统一驱动复原的工作，把"先判别退化、再选专用模型"这条传统 pipeline 压进了单一网络。与此同时，还有几条相关的支线：DA-CLIP（Degradation-Aware CLIP，退化感知的 CLIP）借视觉-语言模型的表示来感知退化类型，AutoDIR（ECCV 2024）走"自动检测退化、再统一复原"的路线，DiffUIR 则把这套"一个模型吃多种退化"的思路放进扩散框架。
-
-这条线和本书反复讲的"退化 pipeline"主题是直接对话的关系。前面的章节强调，真实世界的退化是多种因素叠加的，产品往往要串起去噪、去模糊、超分等多级处理；全能复原试图把这种串联收进一个模型，指令式复原则把"修哪一处、修到什么程度"交回给用户或上层系统去表达。需要提醒的是，到 2026 年年中，全能复原在"每个单任务上都做到专用模型的水准"这件事上仍有折中：它换来的是部署与维护的简化，代价常常是在某个具体退化上略逊于为它量身训练的专用模型。于是它更适合"退化种类多、又不想维护许多套模型"的产品，而不是"只做一件事、且要把这件事做到极致"的场景。
-
-## 18.6 OSEDiff / TSD-SR：单步与少步扩散 SR
-
-### 核心思路
-
-完整扩散 SR（如 SUPIR）50 步推理 5-10 秒/张，**生产落地的最大障碍是延迟**。2024-2025 年单步扩散蒸馏把这条路打通：
+在 SwinIR 局部窗口自注意力基础上引入多尺度特征重组：
+- 结合局部窗口自注意力（W-MSA）与移位窗口自注意力（SW-MSA）；
+- 引入通道注意力块（CAB）捕捉全局跨通道相关性；
+- 引入重叠交叉注意力块（OCAB）直接打通跨窗口信息交互，大幅扩展有效激活像素（Effective Receptive Field）。
 
 ```
-LR Image
-  ↓ VAE encode（一次）
-  ↓ Pre-trained UNet (LoRA finetuned for SR)
-  ↓ One forward pass, no iterative denoising
-  ↓ VAE decode
-HR Image
+输入浅层特征
+  ↓ 深度混合注意力组（HAB）
+  ├─ Window Attention 捕获局部上下文
+  ├─ Channel Attention 建模全局通道权重
+  └─ Overlapping Cross-Attention 打通跨窗口信息流
+  ↓ 亚像素卷积（PixelShuffle）
+输出超分辨率重构图像
 ```
 
-蒸馏目标：让学生网络在任意噪声水平下，**一步**预测干净的 $x_0$。配合 score distillation / variational score distillation / target score distillation 等损失。
+### 适用场景与边界
 
-### 代表方法
+- **适用**：客观保真度优先的学术基准评测、作为教师模型指导小模型知识蒸馏；
+- **禁忌**：开放域未知退化输入（默认权重基于理想 Bicubic 退化训练，对复杂真实噪声鲁棒性有限）。
 
-单步 / 少步扩散 SR 在 2024 到 2025 年之间迅速细分成数支，值得分别记住它们的基座与卖点：
+## 18.4.1 状态空间模型（Mamba）：线性复杂度的架构探索
 
-- **OSEDiff**（One-Step Effective Diffusion，NeurIPS 2024）：以变分得分蒸馏（Variational Score Distillation，VSD）训出单步学生，基座是 SD2.1-base（约 8 亿多参数），用 VAE 编码的低清图当初始，是这条线里被引用最多的起点之一。
-- **SinSR**（CVPR 2024）：不是从大文生图模型蒸馏，而是在高效扩散 SR 方法 ResShift 的基础上做单步蒸馏，路线上和 OSEDiff 并不同源。
-- **TSD-SR**（Target Score Distillation，CVPR 2025，arXiv 见于 2024 年底）：提出针对 SR 的目标得分蒸馏（TSD，目标得分蒸馏），基座换成了更新一代的 SD3（MM-DiT 主干），追求单步下更真实的细节。
-- **PiSA-SR**（Pixel-level and Semantic-level Adjustable SR，CVPR 2025）：在预训练 SD 上学两个 LoRA，一个管像素级保真、一个管语义级细节，推理时给两个可调旋钮，让用户在保真与细节之间自行权衡。这一点和本书反复讲的"让用户调 fidelity"主题几乎是同一件事，值得单独记住。
-- **InvSR**（Arbitrary-steps Image Super-resolution via Diffusion Inversion，CVPR 2025）：走"扩散反演"（diffusion inversion）的路子，把复原起点放在反演得到的中间噪声上，从而支持任意步数，兼顾单步的快和多步的可调。
-- **AdcSR**（CVPR 2025）：把已经单步化的扩散 SR 再做一轮对抗式压缩，得到一个更小更快的单步生成器，质量仍向 SUPIR 一档看齐。
-- **S3Diff、DFOSD** 等：分别从"退化引导的单步扩散"和"免蒸馏的单步扩散"等角度，继续压缩步数与训练成本。
+自注意力机制的计算开销与特征空间分辨率呈二次方关系（$O(N^2)$），在大尺寸图像推理中带来显著的显存与计算瓶颈。2024 年以来，基于选择性状态空间模型（SSM）的 Mamba 架构被引入图像复原领域：
+- **MambaIR**：将二维图像展平为序列，利用具有输入自适应选择机制的状态转移方程实现全局长程上下文建模，将计算复杂度降低至与像素数严格呈线性关系（$O(N)$）；
+- **MambaIRv2**：针对单向序列扫描无法非因果全局交互的局限，结合对称双向扫描与自适应注意力机制，在经典超分与轻量超分任务上全面比肩甚至超越顶尖 Transformer 模型；
+- **工程现状**：在学术 Benchmark 上展现出优异的能效比，但在工业部署中针对选择性扫描算子（Selective Scan Kernel）的推理加速生态仍在持续演进中。
 
-### 一步扩散 vs 多步扩散：直觉与权衡
+## 18.5 Restormer：通用底层视觉 U-Net Transformer
 
-一步扩散看起来"违反直觉" - 扩散模型的核心论证就是把困难的一步生成拆成上千步小步，怎么又能压回一步？关键在于"蒸馏的对象不是采样过程，而是教师网络在不同噪声水平下的得分函数"。学生网络学的是：给定任意噪声水平和噪声样本，直接预测出最终的清晰图。这不是替代多步扩散的数学合理性，而是用一个更大的模型在更窄的输入分布上做更困难的任务，把"困难度预算"从迭代次数搬到模型容量。
+### 核心原理
 
-在 SR 任务里这件事尤其合理 - 输入 $y$ 给了模型一个非常强的条件信号（不像无条件文生图那样从纯噪声出发），所以解空间已经被挤窄到一个相对低维的流形。一步逼近这个流形的中心是可行的，多步并没有带来质的提升，只是平滑了样本周围的小扰动。这就是为什么 OSEDiff / TSD-SR 在 SR 上能达到甚至超过多步基线，但同样的蒸馏路线在文生图上仍要保留 4-8 步才能保住质量 - SR 的条件信息密度远高于纯文生图。
-
-工程上的权衡可以总结成一句话：**多步扩散是用时间换质量的旋钮，单步扩散是用模型容量换时间的固定选择**。前者灵活（推理时可以根据用户档位调节步数）但慢；后者快但失去步数调节自由度（要做"质量档"只能切到另一个模型）。生产系统多数选后者，并在用户的"高质量模式"按钮下保留一个多步扩散模型作为备选。
-
-### 一句话记住
-
-"扩散派从 50 步到 1 步，让 SUPIR 路线第一次能进生产环境"。
-
-### 何时用
-
-- **生产环境扩散派 SR**：2025 年起的默认选择
-- **实时 / 准实时增强**（< 1 秒/张）
-- **对 SUPIR 视觉质量满意但延迟不能接受**的场景
-
-### 何时别用
-
-- **极端退化 + 创意优先**（完整 SUPIR 仍偶有微弱质量优势，工业仍可保留作为离线处理选项）
-- **严格保真**（扩散派的"猜"本质没变，只是更快了，不适合法医/监控）
-
-### 关键数字
-
-这条线的量化对比在不同论文里口径差异很大，这里只给方向性的判断，具体分数以各自论文为准：
-
-- **推理步数与延迟**：从 SUPIR 的数十步压到 1 步（OSEDiff、TSD-SR、PiSA-SR、AdcSR）或少数几步（InvSR 可按需要选步数），延迟因此降到亚秒级，相对完整多步扩散是一两个数量级的提速。
-- **基座与体积**：这一点很容易记错，值得强调。OSEDiff、PiSA-SR 这一支的基座是 SD2.1-base（约 8 亿多参数的 UNet），TSD-SR 换的是 SD3 的 MM-DiT 主干，二者都不是 SDXL。所以按 SDXL 规模去估"量化后要好几 GB"是偏大的：真实体积取决于所挂基座，SD2.1-base 这一支明显小于 SDXL 派，AdcSR 更是刻意把网络压小，进一步降低了部署体积。
-- **质量**：在真实退化超分上，这些单步方法的感知质量与无参考质量已经能与多步基线打平，部分指标互有胜负；用"质量接近、速度大幅领先"来概括，比引用某个具体小数更稳妥。
-
-### 当前位置
-
-**2025-2026 年扩散 SR 工程主流**。SUPIR 仍是研究/教学的"完整版"标杆，但开新项目应当**默认从单步 / 少步蒸馏路线开始**。这条线被低估的工程价值在于：扩散派第一次具备了取代 Real-ESRGAN 在通用增强工作流中的延迟条件。到 2025 年，它内部还进一步分化出"可调档"的一支（PiSA-SR 用两个 LoRA 分别控制保真与细节，InvSR 用反演支持任意步数），把上一节讲过的"多步是旋钮、单步是固定选择"这个权衡又拉回了一部分灵活度。追极致质量的离线场景则可以看 DiT 复原（见下一小节）。
-
-### 论文与代码
-
-- OSEDiff：Wu et al. "One-Step Effective Diffusion Network for Real-World Image Super-Resolution"（NeurIPS 2024），基座 SD2.1-base，[github.com/cswry/OSEDiff](https://github.com/cswry/OSEDiff)
-- SinSR：Wang et al. "SinSR: Diffusion-Based Image Super-Resolution in a Single Step"（CVPR 2024），蒸馏自 ResShift
-- TSD-SR：Dong et al. "TSD-SR: One-Step Diffusion with Target Score Distillation for Real-World Image Super-Resolution"（CVPR 2025），基座 SD3
-- PiSA-SR：Sun et al. "Pixel-level and Semantic-level Adjustable Super-resolution: A Dual-LoRA Approach"（CVPR 2025）
-- InvSR：Yue et al. "Arbitrary-steps Image Super-resolution via Diffusion Inversion"（CVPR 2025）
-- AdcSR：CVPR 2025 的对抗式压缩单步 SR；S3Diff、DFOSD 等为同期其它单步方案
-
-## 18.6.1 DiT 复原：从 UNet 主干走向 Diffusion Transformer
-
-前面讲的扩散 SR，无论 SUPIR 还是 OSEDiff，主干都还是 Stable Diffusion 那一代的 UNet。2024 年起，文生图基模本身开始更新换代：SD3、FLUX、PixArt 这一代把主干从 UNet 换成了 Diffusion Transformer（扩散式 Transformer，简称 DiT），也就是把扩散过程放到一个 Transformer 主干上跑。复原研究自然跟着往这个方向走。
-
-需要先纠正一个到 2024 年中还常见、但已经过时的判断：曾有说法认为"DiT 复原还没有出现 SUPIR 那种级别的标志性工作"。这个判断在 2024 年底就被推翻了。DreamClear（High-Capacity Real-World Image Restoration，NeurIPS 2024）就是那件标志性工作：它以 PixArt 这一代的 DiT 为主干，配合多模态大模型给出的语义理解，做高容量的真实世界复原，并且专门搭了一条注重隐私安全的大规模数据构建流程，来为这么大的模型准备足够的训练数据。换句话说，它证明了高容量 DiT 主干确实能撑起真实复原这件事，而不只是文生图。
-
-进入 2025 年，这条线继续沿着更新的基模往前走，出现了以 FLUX 为基座的复原工作。归根结底，DiT 复原到 2026 年年中还处在"基座在换代、方法在跟进"的阶段：它的质量上限被看好，但生态成熟度（可用的开源实现、部署工具链）仍落后 UNet 派一到两代。于是对大多数产品来说，它现在是"值得跟踪、择机尝试"，而不是"立刻换上生产线"。另外要留意的是，第 9 章提示过，DiT 主干的条件注入方式和 UNet 时代并不一样：UNet 靠复制 encoder、往 skip 上加、替换 conv_in，而 DiT 通常是把控制信息拼成 token 进序列，或者走专门的 conditioning block。把 UNet 时代的 ControlNet 机制直接照搬到 DiT 上，往往并不成立。
-
-## 18.7 CodeFormer：人脸修复
-
-### 核心思路
-
-把人脸的局部特征**离散化**为 codebook 里的若干 code，通过 Transformer 预测 code 序列：
+采用多转置注意力模块（MDTA，Multi-Dconv Head Transposed Attention）与门控前馈网络（GDFN）：
+- 将自注意力计算由空间维度映射至通道维度，计算复杂度由 $O(N^2)$ 大幅削减至 $O(C^2)$，原生支持高分辨率大图整图推理；
+- 采用 4 级 U-Net 编码器-解码器拓扑与跨层跳跃连接；
+- 统一网络拓扑，仅通过更换退化训练数据集即可自适应去噪、运动/失焦去模糊与去雨去雾。
 
 ```
-LR Face
-  ↓ Encoder
-  ↓ Transformer (predict discrete code indices)
-  ↓ Codebook lookup
-  ↓ Decoder
-HR Face
+输入退化图像
+  ↓ 编码器（4 级 MDTA 通道注意力 + GDFN 门控卷积前馈网络）
+  ↓ 潜空间瓶颈层（深层多头特征交互）
+  ↓ 解码器（4 级上采样恢复 + 对应层跳跃残差拼接）
+输出高精度复原图像
 ```
 
-外加可调的 `fidelity_weight ∈ [0, 1]`，用户可选"严格保真"还是"充分用先验"。
+### 适用场景与边界
 
-### 一句话记住
+- **适用**：非放大类图像去噪、高动态模糊消除、恶劣天气去雨去雾；大尺寸图像整图处理；
+- **禁忌**：超分辨率任务（原生架构未针对亚像素上采样优化，SR 建议优先选用 HAT 或 Real-ESRGAN）；
+- **工程地位**：去噪与去模糊任务的工业事实标准基准。
 
-"用 VQ codebook 而不是 StyleGAN 给人脸做强先验，可调节 fidelity 是关键工程亮点"。
+## 18.5.1 全能复原与指令引导复原：统一多退化求解范式
 
-### 何时用
+传统流水线通常需要前置退化分类器将样本分流至各自专属的模型（如去噪模型、去模糊模型、去雨模型）。全能复原（All-in-One Restoration）与指令驱动复原探索了单一网络权重自适应统一处理混合退化的新范式：
+- **PromptIR**：在网络内部引入可学习的 Prompt 记忆矩阵，依据输入特征自适应解码退化类型与退化程度，动态调制中间层激活，实现单一模型在去噪、去雨、去雾任务间的无缝自适应切换；
+- **InstructIR**：将控制条件由隐式特征提示升级为自然语言指令（如“去除运动模糊并适度提亮阴影”），通过跨模态注意力机制由用户指令精准引导局部增强强度；
+- **DA-CLIP 与 DiffUIR**：分别引入视觉语言预训练表征与扩散潜空间，进一步提升多任务联合复原的语义感知能力；
+- **工程权衡**：全能模型显著降低了多模型部署与运维开销，但在极限单一指标上略逊于量身特化微调的专用模型，更适用于混合退化复杂的通用消费级应用。
 
-- **任何人脸增强场景**：这是当前事实标准
-- **老照片人脸**（fidelity = 0.5）
-- **视频会议**（fidelity = 0.7，保守不变样）
+## 18.6 OSEDiff / TSD-SR：单步与少步扩散超分辨率
 
-### 何时别用
+### 核心原理
 
-- **法医证据**（不允许编造）
-- **极小人脸**（< 32×32 像素，先验都救不回来）
-
-### 关键参数
-
-```python
-{
-    'fidelity_weight': 0.5,      # 0=纯先验, 1=纯 LR; 默认 0.5 平衡
-    'face_align': True,          # 必须先对齐
-    'crop_size': 512,            # 预训练用 512 输入
-}
-```
-
-### 当前位置
-
-人脸修复的工程标准。GFPGAN 仍在用，但 CodeFormer 的可调性使它在产品中更受欢迎。
-
-### 被谁接班 / 一起用
-
-CodeFormer 走的是"VQ 码本 + Transformer 预测码序列"的判别-生成混合路线，到 2026 年它仍是人脸修复里最稳、最好部署的默认项。与此同时，2023 年以后又长出一条扩散派的盲人脸复原线，值得知道：DifFace 通过把退化误差逐步收缩到扩散轨迹上来复原，PGDiff 用部分引导（partial guidance）让一个通用扩散模型适配多种人脸复原需求，DR2 则先用扩散去除退化、再接一个增强模块。再往后，还出现了把这套扩散人脸复原压到单步的工作。这条线的长处是先验更丰富、对严重退化的想象力更强，短处则和所有扩散派一样：更容易"编"出原图没有的细节，也更重。于是在需要保真、需要可控 fidelity 的产品里，CodeFormer 仍是更稳的默认；扩散派人脸复原更多用在"就是要追求极致观感、且能接受一定虚构"的场景。
-
-### 论文与代码
-
-- 论文：Zhou et al. "Towards Robust Blind Face Restoration with Codebook Lookup Transformer" (NeurIPS 2022)
-- 代码：[github.com/sczhou/CodeFormer](https://github.com/sczhou/CodeFormer)
-- 扩散派盲脸复原：DifFace、PGDiff、DR2 等（2023 起），以及后续的单步扩散人脸复原
-
-## 18.8 BasicVSR++：视频超分
-
-### 核心思路
-
-双向循环 + 二阶传播 + flow-guided DCN（第 14.3 节详谈）：
+多步扩散模型（如 SUPIR）需 50 步反向迭代，高时延阻碍了在线交互部署。2024-2026 年单步扩散蒸馏彻底攻克了该延迟瓶颈：
+- **变分得分蒸馏（VSD）与目标得分蒸馏（TSD）**：训练紧凑的学生网络在任意噪声流形上实现单步前向预测清晰解 $x_0$；
+- **条件流形压缩**：超分辨率任务中低质图像提供了极强的空间几何锚定约束，使得后验解流形相对紧凑，单步直接逼近流形中心在数学上完全可行。
 
 ```
-所有帧的特征
-  ↓ 前向 RNN (二阶传播)
-  ↓ 后向 RNN (二阶传播)
-  ↓ 聚合 (concat + conv)
-  ↓ Upsample
-HR 视频
+输入低质图像
+  ↓ 单次 VAE 潜空间编码
+  ↓ 预训练骨干（LoRA 微调的单步生成器）
+  ↓ 单次前向网络推理（零迭代循环）
+  ↓ 单次 VAE 空间解码
+输出高分辨率真实感图像
 ```
 
-### 一句话记住
+### 代表性前沿演进
 
-"双向循环让每帧能用过去和未来信息，二阶传播绕过光流误差累积"。
+- **OSEDiff（NeurIPS 2024）**：以 SD2.1-base 为基座，基于变分得分蒸馏实现单步超分，推理耗时压减至亚秒级；
+- **SinSR（CVPR 2024）**：在紧凑扩散模型 ResShift 上完成单步蒸馏，显著降低模型参数量；
+- **TSD-SR（CVPR 2025）**：提出针对超分辨率的目标得分蒸馏（TSD），并将基座升级至 SD3 的 MM-DiT 架构；
+- **PiSA-SR（CVPR 2025）**：部署双 LoRA 分支分别控制像素保真度与语义生成丰富度，在单步前向中实现保真度可调；
+- **InvSR 与 AdcSR（CVPR 2025）**：分别基于扩散反演实现任意步数灵活切换，以及通过对抗压缩实现端侧极轻量单步部署。
 
-### 何时用
+### 适用场景与边界
 
-- **VSR 任务**（事实标准）
-- **视频去模糊、视频去噪**（同架构改训练数据）
-- **质量优先 + 不要求实时**
+- **适用**：云端高并发实时超分、兼具扩散生成质感与严格时延要求的消费级产品；
+- **工程地位**：2025 年起扩散超分辨率落地生产的默认技术选型。
 
-### 何时别用
+## 18.6.1 DiT 扩散架构演进：从 UNet 到 Diffusion Transformer
 
-- 实时直播（即使 BasicVSR++ 也太慢，需要蒸馏版）
-- 极端长视频（隐状态累积误差）
+随着基础生成模型的主干全面从卷积 UNet 迁移至 Diffusion Transformer（DiT），图像复原领域亦完成了底层架构的代际升级：
+- **DreamClear（NeurIPS 2024）**：以 PixArt DiT 为主干，结合多模态大模型语义理解，构建高容量真实世界盲复原网络，确立了 DiT 在底层视觉生成上限上的标杆地位；
+- **FLUX 基座复原**：进一步利用大规模整流流（Rectified Flow）与多模态 DiT 架构扩展细节重建能力；
+- **架构机制演变**：DiT 舍弃了传统 UNet 基于 Skip Connection 与卷积拼接的条件注入方式，转而采用 Adaptive LayerNorm、Cross-Attention 或序列 Token 拼接注入退化条件，展现出优秀的参数扩展性。
 
-### 关键数字
+## 18.7 CodeFormer：离散代码本先验人脸盲复原
 
-- REDS4 4× VSR：32.4 dB（前 SOTA EDVR 31.1 dB）
-- 推理：A100 上 ~50ms / 720P 帧
+### 核心原理
 
-### 当前位置
-
-这一点在 2026 年要分两种场景来说。在学术的双三次 / 已知退化 benchmark（例如 REDS、Vimeo-90K）上，BasicVSR++ 到 2026 年仍是绕不开的强基线，双向循环加二阶传播这套设计依旧稳。但如果把镜头对准真实退化视频（老旧影片、压缩严重的网络视频、手机日常拍摄），把 BasicVSR++ 当成"贯穿到 2026 的事实标准"就站不住了：这一侧的前沿在 2024 到 2025 年之间已经明显转向扩散与 DiT，下一小节单独讲。RVRT / VRT 在 PSNR 上比它更高但更慢，属于同一"已知退化"阵营里的更重选项。
-
-### 论文与代码
-
-- 论文：Chan et al. "BasicVSR++: Improving Video Super-Resolution with Enhanced Propagation and Alignment" (CVPR 2022)
-- 代码：[github.com/open-mmlab/mmagic](https://github.com/open-mmlab/mmagic) (MMEditing 内)
-
-## 18.8.1 视频扩散复原：真实退化视频的新前沿
-
-BasicVSR++ 这类循环卷积网络是在"退化已知、且相对温和"的设定下训练与评测的。可真实世界的视频退化往往既复杂又严重，还叠加了压缩伪影和时间上的不稳定。于是从 2024 年起，真实退化视频超分的前沿转到了扩散和 DiT 上，思路和图像那一侧同源：借文生图 / 文生视频大模型的生成先验，去"想象"出被退化抹掉的细节，同时设法抑制扩散天然带来的帧间闪烁。
-
-这条线的代表工作可以串成一条清楚的脉络。Upscale-A-Video（CVPR 2024）把图像扩散先验引入真实退化视频超分，并用局部到全局的时序策略去缓解闪烁。MGLD-VSR（Motion-Guided Latent Diffusion，运动引导的潜扩散，ECCV 2024）用运动信息去约束潜空间扩散，让相邻帧更一致。VEnhancer 则借文生视频模型做统一的时空增强，尤其擅长修正 AI 生成视频的瑕疵。进入 2025 年，STAR 借文生视频模型的时空先验去做真实退化视频超分；ByteDance 的 SeedVR（CVPR 2025 Highlight）把复原直接放到一个大型 DiT 上，主打"任意长度、任意分辨率"的通用视频复原。到 2026 年，它的续作 SeedVR2 进一步把这套 DiT 复原压到一步完成，等于把图像那边"单步扩散"的思路搬到了视频上。
-
-需要保持和上一小节一致的判断：这些扩散 / DiT 方法在真实退化视频上的观感优势是实打实的，但它们普遍更重、对时间一致性的把控也更依赖工程投入。归根结底，到 2026 年年中，"已知退化、要快、要稳"仍然优先 BasicVSR++ 一档；"真实重退化、追求观感、能接受更高成本"才往扩散 / DiT 这条新线上走。
-
-## 18.9 RIFE：帧插值
-
-### 核心思路
-
-不显式估计两端帧间的光流，**直接预测中间帧到两端的光流**：
+将退化人像映射至预训练的离散高质量人脸先验空间：
+- 采用 VQGAN 离散代码本（Codebook）解耦人脸五官流形；
+- 引入 Transformer 预测离散代码索引序列，从根本上杜绝连续特征空间中的模糊与均值化趋势；
+- 提供连续可调的保真度权重参数 `fidelity_weight ∈ [0, 1]`，实现真实原貌与生成细节之间的线性平衡。
 
 ```
-F_t, F_{t+1}
-  ↓ IFNet (Intermediate Flow Net)
-  ↓ flow_to_t, flow_to_{t+1}, fusion_mask
-  ↓ warp F_t with flow_to_t → warped_t
-  ↓ warp F_{t+1} with flow_to_{t+1} → warped_t+1
-  ↓ blend = mask * warped_t + (1-mask) * warped_t+1
-F_{t+0.5}
+输入退化人脸
+  ↓ 编码器提取特征
+  ↓ Transformer 预测离散码本索引序列
+  ↓ Codebook 查找高质量特征基元
+  ↓ 解码器结合浅层跳跃特征重构
+输出高清人像（支持保真度动态调校）
 ```
 
-### 一句话记住
+### 适用场景与边界
 
-"直接预测中间帧到两端的光流，避开中间帧不存在的悖论"。
+- **适用**：人像特化超分辨率、老照片人像修复、视频会议人脸实时美化；
+- **禁忌**：极度欠采样人像（有效面部低于 $16\times 16$ 像素）、严格司法证据鉴定。
 
-### 何时用
+## 18.8 BasicVSR++：双向循环时序视频超分辨率
 
-- **任何帧插值任务**（事实标准）
-- **30 fps → 60 fps、60 fps → 120 fps**
-- **慢动作**（24 fps → 240 fps）
-- **实时插值**（RIFE 在 1080P 上能跑 30 FPS+）
+### 核心原理
 
-### 何时别用
-
-- 超大位移（FILM 更鲁棒）
-- 严重遮挡场景（AMT 更好）
-
-### 关键参数
-
-```python
-{
-    'scale': 1.0,        # 1=4K, 0.5=对 4K 更稳定
-    'tta': False,        # test-time augmentation, 慢但精度高
-}
-```
-
-### 当前位置
-
-帧插值的工程性价比标准。后续工作各有侧重：FILM 强在大位移，AMT（CVPR 2023）以全对相关体加多场光流细化见长，EMA-VFI 引入更强的运动特征提取，GIMM-VFI（Generalizable Implicit Motion Modeling，可泛化的隐式运动建模，NeurIPS 2024）用一个隐式的连续运动场来预测任意时刻的光流，在复杂运动上更稳。与此同时，还有一条把视频扩散 / 生成模型用于插帧的新线，靠生成先验去推断中间帧，在大遮挡、大位移这类传统光流最棘手的场景里更有想象力，代价是更重、也更容易生成不该有的内容。到 2026 年，RIFE 仍是"要快、要稳、要好部署"时的默认，新方法则在质量上限和困难场景上继续推进。
-
-### 论文与代码
-
-- 论文：Huang et al. "Real-Time Intermediate Flow Estimation for Video Frame Interpolation" (ECCV 2022)
-- 代码：[github.com/megvii-research/ECCV2022-RIFE](https://github.com/megvii-research/ECCV2022-RIFE)
-
-## 18.10 Retinexformer：低光增强
-
-### 核心思路
-
-把传统的 Retinex 理论（图像 = 反射 × 光照）和 Transformer 结合：
+通过二阶时序传播与光流引导可变形卷积实现全序列时空对齐：
+- **双向循环传播**：前向与后向 RNN 协同传递历史与未来帧的多尺度特征；
+- **二阶网状传播**：允许特征跨越相邻帧直接引用前第二帧，有效规避光流遮挡累积误差；
+- **光流引导可变形卷积（Flow-guided DCN）**：在特征层实现亚像素精度的非刚体运动补偿。
 
 ```
-Low-light image
-  ↓ 分解为 Reflectance + Illumination (传统 Retinex)
-  ↓ Transformer (Illumination-Guided Transformer)
-  ↓ 合成增强图
-Enhanced image
+视频帧特征序列
+  ↓ 前向二阶循环时序传播
+  ↓ 后向二阶循环时序传播
+  ↓ 多尺度跨时域特征聚合
+  ↓ 亚像素上采样重构
+输出时序一致的高清视频序列
 ```
 
-### 一句话记住
+### 适用场景与边界
 
-"用 Retinex 物理模型作为归纳偏置，让模型重点学反射不变性"。
+- **适用**：视频超分辨率（VSR）、视频去模糊与去噪、广电级高质量片源离线重制；
+- **禁忌**：低延迟实时直播推流（双向结构依赖未来帧缓冲，实时场景需切换至单向因果 BasicVSR-Mini）。
 
-### 何时用
+## 18.8.1 视频扩散复原：真实开放域视频画质跃迁
 
-- **低光照片**（夜景、室内昏暗）
-- **过曝校正**（部分支持）
-- **HDR tone mapping 的辅助**
+面对强压缩与极端退化的真实开放域视频，传统循环卷积网络容易受限于确定性回归均值化。结合扩散先验与时空 DiT 的新范式全面兴起：
+- **Upscale-A-Video 与 MGLD-VSR**：将图像扩散先验与密集光流时序约束结合，有效抑制逐帧采样的闪烁现象；
+- **STAR 与 SeedVR（CVPR 2025）**：利用文生视频大模型的时空生成先验，直接在 DiT 架构上实现任意时长与分辨率的通用视频超分辨率；
+- **SeedVR2（2026）**：进一步将单步扩散蒸馏引入视频 DiT 复原，打通了生成式视频增强的准实时处理链路。
 
-### 何时别用
+## 18.9 RIFE：基于中间流估计的实时视频帧插值
 
-- 噪声主导的极暗场景（< 0.1 lux）：Retinex 假设失效
-- 多光源混合：Retinex 简化了光照模型
+### 核心原理
 
-### 当前位置
-
-低光增强的代表 baseline，到 2026 年仍常被当作对比基准。它之后这几年，低光增强又出现若干条接班线，值得知道：
-
-- **LightenDiffusion**（ECCV 2024）：把 Retinex 分解放进潜空间，再用扩散做无监督的低光增强，属于低光里的扩散派代表。
-- **GLARE**（ECCV 2024）：走"码本检索生成先验"的路子，用正常光照的码本去引导增强。
-- **QuadPrior**（CVPR 2024）：用一组物理先验做零参考（无需成对数据）的低光增强。
-- **RetinexMamba**：把前面讲的状态空间 / Mamba 架构接到 Retinex 框架上，追求线性复杂度下的低光增强。
-- 更早的两条老选择仍可用作对照：LLFormer（Transformer 早期方法）与 SCI（更轻量的 CNN，端侧友好）。
-
-一句提醒：低光这条线到 2026 年整体在往扩散派和物理先验两个方向走，Retinexformer 更像是"稳、轻、好复现"的默认起点，而不是质量天花板。
-
-### 论文与代码
-
-- 论文：Cai et al. "Retinexformer: One-stage Retinex-based Transformer for Low-light Image Enhancement" (ICCV 2023)
-- 代码：[github.com/caiyuanhao1998/Retinexformer](https://github.com/caiyuanhao1998/Retinexformer)
-- 接班线：LightenDiffusion、GLARE（ECCV 2024），QuadPrior（CVPR 2024），RetinexMamba 等
-
-## 18.11 选型决策树
-
-按场景给推荐：
+突破传统双向光流估计必须依赖对称输入的限制，直接端到端预测中间时刻的双向光流场：
+- 利用 IFNet（Intermediate Flow Net）直接估计中间帧指向两端参考帧的光流向量与融合软掩码；
+- 避免了传统光流反向查找（Splatting / Inversion）引入的空洞与遮挡伪影；
+- 算子高度紧凑，在 1080P 分辨率下实现 30+ FPS 实时端侧推理。
 
 ```
-任务是什么?
+输入相邻帧 F_t 与 F_{t+1}
+  ↓ IFNet 直接预测中间时刻光流与融合掩码
+  ↓ 双向逆向映射形变（Backward Warping）
+  ↓ 空间自适应权重融合
+输出平滑自然的插值帧 F_{t+0.5}
+```
+
+### 适用场景与边界
+
+- **适用**：高帧率视频插帧（30 fps 提升至 60/120 fps）、高动态慢动作回放生成、实时显示引擎补帧；
+- **工程地位**：工程部署首选的高性价比实时插帧事实标准。
+
+## 18.10 Retinexformer：物理先验引导的低光照增强
+
+### 核心原理
+
+将经典 Retinex 物理光学模型与 Transformer 自注意力机制紧密结合：
+- 基于物理成像公式将低光图像解耦为反射分量（物体固有属性）与光照分量（环境光强场）；
+- 利用光照引导自注意力模块（Illumination-Guided Transformer）对阴影区域实施非线性增益补偿；
+- 有效保留局部微对比度并抑制暗区噪声放大。
+
+```
+输入暗光退化图像
+  ↓ Retinex 物理空间解耦
+  ├─ 反射图分支（结构与纹理保持）
+  └─ 光照图分支（环境照度场估计）
+  ↓ 光照引导 Transformer 动态交互与增强
+输出明亮通透的高动态范围图像
+```
+
+### 适用场景与边界
+
+- **适用**：夜间摄影提亮、室内逆光阴影拉伸、计算摄影 HDR 色调映射前置处理；
+- **演进分支**：LightenDiffusion（潜空间扩散低光复原）、GLARE（代码本先验引导）、RetinexMamba（线性状态空间低光增强）。
+
+### 18.11 场景驱动的选型决策树
+
+```
+具体工程任务定义
   │
-  ├─ 通用 SR
-  │   │
-  │   ├─ 离线 + 极致质量 + 不限延迟 → SUPIR（多步）或 DiT 复原（DreamClear）
-  │   ├─ 实时扩散派（默认 2025 起）→ OSEDiff / TSD-SR（单步）
-  │   ├─ 想让用户调 fidelity（像素/语义双档）→ PiSA-SR
-  │   ├─ 真实场景 + 工程稳定（CNN/GAN 派）→ Real-ESRGAN
-  │   └─ 学术 benchmark / PSNR 比赛 → HAT 或 MambaIRv2（Mamba 线）
+  ├─ 通用超分辨率（Super-Resolution）
+  │   ├─ 离线批处理 / 追求极致生成质感（不限计算时延）: SUPIR（多步）或 DreamClear（DiT 复原）
+  │   ├─ 云端高并发准实时处理（默认推荐选型）: OSEDiff / TSD-SR（单步扩散）
+  │   ├─ 需支持保真度与语义生成动态解耦调校: PiSA-SR（双 LoRA 架构）
+  │   ├─ 真实退化稳健型流水线（规避生成幻觉）: Real-ESRGAN（CNN-GAN 经典架构）
+  │   └─ 学术比赛 / 客观 PSNR/SSIM 榜单竞争: HAT 或 MambaIRv2（状态空间架构）
   │
-  ├─ 去噪 / 去模糊 / 去雨（不放大）
-  │   ├─ 单任务、要稳 → Restormer  ←─ 默认
-  │   └─ 多种退化混合 / 不想维护多套模型 → 全能复原（PromptIR / InstructIR）
+  ├─ 像素级无放大复原（去噪 / 去模糊 / 去雨）
+  │   ├─ 单一特定退化求解（稳健工程基准）: Restormer（通道注意力 U-Net）
+  │   └─ 复合混合退化 / 统一轻量化部署: PromptIR 或 InstructIR（指令引导全能复原）
   │
-  ├─ 人脸增强
-  │   ├─ 要保真、要可调 fidelity → CodeFormer  ←─ 默认
-  │   └─ 极致观感、可接受一定虚构 → 扩散派盲脸复原（DifFace / PGDiff）
+  ├─ 人脸专项高保真修复
+  │   ├─ 强保真度与身份拓扑可控（工业默认）: CodeFormer（离散代码本先验）
+  │   └─ 艺术级高表现力人像重构（允许适度先验生成）: DifFace 或 PGDiff（扩散人脸复原）
   │
-  ├─ 视频超分
-  │   ├─ 已知退化 / 要快 → BasicVSR++
-  │   ├─ 真实重退化 / 追求观感 → 视频扩散复原（SeedVR / STAR）
-  │   ├─ 实时直播 → 蒸馏版 BasicVSR-Mini + TensorRT
-  │   └─ 离线高质量（已知退化）→ BasicVSR++ 或 RVRT
+  ├─ 视频超分辨率与画质提升
+  │   ├─ 标准已知退化 / 强时序稳定性要求: BasicVSR++（双向二阶传播）
+  │   ├─ 真实重退化老旧视频画质跃迁: SeedVR 或 STAR（视频 DiT 扩散架构）
+  │   └─ 超低延迟直播推流: 蒸馏版因果 BasicVSR-Mini + TensorRT FP16
   │
-  ├─ 帧插值 → RIFE
-  │   ├─ 大位移 → FILM
-  │   ├─ 严重遮挡 → AMT
-  │   └─ 复杂运动 / 任意时刻 → GIMM-VFI
+  ├─ 视频帧率提升与插帧（Frame Interpolation）
+  │   ├─ 实时低延迟推流插帧（工业默认）: RIFE（中间流估计）
+  │   ├─ 剧烈运动与大位移场景: FILM 或 GIMM-VFI
+  │   └─ 复杂遮挡与非刚体形变: AMT
   │
-  ├─ 低光增强 → Retinexformer
-  │   └─ 要更强先验 / 真实重退化 → LightenDiffusion（扩散派）
+  ├─ 低照度画质增强
+  │   ├─ 物理可解释性强 / 计算开销紧凑: Retinexformer（Retinex 物理先验）
+  │   └─ 极限微光重噪声环境: LightenDiffusion（潜空间扩散复原）
   │
-  ├─ 文档增强 → 专用 DocSR + OCR-aware loss (第 10.7 节)
+  ├─ 屏幕截图与文档 OCR 增强
+  │   └─ 字符拓扑严格保真: 专用 DocSR + OCR-aware Loss
   │
-  └─ 端侧实时 → 蒸馏版 NAFNet + CoreML/TensorRT FP16
+  └─ 移动端与嵌入式端侧部署
+      └─ 亚毫秒级低功耗推理: 蒸馏版 NAFNet + CoreML / TensorRT FP16
 ```
 
-## 18.12 学术 SOTA vs 工程 SOTA
+## 18.12 学术基准 SOTA 与工业交付 SOTA 的工程分水岭
 
-最后强调一个反复出现的主题：
+在工业落地评估中需始终牢记以下准则：
 
-> 这一章列的 9 个模型不是"刷分最高的"。
->
-> 它们是**工程上最值得部署**的：平衡了效果、速度、稳定性、可维护性。
+> 学术 Benchmark 优化的核心是平均指标的微小增益；
+> 工业系统工程追求的是**系统鲁棒性、硬件亲和度、极端输入防御能力与长期可维护性**。
 
-学术 benchmark 的 SOTA 经常是：
+学术 SOTA 的典型特征：
+- 在理想退化分布上取得 0.1 至 0.3 dB 的 PSNR 领先；
+- 伴随 5 至 10 倍的算力与显存膨胀；
+- 包含非标准算子，在真实复杂退化分布下极易发生精度坍塌。
 
-- 比 baseline 提升 0.1-0.3 dB
-- 但参数量 / 推理速度 5-10× 差
-- 在真实场景下提升不明显
+工业级基准的核心考量：
+- **流形鲁棒性**：在长尾及异常退化输入下具备优雅退化能力；
+- **跨平台一致性**：在不同硬件后端（NVIDIA CUDA、Apple ANE、Android NPU）间保持数值稳定性；
+- **部署工程性**：原生支持 ONNX 图导出、整网量化（PTQ/QAT）与无缝切块（Tiling）；
+- **代码可维护性**：架构逻辑清晰，便于团队进行特化微调与二次开发。
 
-工程上更看重：
+## 18.13 前沿技术家族延伸索引
 
-- **鲁棒性**（不在常见输入上崩）
-- **稳定性**（不同硬件上结果一致）
-- **可部署性**（能转 ONNX、能量化、能 tile）
-- **可维护性**（有官方代码、有持续维护、有社区）
+为保持技术视野的完整性，下述各前沿代表工作值得作为延伸跟踪资产：
 
-这 9 个模型在这些维度上都是同类最好。
+### 通用超分辨率分支
+- **DiffBIR**：两阶段扩散超分架构（SwinIR 前置去退化 + 冻结 SD 先验注入）；
+- **SeeSR / ResShift**：引入高级语义提示与高效残差转移采样的扩散超分模型；
+- **DRCT / Hi-IR / ATD**：结合密集残差连接与自适应 Transformer 的 PSNR 标杆；
+- **MambaIR / MambaIRv2 / VMambaIR**：线性复杂度的状态空间图像复原架构（见 18.4.1）；
+- **DreamClear 及 FLUX 衍生模型**：高容量 DiT 盲复原网络（见 18.6.1）；
+- **PiSA-SR / InvSR / AdcSR / SinSR**：单步与少步可调扩散超分体系（见 18.6）。
 
-## 18.13 哪些 SOTA 没列
+### 全能与指令驱动复原
+- **PromptIR / InstructIR / DA-CLIP / AutoDIR / DiffUIR**：统一求解多类复合退化的全能架构（见 18.5.1）。
 
-值得知道但本章没单独列（或只在前面小节点到）的（按类别）：
+### 人像特化盲复原
+- **GFPGAN / GPEN**：基于 StyleGAN2 先验的经典生成对抗人像复原网络；
+- **RestoreFormer++**：增强型多头注意力代码本复原网络；
+- **DifFace / PGDiff / DR2**：扩散轨迹先验盲人像复原网络。
 
-### 通用 SR 派系
+### 视频时空复原与插帧
+- **VRT / RVRT**：多尺度视频 Transformer 复原主干；
+- **Upscale-A-Video / MGLD-VSR / STAR / SeedVR / SeedVR2**：结合大模型时空先验的视频扩散与 DiT 复原范式（见 18.8.1）；
+- **FILM / AMT / GIMM-VFI**：针对大位移与复杂遮挡的高鲁棒视频插帧架构。
 
-- **DiffBIR**：扩散派，比 SUPIR 早；两阶段设计，先用 SwinIR 一类网络去退化，再用 ControlNet 式的注入把结果送进冻结的 SD（并非"CLIP image 走 cross-attention"，这是常见的误记）
-- **SeeSR**：扩散派 + 语义先验，更注重控制
-- **ResShift**：扩散派的高效采样（被 SinSR 蒸馏到单步）
-- **StableSR / PASD**：扩散 SR 的其它注入范式（详见第 9 章）
-- **DRCT / Hi-IR / ATD**：HAT 同期/后续 PSNR 派 Transformer SR
-- **MambaIR / MambaIRv2 / VMambaIR**：状态空间 / Mamba 架构 SR（见 18.4.1）
-- **DreamClear，及 FLUX 基座复原**：DiT 复原（见 18.6.1）
-- **PiSA-SR / InvSR / TSD-SR / AdcSR / SinSR**：单步 / 少步扩散 SR（见 18.6）
-- **BSRGAN**：Real-ESRGAN 的同期工作
+### 低光照增强
+- **LightenDiffusion / GLARE / QuadPrior / RetinexMamba**：潜空间扩散与状态空间低光增强架构。
 
-### 全能复原 / 指令式复原
+## 18.14 模型迭代升级的工程准则
 
-- **PromptIR / InstructIR / DA-CLIP / AutoDIR / DiffUIR**：一个模型吃多种退化（见 18.5.1）
+面对学术界高频发布的新算法，生产系统切忌盲目追新。仅当候选模型同时满足以下五项硬性指标时，方可启动线上模型替换：
 
-### 人脸
+1. **业务真实测试集表现出显著画质代差**（而非仅在标准公开测试集刷分）；
+2. **完全通过包含 15 类边界缺陷的自动化失败案例回归套件**（杜绝引入新崩溃点）；
+3. **端到端推理时延与显存占用符合业务预算**（劣变不超过基线的 1.2 倍）；
+4. **训练源码完整可控且具备全流程微调复现能力**；
+5. **算子拓扑完全匹配目标硬件推理引擎的量化与加速流水线**。
 
-- **GFPGAN**：StyleGAN2 先验路线，2021 经典
-- **GPEN**：Tencent ARC 的早期工作
-- **RestoreFormer++**：CodeFormer 的进化版
-- **DifFace / PGDiff / DR2**：扩散派盲脸复原（2023 起，见 18.7）
+## 18.14.1 核心模型工程特性横向矩阵
 
-### 视频
+| 模型名称 | 任务类型 | 算法范式 | 参数量规模 | A100 单卡时延 | 真实退化鲁棒性 | 端侧部署能力 | 工业应用定位 |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| SUPIR | 通用超分 | 50步多步扩散 | ~3.0B (SDXL主干) | 5-10 秒/张 | 极强 | 否 | 离线极致渲染标杆 |
+| OSEDiff / TSD-SR | 通用超分 | 单步蒸馏扩散 | ~8.6亿 (SD2.1/SD3) | 亚秒级 (~0.5s) | 极强 | 部分支持 (需剪枝) | 2025-2026 生产主流 |
+| Real-ESRGAN | 通用超分 | 判别式 CNN-GAN | ~16.7M | ~200 ms | 强 | 原生支持 | 工业高吞吐事实标准 |
+| HAT | 通用超分 | 深度混合注意力 | ~40.0M | ~80 ms (256²) | 弱 (需重训数据) | 否 | 学术与蒸馏教师基准 |
+| Restormer | 去噪/去模糊 | 通道自注意力 U-Net | ~26.1M | ~50 ms (256²) | 强 | 需模型量化 | 非放大复原通用主干 |
+| CodeFormer | 人像盲复原 | 离散代码本 Transformer | ~75.0M | ~100 ms (512²) | 极强 (人脸先验) | 原生支持 | 人像修复事实标准 |
+| BasicVSR++ | 视频超分 | 双向二阶循环时序 | ~7.3M | ~50 ms (720P) | 中等 | 部分支持 | 离线视频超分基准 |
+| RIFE | 视频插帧 | 中间流直接估计 | ~9.8M | 1080P 实时 30+ FPS | 强 | 原生支持 | 实时插帧事实标准 |
+| Retinexformer | 低光照增强 | Retinex 物理先验 | ~1.6M | ~50 ms (256²) | 中等 (极暗需微调)| 原生支持 | 暗光增强经典基准 |
 
-- **VRT / RVRT**：Transformer 派 VSR
-- **EDVR**：滑动窗口经典
-- **Upscale-A-Video / MGLD-VSR / STAR / SeedVR / SeedVR2**：视频扩散 / DiT 复原（见 18.8.1）
-- **ProPainter**：视频 inpainting 代表
+**横向对比工程结论**：
+1. **参数规模与垂直领域表现非线性相关**：CodeFormer（75M）在人像五官细节上显著优于百亿级通用基模，体现出结构化先验的极高利用效率；
+2. **推理时延呈现量级差异**：从实时 RIFE 到多步 SUPIR，时延跨越近三个数量级，系统架构必须严格以延迟预算驱动技术选型；
+3. **生产寿命规律**：具备出色硬件亲和度与退化建模完备性的模型，具备长达数年的工业服役周期。
 
-### 帧插值
-
-- **FILM**：Google，大位移强
-- **AMT**：CVPR 2023，遮挡强
-- **GIMM-VFI / EMA-VFI**：更新的运动建模方法
-- **VFIformer**：Transformer 派
-
-### 低光
-
-- **LightenDiffusion / GLARE / QuadPrior / RetinexMamba**：2024-25 的接班线（见 18.10）
-- **LLFormer**：Transformer 早期
-- **SCI**：轻量 CNN
-- **EnlightenGAN**：GAN 派
-
-### 任务特化
-
-- **DocSR / TextZoom**：文字 SR 数据集和 baseline
-- **SwinIR-Light、ESRGAN-Lite**：端侧轻量
-
-每个领域都有 5-10 个值得关注的模型。本章选的是**最具代表性、最工程友好**的那些，并在相关小节把 2024-2026 年新起的几条主线接了进来。
-
-## 18.14 何时该换 SOTA
-
-新模型每月都在出。**什么时候应该把生产模型换掉？**
-
-经验：以下都满足才考虑换：
-
-1. **新模型在你的真实测试集上明显更好**（不是 Set5/14）
-2. **失败案例集表现不差**（不会引入新问题）
-3. **推理速度可接受**（不超过当前 1.5×）
-4. **训练代码和数据可获得**（能复现、能微调）
-5. **社区有活跃维护**（不是单论文 + 代码扔在那）
-
-绝大多数论文 SOTA 不满足上面 5 条，所以**保守换模型**是工程经验。
-
-> 工程上换模型的成本远比"训一个新的"高。
->
-> 一个稳定的旧 SOTA 通常胜过一个不稳定的新 SOTA。
-
-## 18.14.1 9 个模型的横向对比表
-
-把这一章的 9 个核心模型放到同一张表里方便横向参考：
-
-| 模型 | 类别 | 派系 | 参数量 | A100 推理 | 真实退化鲁棒 | 端侧可部署 | 当前位置 |
-|------|------|------|--------|-----------|--------------|------------|----------|
-| SUPIR | 通用 SR | 扩散派 50 步 | ~3B（SDXL+ControlNet） | 5-10s/张 | 强 | 否 | 离线极致标杆 |
-| OSEDiff / TSD-SR | 通用 SR | 扩散派 1 步 | SD2.1-base / SD3 主干 + LoRA（小于 SDXL 派） | 亚秒级 | 强 | 部分（体积随基座，SD2.1 派较小） | 2025-2026 工程主流 |
-| Real-ESRGAN | 通用 SR | GAN+真实退化 | ~17M | ~0.2s | 强 | 是 | 工业事实标准 |
-| HAT | 通用 SR | Transformer PSNR | ~40M | ~80ms（256²） | 弱（bicubic 训） | 否 | 学术 baseline |
-| Restormer | 去噪/去模糊 | U-Net Transformer | ~26M | ~50ms（256²） | 中-强 | 否（需蒸馏） | restoration 派事实标准 |
-| CodeFormer | 人脸修复 | VQ codebook | ~75M | ~100ms | 强（人脸 mask） | 是 | 人脸事实标准 |
-| BasicVSR++ | 视频 SR | 双向循环+二阶传播 | ~7M | ~50ms/720P 帧 | 中 | 部分 | VSR 事实标准 |
-| RIFE | 帧插值 | IFNet 中间流 | ~10M | 1080P 实时 30+ FPS | 中-强 | 是 | 帧插值事实标准 |
-| Retinexformer | 低光增强 | Retinex + Transformer | ~1.6M | ~50ms（256²） | 中（极暗失效） | 是 | 低光代表 |
-
-几个读这张表的快速结论：
-
-1. **参数量与质量不严格相关**：CodeFormer 75M 在人脸上击败 100M+ 的通用模型，因为它的先验更专一。
-2. **A100 推理时间跨度三个数量级**：从 RIFE 实时到 SUPIR 10 秒，差别近 1000×。这是"延迟约束如何决定模型选择"的直接体现。
-3. **端侧可部署列大多是"是"或"部分"**：纯否的只有 SUPIR / HAT / Restormer 三个，且都有蒸馏方向在做端侧版本。
-4. **当前位置列暴露一个事实**：列表里 9 个模型中，6 个的"当前位置"是"事实标准"或"主流"，只有 SUPIR 和 HAT 的角色是"标杆/baseline" - 这印证了工程性强的模型有更长的半衰期。
-
-上面这 9 行是"工程主力"的横向参考，是今天就能放上生产线的默认。到 2026 年年中，除了它们，还有五条新主线的代表值得放进同一张跟踪清单里，只是它们目前更偏"前沿、值得尝试"而非"随手可部署"：
-
-- **状态空间 / Mamba**：MambaIR、MambaIRv2（见 18.4.1）
-- **全能复原 / 指令式复原**：PromptIR、InstructIR（见 18.5.1）
-- **单步 / 少步扩散 SR**：PiSA-SR、TSD-SR、InvSR（见 18.6）
-- **DiT 复原**：DreamClear，及 2025 起的 FLUX 基座复原（见 18.6.1）
-- **视频扩散复原**：SeedVR、SeedVR2、STAR（见 18.8.1）
-
-把这两组合起来看，才是 2026 年年中"既要能落地、又要不落伍"的完整视野：前 9 个是今天就能部署的默认，后 5 条是必须盯住的走向。
-
-## 18.14.2 派系传承图
-
-最后用一张派系图把这一章的所有模型和它们的祖先 / 接班人画在一起，帮助你理解每条线的内在演化逻辑：
+## 18.14.2 算法流派演进拓扑图
 
 ```mermaid
 graph LR
@@ -864,55 +534,28 @@ graph LR
     style AIO fill:#fff8e1
 ```
 
-这张图有几条线索值得强调：
+## 18.15 全书结语
 
-- **ESRGAN 这条线**经过 Real-ESRGAN 之后转向"数据为王"路线，与 PSNR 派的 SwinIR / HAT 走向分叉。
-- **SwinIR 同时是 HAT 和 Restormer 的祖先**：前者继续做 SR，后者转向通用 restoration backbone，还进一步伸出全能 / 指令式复原（PromptIR、InstructIR）这一支。这是同一个 Transformer 思路在不同任务上的分支。
-- **扩散派从 DDPM 到 OSEDiff 是一条快速演化线**：5 年时间从开山论文走到生产可部署，是低层视觉历史上演化最快的子方向。
-- **更正两处常见的谱系误记**：CodeFormer 的强先验来自 VQGAN 的离散码本加 Transformer（NeurIPS 2022），与 Stable Diffusion 的潜扩散没有派生关系，两者大致同期且各自独立；同理，OSEDiff 基于 SD2.1、SinSR 蒸馏自 ResShift，都不是 SUPIR 的后代。把它们硬挂到"SD → SUPIR"这条主链上并不准确，所以这一版把 CodeFormer 挪到了 VQGAN 一支，OSEDiff / SinSR 的连线也一并改了过来。
-- **DiT 主干替换已经落地**：不再是"还没有标志性工作"。DreamClear（基于 PixArt 这一代 DiT，NeurIPS 2024）就是那件标志性工作，2025 起 FLUX 基座的复原继续跟进；TSD-SR 则把单步蒸馏搬到了 SD3 的 DiT 主干上。
-- **架构多出第三条主线**：状态空间 / Mamba（MambaIR → MambaIRv2）以线性复杂度切入，成为卷积、注意力之外值得跟踪的新分支。
-- **视频复原也在更新换代**：真实退化视频从 BasicVSR++ 一档转向 Upscale-A-Video / SeedVR 这条扩散 / DiT 线，SeedVR2 更把单步扩散带到了视频。
+纵观全书从物理成像理论至底层工程落地的系统性探索，可提炼出贯穿影像增强工程的十条核心公理：
 
-## 18.15 最后
+1. **影像增强本质上是不适定数学逆问题（Ill-Posed Inverse Problem）**：当输入高频信号物理湮灭时，模型执行的是先验采样而非确定性测量；
+2. **数据流形建模的价值超越网络拓扑创新**：高质量高阶退化数据管道是决定模型泛化能力的基石；
+3. **保真度（PSNR）与感知质量（Perceptual Quality）存在客观对立权衡**；
+4. **工业目标函数绝非单一损失，必然是多尺度、频域与感知特化的复合正则约束**；
+5. **现代高性能复原网络均运行于潜空间（Latent Space）或深层流形空间**；
+6. **生成式模型的细节先验是画质提升的利刃，亦是产生幻觉与失真的潜在根源**；
+7. **在系统工程中，边界防御与优雅降级比优化 95% 样本的平均指标更为关键**；
+8. **视频增强不是单帧图像的简单堆叠，时序光度连续性是不可或缺的独立维度**；
+9. **端侧部署需要从算子支持、定点量化到能耗温控的完整全栈协同设计**；
+10. **不存在通用的“全能最优架构”，系统效能永远建立在特定业务约束与模型组合的最优权衡之上**。
 
-这本书走过：
-
-- Part I：理解为什么（中心方程、表达空间、损失、评估、数据）
-- Part II：理解怎么做（CNN、Transformer、扩散、扩散控制、特化）
-- Part III：训练与评估（稳定性、方法论）
-- Part IV：视频
-- Part V：工程部署（推理、案例、失败）
-- Part VI：参考（这一章）
-
-**核心观点回顾**：
-
-1. 影像增强是**逆问题**，模型在猜，不在恢复
-2. 数据 > 网络（Real-ESRGAN 的核心教训）
-3. PSNR 派 vs 感知派是**理论必然**，不是工程缺陷
-4. 增强模型的损失**几乎从来不是单一的**
-5. 现代方法都不在像素空间工作（潜空间、特征空间）
-6. 扩散模型的"无中生有"是优势也是危险
-7. 工程上"失败处理"比"平均优化"更重要
-8. 视频不只是图像 × N，时序一致是独立问题
-9. 端侧部署需要完全不同的优化栈
-10. **没有通用最优**，每个场景有自己最佳的模型组合
-
-读完这本书，希望你能：
-
-- 看到一张烂图，知道用什么模型组合处理
-- 看到一个新论文，能立刻判断它在解决哪个本质问题
-- 设计自己的增强系统时，知道每个决策的 trade-off
-- 在生产环境碰到 bug 时，知道往哪个方向找原因
-
-影像增强这个领域还会继续演进。架构会变、模型会迭代、benchmark 会刷新。但这本书讲的**思考框架**，即退化模型、表达空间、损失设计、评估方法、训练动力学、部署约束、失败模式，这些会保持有效。
-
-Good luck. 愿这本书对你有用。
+技术架构持续迭代演进，但底层关于退化解耦、空间映射、约束构建、时序对齐与工程防御的方法论体系将长久指引低层视觉系统的构建。
 
 ---
 
-> 系列结束。
+> 全书完。
 >
-> 想接着学：本书相关的姊妹书：
-> - [LLM 训练工程师完全指南](https://github.com/yingwang/llm-tutorial) — 怎么造 LLM
-> - [Thinking in LLM](https://github.com/yingwang/thinking-in-llm) — 怎么用 LLM
+> 推荐阅读系统工程姊妹著作：
+> - [LLM 训练工程师完全指南](https://github.com/yingwang/llm-tutorial) : 大语言模型从预训练到对齐工程实践
+> - [Thinking in LLM](https://github.com/yingwang/thinking-in-llm) : 大语言模型系统架构与应用工程指南
+
