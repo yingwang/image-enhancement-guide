@@ -96,7 +96,7 @@ flowchart TD
     A[Data Loader<br/>HR patch sampling] --> B[Degradation Synth<br/>blur / down / noise / JPEG]
     B --> C[Forward<br/>autocast bf16/fp16]
     C --> D[Compute Loss<br/>L1 + VGG + GAN + ...]
-    D --> E[Backward<br/>scaler.scale().backward]
+    D --> E["Backward<br/>scaler.scale().backward"]
     E --> F[Grad Clip<br/>max_norm 1.0]
     F --> G[Optimizer Step<br/>AdamW + scaler]
     G --> H[Scheduler Step<br/>warmup + cosine]
