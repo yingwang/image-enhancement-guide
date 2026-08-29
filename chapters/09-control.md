@@ -249,103 +249,48 @@ def forward_with_controlnet(unet, controlnet, x_t, lr_img, t, context):
     return unet.out(h)
 ```
 
-### ControlNet 训练数据要求
+### ControlNet 训练数据与监督构建
 
-要 (LR, HR) 配对（HR 用来做 noisy latent 加噪 target，LR 是 ControlNet 输入）。
+在图像增强任务中，ControlNet 的训练依赖高保真配对数据 $(\mathbf{x}_{\text{LR}}, \mathbf{x}_{\text{HR}})$：
+- **HR 目标样本**：经由 VAE 编码并加噪至时间步 $t$ 生成 $x_t$，作为扩散去噪的目标回归真值；
+- **LR 条件输入**：作为 ControlNet 专有分支的输入，负责逐级提取多尺度空间几何先验；
+- **数据规模与分布覆盖**：工业级增强模型的 ControlNet 训练通常需要数十万至数百万级高质量图像切片，深度依赖第 5 章所阐述的高阶随机退化合成管线进行数据增强。
 
-数据规模：ControlNet 论文用了几十万到几百万张图。增强任务的 ControlNet 通常用第 5 章的合成 pipeline 生成训练数据。
+### DiffBIR：两阶段解耦恢复范式
 
-### DiffBIR：两阶段的 ControlNet 式复原
+Lin 等人提出的 DiffBIR（Blind Image Restoration via Diffusion, 2023）是 ControlNet 范式在盲图像恢复中的标杆实践。学术界与工业界常将其误归类为 Cross-Attention 方案，在此需予以明确界定：DiffBIR 采用严格的两阶段解耦流水线：
 
-DiffBIR（Lin et al. 2023）是把 ControlNet 思路用到盲图像复原的代表，它常被误当作 cross-attention 方法，这里放到 ControlNet 一节澄清。它的设计是两阶段：
+- **第一阶段（确定性去退化，Degradation Removal）**：采用基于 SwinIR 拓扑的紧凑回归网络对输入 LR 图像进行前置滤波，剥离剧烈噪声、块状压缩伪影与运动模糊，输出一张结构轮廓干净但高频纹理相对平滑的中间特征图；
+- **第二阶段（生成式细节重构，Generative Refinement）**：将第一阶段输出的平滑图像作为条件输入，送入并联的 IRControlNet 分支，逐层加注至冻结的 Stable Diffusion 主干，利用大规模生成先验填补高频微观质感。
 
-- **Stage-1（去退化）**：先用一个 SwinIR 类的回归网络把 LR 的退化（噪声、压缩、模糊）大致清掉，得到一张结构干净但偏平滑的中间图。这一步只负责"去脏"，不负责补细节。
-- **Stage-2（生成细节）**：把 Stage-1 的输出作为条件，通过 IRControlNet（一个为复原任务训练的 ControlNet 式并联分支）注入冻结的 SD，让扩散先验补回高频纹理。
+DiffBIR 全程未引入 CLIP 图像特征编码，亦未采用图像交叉注意力，其空间控制力完全源于 ControlNet 的并联特征加和。这一两阶段设计将"确定性逆滤波"与"概率性纹理生成"解耦，有效降低了单阶段扩散模型在极端退化下容易产生结构畸变的风险。
 
-关键点是 DiffBIR 全程不使用 CLIP image encoder，也不走图像 cross-attention，结构注入完全靠 ControlNet 式的并联加和。所以它属于本节的 ControlNet 路线，而不是 9.5 的 cross-attention 路线。
+### 条件注入机制与主干拓扑的演进耦合
 
-### 注入机制与骨干的耦合
+需要指出的是，本节探讨的 ControlNet 以及前文的 Input Concat 与 Cross-Attention 注入机制，均深度绑定于 **UNet 拓扑**（如复制 Encoder 阶段特征、向 Skip Connection 注入加法扰动、替换输入层卷积通道）。
 
-需要提醒一句：本节讲的 ControlNet、以及 9.4/9.5 的 concat 与 cross-attention 注入，都是围绕 **UNet 骨干**设计的（复制 encoder、加到 skip、替换 conv_in）。换成 DiT 骨干（SD3、Flux 这一代）之后，条件控制的落地方式并不相同，通常是把控制 token 拼进序列或用专门的 conditioning block，而非复制 encoder 加 skip。这条留到第 18 章展开，这里只提示不要把 UNet 时代的注入机制直接照搬到 DiT 上。
-
-## 9.6b 范式四：IP-Adapter（解耦的图像 prompt）
-
-IP-Adapter (Ye et al. 2023) 解决一个 ControlNet 不太好做的问题：**用一张参考图当作"风格 / 身份 prompt"**，不直接控制每个像素的结构，而是控制"这张生成的图整体看起来像参考图"。
-
-放到增强语境下：
-
-- 给定 LR + 一张同人的高清照（reference），让生成的 HR 在身份上贴近 reference
-- 给定 LR + 一张目标光照的样图，让 HR 复刻样图的色调
-- 给定 LR + 一张目标纹理的高清 patch，让 HR 学习这种纹理
-
-IP-Adapter 的设计思想可以一句话概括：
-
-> 不要让图像 prompt 抢 text prompt 的 cross-attention，**单独给图像 prompt 开一个 cross-attention 通道**，与原 text cross-attention 相加。
-
-这就是"解耦 cross-attention"。原 SD UNet 的 attention 是 $\text{Attn}(Q, K_t, V_t)$，其中 $K_t, V_t$ 来自 text encoder。IP-Adapter 增加一个并行项：
-
-$$
-\text{Output} = \text{Attn}(Q, K_t, V_t) + \lambda \cdot \text{Attn}(Q, K_i, V_i)
-$$
-
-$K_i, V_i$ 来自图像 encoder（CLIP image）经过一个新的投影层。$\lambda$ 是用户可调的"图像 prompt 强度"。
-
-这种解耦相对"直接把 image token 拼到 text token 后面"的好处：
-
-1. **保留原 text 通道的训练分布**：原 cross-attention 见的是 text token，强行混入图像 token 会让分布漂移；解耦让 text 通道完全不变
-2. **图像和文字可以独立调强度**：text 部分仍按 CFG 控制，图像部分用 $\lambda$ 控制，互不干扰
-3. **只需训新增的图像 cross-attention 层**，原 UNet 不动，新增参数极少（< 100M）
-
-代码骨架：
-
-```python
-class IPAdapterCrossAttn(nn.Module):
-    """IP-Adapter: 解耦的图像 cross-attention。
-    与原 text cross-attention 并行, 输出相加。
-    """
-
-    def __init__(self, dim: int, num_heads: int, image_dim: int = 1024):
-        super().__init__()
-        # 复用原 cross-attention 的 Q (来自 latent)
-        # 新增图像分支的 K, V projection
-        self.to_k_img = nn.Linear(image_dim, dim, bias=False)
-        self.to_v_img = nn.Linear(image_dim, dim, bias=False)
-        self.num_heads = num_heads
-        nn.init.zeros_(self.to_k_img.weight)
-        nn.init.zeros_(self.to_v_img.weight)        # 0 初始化, 训练初期无影响
-
-    def forward(self, q, text_kv, image_tokens, scale: float = 1.0):
-        # text_kv 走原 cross-attention (省略, 主 UNet 内置)
-        text_out = original_cross_attn(q, text_kv)
-
-        # 图像分支
-        k_img = self.to_k_img(image_tokens)
-        v_img = self.to_v_img(image_tokens)
-        image_out = scaled_dot_product_attention(q, k_img, v_img, num_heads=self.num_heads)
-
-        return text_out + scale * image_out
-```
+随着扩散主干向 DiT（Diffusion Transformer，如 SD3、Flux）架构演进，条件控制的工程实现亦发生了形态变迁：通常采用将控制 Token 直接拼入序列、或通过专有的 AdaLN（Adaptive LayerNorm）与 Conditioning Block 实施特征调制，而非机械复制编码器分支。相关前沿演进将在第 18 章展开系统论述。
 
 ## 9.6b 范式四：IP-Adapter 解耦图像提示词机制
 
-Ye 等人提出的 IP-Adapter 旨在解决基于参考图像（Reference Image）引导生成的特征耦合问题。
+在多模态与参考引导增强场景中，工程师经常面临一类特殊需求：**以参考图像（Reference Image）作为风格、光照或主体身份的先验提示**，而非对其进行严格的逐像素几何空间对齐。
 
-在图像增强任务中的典型应用包括：
-- **同源参考超分（RefSR）**：结合低分辨率输入与同主体的高清参考特写，定向迁移高频细节；
-- **风格与光照对齐**：以特定样张的色调分布与光影质感引导重建过程；
-- **材质纹理注入**：利用高质量微观材质切片辅助大面积破损区域修复。
+在图像增强语境下的典型应用包括：
+- **同源参考超分辨率（RefSR）**：结合低分辨率输入与同主体的高清特写参考，引导面部或特定物体的纹理生成；
+- **光影与色调迁移**：以目标样张的色彩分布与光照质感引导重建过程；
+- **微观材质辅助修复**：利用同类材质的高清切片提供细粒度表面纹理先验。
 
-### 解耦跨注意力（Decoupled Cross-Attention）数学原理
+### 解耦跨注意力（Decoupled Cross-Attention）数学机理
 
-标准 SD 架构中，跨注意力模块仅处理来自文本编码器的序列：$\text{Attention}(Q, K_t, V_t)$。若将图像 Token 与文本 Token 强行拼接输入同一注意力层，会破坏预训练文本注意力的特征分布，导致指令遵循度下降。
+标准 Stable Diffusion 架构中，空间自注意力后的 Cross-Attention 模块仅面向文本 Prompt 序列计算：$\text{Attention}(Q, K_t, V_t)$。若将图像 Token 粗暴地拼接至文本序列之后，会强行扭曲预训练文本注意力的几何分布，引发严重的语义漂移与指令失遵。
 
-IP-Adapter 采用解耦双通路并行设计：为图像特征独立构建专用的 Key 与 Value 投影矩阵，输出端执行加权求和：
+Ye 等人提出的 IP-Adapter 引入了解耦双通道并行设计：为图像特征独立构建专用的 Key 与 Value 线性投影矩阵，在特征输出端执行加权融合：
 
 $$
 \text{Output} = \text{Attention}(Q, K_t, V_t) + \lambda \cdot \text{Attention}(Q, K_i, V_i)
 $$
 
-其中 $K_i, V_i$ 由 CLIP 图像特征经新增线性层投影生成，$\lambda$ 为可在线调节的图像引导强度标量。
+其中 $K_i, V_i$ 由 CLIP 图像特征经新增线性层映射生成，$\lambda \in [0, 1.5]$ 为推断阶段可实时微调的图像引导强度标量。
 
 ```python
 class IPAdapterCrossAttn(nn.Module):
@@ -375,9 +320,10 @@ class IPAdapterCrossAttn(nn.Module):
         return text_out + scale * image_out
 ```
 
-工程优势：
-1. **零破坏预训练基座**：主干权重完全冻结，新增参数量不足 100M，训练资源开销极小；
-2. **多模态权重完全解耦**：文本 CFG 强度与图像引导强度 $\lambda$ 相互独立，支持推断期灵活消融与微调。
+**工程核心优势：**
+
+1. **保护预训练基座特征流形**：原 UNet 与文本通道保持完全冻结，新增参数量通常不足 100M，计算与显存开销极小；
+2. **多模态引导权重完全解耦**：文本 CFG 强度与图像引导强度 $\lambda$ 相互独立，支持在推断期间平滑插值调节。
 
 ## 9.7 工业级 SOTA 架构剖析：SUPIR（2024）
 
