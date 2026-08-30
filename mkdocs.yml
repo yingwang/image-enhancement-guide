@@ -1,5 +1,5 @@
-site_name: "影像增强：从原理到工程 / Image Enhancement: From Principles to Engineering"
-site_description: "从退化模型 y = D(x) + n 出发，理解影像增强的第一性原理，掌握从 CNN/Transformer 到扩散模型的完整工程实践。"
+site_name: "Image Enhancement: From Principles to Engineering / 影像增强：从原理到工程"
+site_description: "Starting from the degradation model y = D(x) + n: the first principles of image enhancement and the full engineering path from CNN/Transformer to diffusion models. 从退化模型出发，理解影像增强的第一性原理。"
 site_url: https://yingwang.github.io/image-enhancement-guide/
 repo_url: https://github.com/yingwang/image-enhancement-guide
 repo_name: yingwang/image-enhancement-guide
@@ -11,7 +11,7 @@ use_directory_urls: true
 
 theme:
   name: material
-  language: zh
+  language: en
   features:
     - navigation.tabs
     - navigation.tabs.sticky
@@ -50,12 +50,12 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/yingwang
   alternate:
-    - name: 中文
-      link: /image-enhancement-guide/
-      lang: zh
     - name: English
-      link: /image-enhancement-guide/en/
+      link: /image-enhancement-guide/
       lang: en
+    - name: 中文
+      link: /image-enhancement-guide/zh/
+      lang: zh
 
 markdown_extensions:
   - admonition
@@ -66,7 +66,7 @@ markdown_extensions:
   - mdx_truly_sane_lists
   - toc:
       permalink: true
-      permalink_title: 链接到此节
+      permalink_title: Link to this section
   - pymdownx.arithmatex:
       generic: true
   - pymdownx.details
@@ -103,28 +103,8 @@ plugins:
         - zh
 
 nav:
-  - 中文:
-    - 首页: README.md
-    - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
-    - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
-    - 第 3 章 — 损失函数全景: chapters/03-losses.md
-    - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
-    - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
-    - 第 6 章 — CNN 时代: chapters/06-cnn.md
-    - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
-    - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
-    - 第 9 章 — 扩散的条件控制: chapters/09-control.md
-    - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
-    - 第 11 章 — 训练稳定性: chapters/11-training.md
-    - 第 12 章 — 评估方法论: chapters/12-evaluation.md
-    - 第 13 章 — 视频不只是图像加时间: chapters/13-video-basics.md
-    - 第 14 章 — VSR / 帧插值 / 视频修复: chapters/14-video-models.md
-    - 第 15 章 — 推理优化: chapters/15-inference.md
-    - 第 16 章 — 真实场景案例: chapters/16-cases.md
-    - 第 17 章 — 失败案例集: chapters/17-failures.md
-    - 第 18 章 — SOTA 模型: chapters/18-sota.md
   - English:
-    - Home: en/README.md
+    - Home: index.md
     - Ch. 1 — Degradation Model: en/chapters/01-degradation-model.md
     - Ch. 2 — Pixel, Feature, Latent: en/chapters/02-representation.md
     - Ch. 3 — Loss Landscape: en/chapters/03-losses.md
@@ -143,6 +123,26 @@ nav:
     - Ch. 16 — Real-World Cases: en/chapters/16-cases.md
     - Ch. 17 — Failure Modes: en/chapters/17-failures.md
     - Ch. 18 — SOTA Models: en/chapters/18-sota.md
+  - 中文:
+    - 首页: zh.md
+    - 第 1 章 — 退化模型与逆问题: chapters/01-degradation-model.md
+    - 第 2 章 — 像素、特征、潜空间: chapters/02-representation.md
+    - 第 3 章 — 损失函数全景: chapters/03-losses.md
+    - 第 4 章 — 评估的陷阱: chapters/04-metrics.md
+    - 第 5 章 — 数据与退化合成: chapters/05-degradation-pipeline.md
+    - 第 6 章 — CNN 时代: chapters/06-cnn.md
+    - 第 7 章 — Transformer 在低层视觉: chapters/07-transformer.md
+    - 第 8 章 — 扩散模型基础: chapters/08-diffusion.md
+    - 第 9 章 — 扩散的条件控制: chapters/09-control.md
+    - 第 10 章 — 任务特化模型: chapters/10-task-specific.md
+    - 第 11 章 — 训练稳定性: chapters/11-training.md
+    - 第 12 章 — 评估方法论: chapters/12-evaluation.md
+    - 第 13 章 — 视频不只是图像加时间: chapters/13-video-basics.md
+    - 第 14 章 — VSR / 帧插值 / 视频修复: chapters/14-video-models.md
+    - 第 15 章 — 推理优化: chapters/15-inference.md
+    - 第 16 章 — 真实场景案例: chapters/16-cases.md
+    - 第 17 章 — 失败案例集: chapters/17-failures.md
+    - 第 18 章 — SOTA 模型: chapters/18-sota.md
 
 copyright: |
   Copyright &copy; 2026 Ying Wang —

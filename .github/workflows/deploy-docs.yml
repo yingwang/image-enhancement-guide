@@ -48,14 +48,25 @@ jobs:
       - name: Assemble docs/ from chapters/ + en/
         run: |
           mkdir -p docs/chapters docs/en/chapters docs/stylesheets docs/javascripts
-          cp README.md docs/README.md
-          cp -r chapters/. docs/chapters/
+          # 站点默认语言是英文：根首页取自 en/README.md，中文首页放在 docs/zh.md。
+          # docs/README.md 不能再用，mkdocs 会判定它与 index.md 冲突并把整页排除。
+          cp en/README.md docs/index.md
           cp en/README.md docs/en/README.md
           if [ -d en/chapters ] && [ "$(ls -A en/chapters)" ]; then
             cp -r en/chapters/. docs/en/chapters/
           fi
+          cp README.md docs/zh.md
+          cp -r chapters/. docs/chapters/
           cp stylesheets/extra.css docs/stylesheets/extra.css
           cp javascripts/mathjax.js docs/javascripts/mathjax.js
+          # 根首页原本以 en/ 为基准写相对链接，挪到根目录后要补前缀，否则目录会指到中文章节
+          sed -i 's#](chapters/#](en/chapters/#g' docs/index.md
+          sed -i -E 's#\]\(\.\./(LICENSE(-CODE)?)\)#](\1)#g' docs/index.md
+          sed -i 's#\[中文\](\.\./README\.md)#[中文](zh.md)#' docs/index.md
+          sed -i 's#\[English\](README\.md)#[English](index.md)#' docs/index.md
+          # 语言切换行在各自页面里的落点
+          sed -i 's#\[中文\](\.\./README\.md)#[中文](../zh.md)#' docs/en/README.md
+          sed -i 's#\[中文\](README\.md)#[中文](zh.md)#' docs/zh.md
 
       - name: Insert blank line before lazy bullet lists (GitHub-style)
         run: |
