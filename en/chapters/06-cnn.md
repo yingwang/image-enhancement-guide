@@ -1,33 +1,70 @@
 # Chapter 6 · The CNN Era
 
-> From 2014 through 2022, convolutional architectures established the foundation of modern deep image restoration:
+> From 2014 to 2022, CNNs walked a distinctive path through low-level vision:
 >
-> Sparse-coding emulation (SRCNN) $\to$ Very deep residual learning (VDSR / EDSR) $\to$ Channel attention mechanisms (RCAN) $\to$ Dense feature reuse (RRDB) $\to$ Minimalist nonlinear gating (NAFNet).
+> from imitating sparse coding (SRCNN) → going deeper plus residual (VDSR/EDSR) → introducing attention (RCAN) → dense connections (RRDB) → reverse simplification (NAFNet).
 >
-> These eight years represent the classical mechanics of low-level vision: mastering their architectural principles provides the intuition needed to understand modern Transformers and diffusion pipelines.
+> These eight years are the "classical mechanics" of this field — once you understand them, you can find the corresponding ideas in Transformers and diffusion.
 
 ## 6.0 Reading Notes
 
-This chapter begins Part II (Architectural Paradigms), charting the eight-year evolutionary trajectory of convolutional networks in image restoration.
+This chapter is the first stop of Part II. The goal is to lay out the CNN line's eight-year evolution from 2014 to 2022 clearly. After reading you should be able to:
 
-Key takeaways:
+- See a CNN enhancement network's diagram and immediately tell which generation it belongs to (SRCNN-style, EDSR-style, RCAN-style, ESRGAN/Real-ESRGAN-style, NAFNet-style) and the corresponding design philosophy
+- Know the basis for every design decision when tackling a new task (depth or width, which upsampling, which normalization, whether to add attention)
+- Explain clearly why Batch Normalization is in fact harmful in low-level vision
 
-- How to identify the architectural lineage and design principles of any restoration CNN (SRCNN, EDSR, RCAN, ESRGAN/Real-ESRGAN, or NAFNet).
-- The trade-offs governing network depth versus width, spatial upsampling operators, normalization layers, and attention mechanisms.
-- The mathematical and statistical reasons why Batch Normalization degrades low-level pixel regression.
+This chapter assumes you have already mastered:
 
-**Prerequisites.** Familiarity with the forward degradation formulation $y = D(x) + n$ (Chapter 1), representation spaces (Chapter 2), objective loss formulations (Chapter 3), and synthetic degradation pipelines (Chapter 5).
+- The central equation $y = D(x) + n$ from Chapter 1, with "$D$ is a stack of random compositions"
+- The distinction between pixel space and feature space from Chapter 2
+- The basic roles of L1 / Charbonnier / VGG / GAN losses from Chapter 3
+- The existence and meaning of the Real-ESRGAN-style degradation pipeline from Chapter 5
 
-**Key Terminology Introduced in This Chapter:**
+It does not assume you have read the original SRCNN/EDSR/RCAN/ESRGAN/NAFNet papers, nor that you have written a full SR training loop. The code in this chapter starts from the simplest runnable form.
 
-- **SRCNN** (Super-Resolution Convolutional Neural Network): The pioneering 3-layer architecture (Dong et al., 2014) establishing end-to-end differentiable mapping for super-resolution.
-- **VDSR** (Very Deep Super-Resolution): A 20-layer architecture (Kim et al., 2016) introducing global residual learning to stabilize deep convolutional optimization.
-- **EDSR** (Enhanced Deep Super-Resolution): The definitive baseline architecture (Lim et al., 2017) that eliminated Batch Normalization and shifted feature extraction to low-resolution space.
-- **RCAN** (Residual Channel Attention Network): Introduced channel attention (Zhang et al., 2018) and residual-in-residual modularity, enabling stable training of 400+ layer backbones.
-- **RRDB** (Residual-in-Residual Dense Block): The multi-level residual and dense-connection block introduced in ESRGAN (Wang et al., 2018) and retained in Real-ESRGAN.
-- **NAFNet** (Nonlinear Activation Free Network): A minimalist architecture (Chen et al., 2022) replacing standard activations (ReLU/GELU) with channel-split multiplication gates (SimpleGate).
-- **PixelShuffle**: Sub-pixel convolution rearranging depth channels $(B, r^2 C, H, W)$ into spatial dimensions $(B, C, rH, rW)$.
-- **ICNR** (Initialization for Sub-Pixel Convolution): Weight initialization scheme that prevents checkerboard artifacts during early training.
+**Abbreviations first appearing in this chapter or used repeatedly.** Listed upfront to avoid jargon stalls; when specific terms come up later, they are unpacked again in one sentence:
+
+- **SRCNN** (Super-Resolution Convolutional Neural Network): the 2014 three-layer CNN super-resolution network by Dong et al., the first to apply end-to-end learning to SR
+- **VDSR** (Very Deep Super-Resolution): proposed by Kim et al. in 2016, a 20-layer VGG-style stack + residual learning, proving that introducing both "depth" and "residual" together yields large gains
+- **EDSR** (Enhanced Deep Super-Resolution): proposed by Lim et al. in 2017, removing Batch Normalization inside residual blocks and moving upsampling to the network tail; the "engineering baseline" of low-level vision CNNs
+- **RCAN** (Residual Channel Attention Network): proposed by Zhang et al. in 2018, bringing channel attention to SR and stabilizing 400+ layer training with residual-in-residual structure
+- **ESRGAN** (Enhanced Super-Resolution GAN): proposed by Wang et al. in 2018, introducing the RRDB block and training with RaGAN loss; defined the visual benchmark of the perceptual SR camp
+- **RRDB** (Residual in Residual Dense Block): the core block of ESRGAN—three nested dense blocks + three layers of residual; still used by Real-ESRGAN
+- **Real-ESRGAN**: the representative 2021 "real-scene" SR model, covered at length in Chapter 5; this chapter focuses on the RRDB backbone it reuses
+- **NAFNet** (Non-linear Activation Free Network): proposed by Chen et al. in 2022, a counter-trend simplification—remove all ReLU/GELU, replace with gated multiplication—outperforming complex architectures on denoising / deblurring
+- **CA** (Channel Attention): learn a scalar weight per channel and multiply; lets the model adaptively amplify or suppress different channels
+- **SE** (Squeeze-and-Excitation): the 2018 general form of channel attention—global average pool to compress spatial into a scalar, then a two-layer MLP computes the weight
+- **ECA** (Efficient Channel Attention): a 2020 channel-attention refinement that replaces the two-layer MLP with a 1D convolution, dropping parameters from $O(C^2)$ to $O(k)$
+- **SCA** (Simplified Channel Attention): NAFNet's minimal channel attention—keeps only average pool + 1×1 convolution, even drops sigmoid
+- **CBAM** (Convolutional Block Attention Module): channel attention + spatial attention in series, but the spatial part has limited gains in low-level vision
+- **PixelShuffle / subpixel convolution**: the operation that rearranges a tensor with $r^2$ times the channels into one with $r$ times the spatial resolution; the de facto upsampling standard since EDSR
+- **ICNR** (Initialization for Convolutional NN with Sub-pixel Convolutions): an initialization for the convolution before PixelShuffle, avoiding checkerboard artifacts in early training
+- **BN / LN / GN / IN** (Batch / Layer / Group / Instance Normalization): the four main normalization variants, each acting along a different dimension; §6.9 compares them in detail
+- **PReLU** (Parametric ReLU): a ReLU variant with a learnable negative-side slope
+- **SiLU / Swish**: activation functions of the form $x \cdot \sigma(x)$, one of the modern defaults
+- **GELU** (Gaussian Error Linear Unit): $x \cdot \Phi(x)$, the standard activation in Transformers
+- **FLOPs** (Floating-Point Operations): the common unit for measuring compute budget
+- **NPU** (Neural Processing Unit): mobile-device neural-network accelerator; CNN optimizations on NPUs are the most mature
+
+## 6.1 Why start with CNNs
+
+Transformers began making their mark in low-level vision from 2021 (SwinIR, Restormer, HAT), and diffusion has occupied the generative SOTA since 2023 (StableSR, SUPIR). It looks as if CNNs are already a thing of the past.
+
+**That is not actually the case.** A few facts:
+
+- NAFNet (2022, pure CNN) is still the de facto benchmark for denoising / deblurring tasks; papers in 2023-2025 still cite it as a baseline
+- Real-ESRGAN still uses RRDB (a CNN architecture from 2018); published in 2021, it is still the de facto open-source real-SR standard in 2026
+- The patch embedding, upsample heads, and bottlenecks of nearly all Transformer models are still convolutions; pure Transformers are rare in low-level vision
+- 99% of enhancement models deployed on mobile are pure CNNs; Chapter 15 will expand the reasons (NPU support for attention is immature, softmax and reshape are expensive on-device)
+
+So the first stop in Part II must be CNNs. This chapter clarifies three things:
+
+1. The evolutionary logic of CNNs in low-level vision—which designs are gradual refinements, which are paradigm shifts
+2. What concrete problem each era's representative network is solving
+3. When designing your own CNN enhancement network, the order in which to consider what to choose and not choose
+
+To keep the upcoming discussion of six or seven networks from blurring together in your head, here is one diagram organizing the line. Each cell is one generation's "headline new design," and the color indicates which class of bottleneck it solves.
 
 ```mermaid
 graph LR
@@ -51,30 +88,26 @@ graph LR
     style NAFNet fill:#e8f5e9
 ```
 
-## 6.1 The Enduring Role of Convolutional Backbones
+Color groups reflect "contribution type." The blue group (SRCNN/VDSR) is "foundational," establishing end-to-end learning and residual learning as paradigms. The yellow group (EDSR/RCAN/RRDB) is "module innovation," proposing reusable sub-structures (residual block, CA, dense block). The red group (Real-ESRGAN) contributes entirely on the data-pipeline side, not the network. The green group (NAFNet) is reverse simplification, removing some of the additions of the prior generations. The last two cells of the line are read in reverse—this is the most memorable counter-trend story of the CNN era in low-level vision.
 
-While Vision Transformers (SwinIR, Restormer, HAT) and diffusion models (StableSR, SUPIR) dominate academic frontiers, convolutional architectures remain essential across production deployments:
+## 6.2 SRCNN (2014) — the starting point
 
-- NAFNet (2022) remains a competitive baseline on denoising and deblurring benchmarks due to its exceptional compute efficiency.
-- Real-ESRGAN relies on the 2018 RRDB convolutional backbone, demonstrating that data synthesis pipelines often dictate performance more than architectural updates.
-- Edge accelerators (mobile NPUs, DSPs) achieve peak hardware utilization on regular 2D convolutions, whereas dynamic self-attention and tensor reshaping operations incur substantial latency overhead.
-
-## 6.2 SRCNN (2014): Establishing End-to-End Learning
-
-Dong et al. reformulated classical sparse-coding super-resolution into a three-layer convolutional mapping:
+The first deep-learning super-resolution paper. Dong et al. mapped the traditional sparse-coding super-resolution pipeline to a three-layer CNN:
 
 ```
-Layer 1 (9×9 Conv, 64 channels)  ←→ Patch extraction and dictionary representation
-Layer 2 (1×1 Conv, 32 channels)  ←→ Non-linear feature mapping
-Layer 3 (5×5 Conv, 3 channels)   ←→ High-resolution reconstruction
+Layer 1 (9×9 conv, 64 ch)  ←→ Patch extraction & representation
+Layer 2 (1×1 conv, 32 ch)  ←→ Non-linear mapping
+Layer 3 (5×5 conv,  3 ch)  ←→ Reconstruction
 ```
+
+Input: LR upsampled to target size by bicubic
+Output: HR estimate
 
 ```python
-import torch
 import torch.nn as nn
 
 class SRCNN(nn.Module):
-    """SRCNN (Dong et al., 2014). The foundational 3-layer super-resolution network."""
+    """SRCNN, 2014. The pioneering work, a three-layer CNN."""
     def __init__(self):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 64, kernel_size=9, padding=4)
@@ -82,55 +115,196 @@ class SRCNN(nn.Module):
         self.conv3 = nn.Conv2d(32, 3, kernel_size=5, padding=2)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is the bicubic-upsampled LR input matching target HR dimensions
+    def forward(self, x):
+        # x is the bicubic-upsampled LR, its shape already equals HR
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
-        return self.conv3(x)
+        x = self.conv3(x)
+        return x
 ```
 
-SRCNN demonstrated that entire multi-stage dictionary pipelines could be trained jointly via gradient descent. However, several structural bottlenecks remained:
-- **Shallow Receptive Field**: With only three layers, the effective spatial receptive field ($13 \times 13$) cannot model contextual structures across natural imagery.
-- **High-Resolution Compute Waste**: Processing inputs after initial bicubic upsampling forces all convolutions to execute at high resolution, multiplying FLOPs by $r^2$ for scaling factor $r$.
-- **Direct Full-Image Regression**: Forcing the network to synthesize absolute pixel intensities from scratch produces high target variance and slow convergence.
+Performance: about 30.5 dB on Set5 4× (bicubic gives 28.4 dB).
 
-## 6.3 VDSR (2016): Deep Representations and Global Residuals
+**The value of SRCNN is not in its results**, but in the fact that it **proved end-to-end learning was viable**. Before it, all super-resolution methods were multi-stage pipelines of "first sparse dictionary learning, then patch classification, then reconstruction," with each stage optimized separately, non-differentiable between stages, and impossible to tune end-to-end. SRCNN turned all of this into a single CNN, so a standard SGD backward pass trains all the parameters together, opening up the next decade of development.
 
-Kim et al. addressed the depth limitations of SRCNN by scaling to 20 convolutional layers and introducing global residual learning:
+**Limitations of SRCNN**:
 
-$$
-\hat{x} = y_{\text{up}} + f_{\theta}(y_{\text{up}})
-$$
+- **Too shallow**: only 3 layers, with an effective receptive field of about 13×13, unable to capture structures at the tens-of-pixels scale of natural images
+- **Upsampling first wastes computation**: all computation is performed at HR size; at 4× SR the FLOPs are 16× the LR-space cost
+- **Large convolution kernels (9×9) are inefficient**: many parameters but a limited effective receptive field; the parameter budget is largely consumed by the first layer
+- **No residual**: must directly regress all pixels of HR from input; the optimization objective has large variance, training is slow
 
-Where $y_{\text{up}}$ is the bicubic-interpolated low-resolution input, and $f_{\theta}$ parameterizes the high-frequency residual mapping.
+All subsequent work was solving these problems. Sections 6.3 to 6.7 can be read as "removing SRCNN's limitations one by one."
 
-### Advantages of Residual Learning in Low-Level Vision
+## 6.3 VDSR (2016) — depth + residual
 
-1. **Low-Frequency Preservation**: The base input $y_{\text{up}}$ already provides the low-frequency structure; the network only needs to synthesize missing high-frequency details.
-2. **Reduced Target Variance**: High-frequency residual values center tightly around zero, dropping target variance by orders of magnitude and stabilizing gradient steps.
-3. **Direct Gradient Propagation**: The global identity connection provides a clean gradient highway from loss to input, mitigating gradient vanishing in deep stacks.
+Kim et al. proposed VDSR (Very Deep Super-Resolution), with two core contributions.
+
+### Going deeper to 20 layers
+
+VGG-style stacked 3×3 convolutions. The receptive field of 20 layers can theoretically cover 41×41 of the input, much larger than SRCNN's, letting it leverage broader context.
+
+Going deeper also brings training difficulties: stacking 20 conv layers directly causes gradients to easily amplify or vanish during backpropagation, and the "small learning rate + careful initialization" of the VGG era is still unstable on SR tasks. VDSR's second contribution—residual learning—solves both the expressive-power problem and the optimization stability simultaneously.
+
+### Residual learning
+
+Instead of directly learning HR, learn the **residual** $r = x - y_{\text{up}}$, i.e. HR minus the upsampled LR.
+
+Why is residual learning especially important in low-level vision? From four angles:
+
+1. **The target low frequency is already in the input**: after bicubic upsampling, $y_{\text{up}}$ is already close to the low-frequency component of HR, so the model only needs to learn the **high-frequency complement**, rather than relearning the entire image.
+2. **Smaller residual variance makes optimization easier**: high-frequency components in natural images have absolute values far smaller than the pixels themselves; the residual is mostly close to 0, and the regression-target variance drops by one or two orders of magnitude.
+3. **Sparser gradients**: the residual is nearly zero in flat regions, so the model only needs to invest capacity on edges and texture regions; parameter utilization is high.
+4. **Cross-layer shortcut**: there is an additive shortcut from input to output, allowing backpropagation gradients to bypass the main trunk straight to the input side and avoid vanishing.
 
 ```python
 class VDSR(nn.Module):
-    """VDSR (Kim et al., 2016). Deep 20-layer residual baseline."""
+    """VDSR, 2016. Deep + residual learning."""
     def __init__(self, num_layers: int = 20, base_ch: int = 64):
         super().__init__()
         layers = [nn.Conv2d(3, base_ch, 3, padding=1), nn.ReLU(inplace=True)]
         for _ in range(num_layers - 2):
-            layers += [
-                nn.Conv2d(base_ch, base_ch, 3, padding=1),
-                nn.ReLU(inplace=True)
-            ]
+            layers += [nn.Conv2d(base_ch, base_ch, 3, padding=1),
+                       nn.ReLU(inplace=True)]
         layers.append(nn.Conv2d(base_ch, 3, 3, padding=1))
         self.body = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.body(x)
+    def forward(self, x):
+        # x is the bicubic-upsampled LR
+        return x + self.body(x)  # residual learning: output = input + learned residual
 ```
 
-## 6.4 EDSR (2017): Eliminating Batch Normalization and Refining Architecture
+Performance: about 31.4 dB on Set5 4×, an improvement of about 0.9 dB over SRCNN.
 
-Lim et al. established the structural template for modern restoration CNNs through three critical design choices:
+**Residual learning has since become the de facto standard in low-level vision**. Every subsequent network (EDSR, RCAN, RRDB, NAFNet, SwinIR, Restormer, all the way through to the UNets used in diffusion) uses residuals; the only differences are how the residual is nested and whether it carries a scale coefficient.
+
+**Limitations of VDSR**:
+
+- It still goes through the network only after bicubic upsampling, wasting a lot of computation (at 4×, the computation is 16× the LR-space cost)
+- No normalization and no scale coefficient: numerical values drift easily in deep networks
+- The residual is a "global residual" with no block-internal residual; further depth quickly hits training-stability problems
+
+## 6.4 EDSR (2017) — removing BN, standardizing the residual block
+
+Lim et al. proposed EDSR (Enhanced Deep Residual Super-Resolution), the "engineering baseline" network for low-level vision. Several decisions in EDSR have influenced all subsequent CNN work.
+
+### Decision one: remove Batch Normalization
+
+The standard ResNet residual block is `Conv → BN → ReLU → Conv → BN`. The EDSR paper found that **removing BN actually works better in low-level vision**.
+
+This section is expanded a bit, because this is one critical difference between low-level and high-level vision that has been chronically confused.
+
+**What BN does.** Batch Normalization gathers all pixel values of one channel across the current mini-batch, computes the mean $\mu$ and variance $\sigma^2$, then performs $\hat{x} = (x - \mu) / \sigma$, and finally uses learnable $\gamma, \beta$ to restore some scale degrees of freedom. Physically it means "normalize this channel's activation distribution to zero mean and unit variance."
+
+**Why it works for high-level vision.** The final classification objective is invariant—adding a global brightness layer to a cat is still a cat. BN normalizes away absolute brightness information, letting the network focus on the genuinely discriminative features. And at large batch sizes, $\mu, \sigma$ estimates are stable, so training and test behaviors match.
+
+**Why it does not work for low-level vision, in four points.**
+
+1. **The target is the pixels themselves**. SR / denoising / deblurring outputs are pixel values, and normalization breaks the "absolute scale" relation between input and output, forcing the model to spend capacity learning the relation back.
+2. **Sensitive to in-batch statistics**. Low-level vision training patches are often very small (typical 48×48 or 64×64), and batch sizes are limited by memory (4-16 typical). Under "small batch + small patch," the variance of $\mu, \sigma$ is high, and the normalization target seen at each step jitters.
+3. **Train-test mismatch**. At test time BN switches to whole-dataset EMA statistics, different from the mini-batch statistics during training. The output then has a small but stable color shift, hurting pixel-level metrics like PSNR.
+4. **Restricts model size**. BN's intermediate tensors require extra memory for means/variances/scales, tightening already-tight SR memory budgets; skipping BN frees memory for more residual blocks or wider channels.
+
+**After removing BN**:
+
+- The model becomes more accurate in low-contrast or solid-color regions, because there is no color drift from normalization
+- A larger network can be used; the saved memory can be invested in depth or width
+- Training stability actually improves, because there is no longer batch-to-batch statistical jitter
+
+This is a **very important difference** between low-level and high-level vision: BN/LayerNorm are essential in high-level vision, but in low-level vision they are often harmful. LayerNorm is fine in Transformer-based low-level vision; §6.9 addresses why separately.
+
+### Decision two: compute in LR space + PixelShuffle upsampling at the end
+
+EDSR fixes the waste of computing in HR space that VDSR suffered from: all feature extraction is done in LR space, and the final upsampling uses **PixelShuffle** (sub-pixel convolution) in a one-shot upsample at the tail.
+
+The essence of PixelShuffle: it converts the channel dimension into the spatial dimension. It rearranges $(B, r^2 C, H, W)$ into $(B, C, rH, rW)$. Concretely, the same pixel position from every $r^2$ adjacent channels is placed into one $r \times r$ small block. What used to be "many channels representing many kinds of detail at the same spatial position" is reinterpreted as "the same channel representing detail on a denser spatial grid."
+
+Why this is key for saving compute: every convolution happens on $(H, W)$ low-resolution feature maps; FLOPs scale with $HW$, while PixelShuffle itself is an $O(1)$ in-memory rearrangement with no multiplies-adds. By contrast, VDSR feeds full HR-sized tensors into each conv, so per-layer FLOPs are $r^2$ times the LR version.
+
+```python
+# PyTorch has built-in PixelShuffle, but understand the math:
+# Input  (B, r^2 * C, H, W)
+# Output (B, C, rH, rW)
+# Rearrangement: every r^2 channels → an r×r spatial block
+import torch.nn as nn
+
+class UpsampleBlock(nn.Module):
+    """EDSR-style upsample module.
+    Supports 2/3/4×. 4× = two 2× steps."""
+    def __init__(self, in_ch: int, scale: int):
+        super().__init__()
+        layers = []
+        if scale in (2, 3):
+            layers += [
+                nn.Conv2d(in_ch, in_ch * scale * scale, 3, padding=1),
+                nn.PixelShuffle(scale),
+            ]
+        elif scale == 4:
+            for _ in range(2):
+                layers += [
+                    nn.Conv2d(in_ch, in_ch * 4, 3, padding=1),
+                    nn.PixelShuffle(2),
+                ]
+        else:
+            raise NotImplementedError(f"scale={scale} not supported")
+        self.up = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.up(x)
+```
+
+Why PixelShuffle is the de facto standard, compared with several other upsampling schemes:
+
+- **Transposed conv** (deconvolution): learns upsampling directly via a stride-greater-than-1 deconvolution. The problem is **checkerboard artifacts** when stride and kernel size do not match—periodic small brightness variations every $r$ pixels, visible to the eye and hard to remove.
+- **Nearest + conv** or **bilinear + conv**: upscale first with a fixed interpolation, then convolve. Works, but completely decouples upsampling from the subsequent conv, so the model can only "fine-tune on top of a frequency response shape determined by the interpolation kernel"; parameter efficiency is low.
+- **PixelShuffle**: a learned reorder via a convolution with $r^2$ times the channels—the most parameter-efficient, free of checkerboard artifacts (provided ICNR initialization is used), and integrates naturally with the LR-space convolution trunk.
+
+In real engineering PixelShuffle is the **default choice**. Unless there is a special reason—e.g. the deployment platform does not support channel-to-space ops, or you need arbitrary scale rather than 2/3/4×—do not use transposed conv.
+
+### Decision three: standardizing the residual block
+
+The EDSR residual block is just `Conv → ReLU → Conv` + residual, **with no normalization**. This seemingly austere design became the standard for the years that followed.
+
+```python
+class ResidualBlock(nn.Module):
+    """EDSR-style residual block: no BN, no activation at the tail of the residual path."""
+    def __init__(self, ch: int = 64, res_scale: float = 1.0):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=1),
+        )
+        self.res_scale = res_scale
+
+    def forward(self, x):
+        return x + self.body(x) * self.res_scale
+
+
+class EDSR(nn.Module):
+    """EDSR, 2017. The engineering baseline of low-level vision."""
+    def __init__(self, scale: int = 4, num_blocks: int = 16,
+                 ch: int = 64, res_scale: float = 0.1):
+        super().__init__()
+        self.head = nn.Conv2d(3, ch, 3, padding=1)
+        self.body = nn.Sequential(*[
+            ResidualBlock(ch, res_scale) for _ in range(num_blocks)
+        ])
+        self.body_tail = nn.Conv2d(ch, ch, 3, padding=1)
+        self.upsample = UpsampleBlock(ch, scale)
+        self.tail = nn.Conv2d(ch, 3, 3, padding=1)
+
+    def forward(self, x):
+        # x: LR (B, 3, H, W)
+        feat = self.head(x)
+        body = self.body_tail(self.body(feat)) + feat   # global residual
+        out = self.tail(self.upsample(body))
+        return out
+```
+
+**res_scale = 0.1** is a small engineering detail: it shrinks the output of the residual path by a factor of 10 before adding it back to the trunk, preventing residual accumulation in deep networks from causing numerical divergence. Intuitively: if each residual block's output has variance $\sigma^2$, then without scale the variance after $N$ layers is roughly $N \sigma^2$; with a 0.1 scale, variance grows only by $0.01 N \sigma^2$. For 16-32-layer networks this is a notable difference. The trick has been widely adopted since EDSR; RCAN/ESRGAN/RRDB all use similar "residual path × small constant."
+
+Drawing the structural difference among SRCNN/VDSR/EDSR makes it more directly visible how "do the work in LR space + final-stage PixelShuffle" compresses the compute back:
 
 ```mermaid
 graph TD
@@ -169,86 +343,73 @@ graph TD
     style EDSR fill:#e8f5e9
 ```
 
-### 1. The Removal of Batch Normalization
+The three sub-diagrams are arranged from top to bottom in increasing closeness to modern design. The blue SRCNN runs its whole chain at HR size with no skip. The yellow VDSR adds an overall skip but still works in HR space. The green EDSR is the prototype of modern SR: all feature extraction in LR space, one-shot upsample at the tail, each residual block with its own scale. All later, more complex networks (RCAN, RRDB, NAFNet) inherit this third skeleton; only the block internals get more refined.
 
-Standard ResNet blocks apply `Conv → BN → ReLU → Conv → BN`. EDSR demonstrated that **removing Batch Normalization improves restoration fidelity**:
+## 6.5 RCAN (2018) — introducing attention
 
-- **Scale Preservation**: Batch Normalization rescales activations using mini-batch statistics, destroying absolute luminance and color intensity information required for pixel regression.
-- **Small-Batch Instability**: Restoration training operates on small spatial crops ($48 \times 48$ to $64 \times 64$) with small batch sizes ($4\text{ to }16$). Batch statistics exhibit high variance under these conditions, injecting noise into optimization.
-- **Train-Test Inconsistency**: Switching to exponential moving average (EMA) statistics during inference introduces slight spatial color shifts that degrade PSNR.
-- **Memory Efficiency**: Removing BN saves intermediate activation memory, allowing the parameter budget to be reallocated toward deeper stacks and wider channels.
+One direction after EDSR is to bring **attention mechanisms** into low-level vision. Zhang et al.'s RCAN (Residual Channel Attention Network) is the representative.
 
-### 2. Feature Extraction in Low-Resolution Space
+### What is Channel Attention
 
-Rather than upsampling inputs before feature extraction, EDSR performs all residual convolutions directly in low-resolution space, executing spatial upsampling in a single step at the network tail via **PixelShuffle**. This reduces per-layer FLOPs by a factor of $r^2$.
+Different channels learn different features—some channels are sensitive to **textures**, some to **edges**, some to **low-frequency color**, and some may be redundant. Channel Attention lets the model learn a **channel weight vector** that automatically amplifies important channels and suppresses unimportant ones, with the weights adaptively decided by the current input features.
+
+The specific Squeeze-and-Excitation–style channel attention has four steps:
+
+1. **Squeeze**: global average pool per channel, turning $(B, C, H, W)$ into $(B, C, 1, 1)$. This step compresses the spatial distribution into one scalar representing the channel's average activation strength over the image.
+2. **Excitation compress**: a 1×1 conv squeezes the channel count to $C / r$ ($r = 16$ typical), with a non-linear mapping. This forces the model to express "inter-channel relations" through a low-dimensional bottleneck.
+3. **Excitation restore**: another 1×1 conv brings the channel count back to $C$, followed by sigmoid, giving $(B, C, 1, 1)$ weights—one number per channel in $[0, 1]$.
+4. **Rescale**: broadcast-multiply these weights back to the original features.
 
 ```python
-class UpsampleBlock(nn.Module):
-    """PixelShuffle upsampling block supporting 2x, 3x, and 4x scale factors."""
-    def __init__(self, in_ch: int, scale: int):
+class ChannelAttention(nn.Module):
+    """SE-style channel attention used by RCAN."""
+    def __init__(self, ch: int, reduction: int = 16):
         super().__init__()
-        layers = []
-        if scale in (2, 3):
-            layers += [
-                nn.Conv2d(in_ch, in_ch * scale * scale, 3, padding=1),
-                nn.PixelShuffle(scale),
-            ]
-        elif scale == 4:
-            for _ in range(2):
-                layers += [
-                    nn.Conv2d(in_ch, in_ch * 4, 3, padding=1),
-                    nn.PixelShuffle(2),
-                ]
-        else:
-            raise NotImplementedError(f"Scale factor {scale} not supported.")
-        self.up = nn.Sequential(*layers)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(ch, ch // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch // reduction, ch, 1),
+            nn.Sigmoid(),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(x)
+    def forward(self, x):
+        # global average pool -> channel squeeze -> channel restore -> sigmoid normalize
+        # Produces per-channel weights (B, C, 1, 1) and broadcast-multiplies them back
+        w = self.fc(self.avg_pool(x))
+        return x * w
 ```
 
-### 3. Residual Scaling (`res_scale = 0.1`)
+The concrete role of channel attention in low-level vision:
 
-Deep residual stacks without normalization can suffer from variance explosion across additive shortcuts. Scaling the residual path by a constant factor (e.g., $0.1$) bounds activation variance and stabilizes deep backpropagation.
+- **Suppressing noise channels**: noise features concentrate in certain channels, attention automatically downweights them, preventing the noise from being amplified by subsequent layers
+- **Amplifying edge channels**: edges are crucial to reconstruction, attention gives them larger weights—a soft gate on "important features"
+- **Adapting to input content**: an image rich in textures and a flat image need different channel weights; fixed-weight plain conv has no such adaptive ability
+- **Nearly free**: each CA module adds only $2 C^2 / r$ parameters, a tiny impact on total parameter count
+
+### Residual in Residual
+
+RCAN nests residual blocks: each RCAB (a residual block with channel attention) is wrapped with another residual; multiple RCABs form a group; the group is wrapped again with a residual; and the entire body has a global residual on top of all of that. This "residual in residual" structure can train networks of more than 400 layers stably.
 
 ```python
-class ResidualBlock(nn.Module):
-    """EDSR-style residual block: no normalization, res_scale variance stabilization."""
-    def __init__(self, ch: int = 64, res_scale: float = 0.1):
+class RCAB(nn.Module):
+    """Residual Channel Attention Block. The basic unit of RCAN."""
+    def __init__(self, ch: int = 64, reduction: int = 16,
+                 res_scale: float = 1.0):
         super().__init__()
         self.body = nn.Sequential(
             nn.Conv2d(ch, ch, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(ch, ch, 3, padding=1),
+            ChannelAttention(ch, reduction),
         )
         self.res_scale = res_scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return x + self.body(x) * self.res_scale
-
-
-class EDSR(nn.Module):
-    """EDSR (Lim et al., 2017). The classic convolutional restoration baseline."""
-    def __init__(self, scale: int = 4, num_blocks: int = 16,
-                 ch: int = 64, res_scale: float = 0.1):
-        super().__init__()
-        self.head = nn.Conv2d(3, ch, 3, padding=1)
-        self.body = nn.Sequential(*[
-            ResidualBlock(ch, res_scale) for _ in range(num_blocks)
-        ])
-        self.body_tail = nn.Conv2d(ch, ch, 3, padding=1)
-        self.upsample = UpsampleBlock(ch, scale)
-        self.tail = nn.Conv2d(ch, 3, 3, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.head(x)
-        body = self.body_tail(self.body(feat)) + feat
-        return self.tail(self.upsample(body))
 ```
 
-## 6.5 RCAN (2018): Channel Attention and Deep Hierarchies
-
-Zhang et al. introduced **Channel Attention (CA)** into low-level vision to dynamically rescale feature channels according to global contextual cues:
+Drawing the data flow inside RCAB makes it easier to compare with the RRDB / NAFNet blocks later:
 
 ```mermaid
 graph LR
@@ -275,33 +436,35 @@ graph LR
     style CAdetail fill:#fff8e1
 ```
 
-```python
-class ChannelAttention(nn.Module):
-    """Squeeze-and-Excitation channel attention used in RCAN."""
-    def __init__(self, ch: int, reduction: int = 16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(ch, ch // reduction, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, 1),
-            nn.Sigmoid(),
-        )
+Performance: about 32.6 dB on Set5 4×, an improvement of about 0.5 dB over EDSR. On the PSNR side of SR, RCAN is still a strong reference today.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.fc(self.avg_pool(x))
-        return x * w
-```
+## 6.6 RRDB (ESRGAN, 2018) — dense connections
 
-By nesting Residual Channel Attention Blocks (RCAB) inside multi-level Residual Groups (RG), RCAN stabilized training across backbones exceeding 400 convolutional layers.
+Wang et al. proposed RRDB (Residual in Residual Dense Block) in ESRGAN. This is the **backbone Real-ESRGAN still uses to this day**.
 
-## 6.6 RRDB (ESRGAN, 2018): Dense Feature Reuse
+### What is a Dense Block
 
-Wang et al. proposed the **Residual-in-Residual Dense Block (RRDB)** in ESRGAN, replacing plain residual blocks with dense connections:
+ResNet uses residual connections (add); DenseNet uses dense connections (concat). At each layer, the outputs of all previous layers are concatenated as input:
+
+$$
+x_{l+1} = H([x_0, x_1, \dots, x_l])
+$$
+
+Advantages:
+
+- **Maximum feature reuse**: every layer directly sees all previous features, without needing "residual accumulation" to indirectly pass them along
+- **Mitigating gradient vanishing**: gradients can pass through any layer directly back to the input, even more thoroughly than plain residual
+- **Parameter efficiency**: the per-layer output channel count is small (growth rate $k$, typical $k = 32$), but features are rich because later layers can concat all earlier ones
+
+Drawbacks to call out: each layer's input channel count grows linearly, so by layer $L$ it is $C_0 + L k$ channels, and the 1×1 conv cost is non-trivial; memory footprint exceeds pure residual. RRDB's compromise is to use dense only at small scale (5-layer dense blocks) and residual between blocks.
+
+### The specific design of RRDB
+
+Each RRDB contains 3 dense blocks; each dense block consists of 5 conv + LeakyReLU layers. There are dense connections inside each block, residual connections between blocks, and one more residual wrapping the whole RRDB. That is, residual appears in three nested layers—this is the origin of the name "Residual in Residual."
 
 ```python
 class DenseBlock(nn.Module):
-    """5-layer dense connection block used in RRDB."""
+    """The 5-layer dense block used by ESRGAN."""
     def __init__(self, ch: int = 64, growth: int = 32):
         super().__init__()
         self.conv1 = nn.Conv2d(ch + 0 * growth, growth, 3, padding=1)
@@ -311,28 +474,28 @@ class DenseBlock(nn.Module):
         self.conv5 = nn.Conv2d(ch + 4 * growth, ch, 3, padding=1)
         self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x1 = self.lrelu(self.conv1(x))
         x2 = self.lrelu(self.conv2(torch.cat([x, x1], 1)))
         x3 = self.lrelu(self.conv3(torch.cat([x, x1, x2], 1)))
         x4 = self.lrelu(self.conv4(torch.cat([x, x1, x2, x3], 1)))
         x5 = self.conv5(torch.cat([x, x1, x2, x3, x4], 1))
-        return x5 * 0.2 + x
+        return x5 * 0.2 + x   # residual scale + residual
 
 
 class RRDB(nn.Module):
-    """Residual-in-Residual Dense Block backbone module."""
+    """Residual in Residual Dense Block."""
     def __init__(self, ch: int = 64, growth: int = 32):
         super().__init__()
         self.db1 = DenseBlock(ch, growth)
         self.db2 = DenseBlock(ch, growth)
         self.db3 = DenseBlock(ch, growth)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         out = self.db1(x)
         out = self.db2(out)
         out = self.db3(out)
-        return out * 0.2 + x
+        return out * 0.2 + x   # one more residual
 ```
 
 Drawing RRDB's "three-layer nesting" clearly:
@@ -365,13 +528,13 @@ graph TD
     style DB fill:#fff8e1
 ```
 
-ESRGAN stacks 23 RRDBs in total, with about 17M parameters. This network is slightly lower than RCAN on the PSNR metric, but combined with GAN training its **visual quality** is far better than the pure-PSNR-optimized RCAN: this is the split between the PSNR camp and the perceptual camp, already discussed in detail in §4.8.
+ESRGAN stacks 23 RRDBs in total, with about 17M parameters. This network is slightly lower than RCAN on the PSNR metric, but combined with GAN training its **visual quality** is far better than the pure-PSNR-optimized RCAN—this is the split between the PSNR camp and the perceptual camp, already discussed in detail in §4.8.
 
-Real-ESRGAN reuses the RRDB network and only swaps the data pipeline and training losses, with completely transformed results. **This once again validates the conclusion of §5.1: data > network.** The same RRDB, trained on bicubic data, gives 18.2 dB PSNR on real images (barely working); trained on Real-ESRGAN pipeline data, it gives 23.8 dB (usable) without changing a single line of network code.
+Real-ESRGAN reuses the RRDB network and only swaps the data pipeline and training losses, with completely transformed results. **This once again validates the conclusion of §5.1: data > network.** The same RRDB, trained on bicubic data, gives 18.2 dB PSNR on real images (barely working); trained on Real-ESRGAN pipeline data, it gives 23.8 dB (usable)—without changing a single line of network code.
 
-## 6.7 NAFNet (2022): Counter-Trend Simplification
+## 6.7 NAFNet (2022) — counter-trend simplification
 
-The trend in low-level vision from 2018 to 2022 was "adding more bells and whistles": Transformer blocks, all sorts of attention, complex normalization, and hybrid architectures. Chen et al.'s NAFNet went the other way, **removing everything that is not strictly necessary**, and yet achieved SOTA on denoising and deblurring. The paper title's "Non-linear Activation Free" openly declares the counter-trend stance.
+The trend in low-level vision from 2018 to 2022 was "adding more bells and whistles": Transformer blocks, all sorts of attention, complex normalization, hybrid architectures. Chen et al.'s NAFNet went the other way—**removing everything that is not necessary**—and yet achieved SOTA on denoising / deblurring. The paper title's "Non-linear Activation Free" openly declares the counter-trend stance.
 
 ### Removal list
 
@@ -380,11 +543,11 @@ The trend in low-level vision from 2018 to 2022 was "adding more bells and whist
 - **Self-Attention**: removed, only an extremely simple channel attention is kept
 - **ReLU**: in the "Plain net," no activation function is used at all
 
-Note: NAFNet **keeps a simplified LayerNorm2d** (once at the start of each block's spatial path and once at the start of the channel path); it does not remove all normalization layers. What it removes are the two "fancy architecture" categories of nonlinearity and attention; normalization is in fact essential for stable training.
+Note: NAFNet **keeps a simplified LayerNorm2d** (once at the start of each block's spatial path and once at the start of the channel path); it does not remove all normalization layers. What it removes are the two "fancy architecture" categories of nonlinearity + attention; normalization is in fact essential for stable training.
 
 ### SimpleGate (replacing GELU)
 
-GELU is $x \cdot \Phi(x)$ (input multiplied by the Gaussian CDF). NAFNet noticed that this is essentially "input multiplied by a gating signal", where $\Phi(x)$ takes values in $[0, 1]$ and acts as a soft gate. If the gating signal itself can be learned adaptively from the features, there is no need to use $\Phi(x)$ as a fixed function.
+GELU is $x \cdot \Phi(x)$ (input multiplied by the Gaussian CDF). NAFNet noticed that this is essentially "input multiplied by a gating signal"—$\Phi(x)$ takes values in $[0, 1]$ and acts as a soft gate. If the gating signal itself can be learned adaptively from the features, there is no need to use $\Phi(x)$ as a fixed function.
 
 Concretely, split the input in half along the channel dimension and multiply element-wise:
 
@@ -401,7 +564,7 @@ class SimpleGate(nn.Module):
         return x1 * x2
 ```
 
-Visual impact: nonlinear capability similar to GELU, **with no learnable parameters and cheaper than GELU**: just chunk + element-wise multiplication, no erf/exp approximation. The cost is that the channel count is halved, so the preceding conv needs to expand channels by 2×.
+Visual impact: nonlinear capability similar to GELU, **with no learnable parameters and cheaper than GELU**—just chunk + element-wise multiplication, no erf/exp approximation. The cost is that the channel count is halved, so the preceding conv needs to expand channels by 2×.
 
 ### Simplified Channel Attention (SCA)
 
@@ -423,7 +586,7 @@ Note:
 - No ReLU
 - No sigmoid (multiplied directly, the weights are not normalized)
 
-This "looks wrong" design actually works: it is a counter-intuitive finding from the NAFNet paper. Intuitively, without sigmoid, the multiplicative coefficients can be arbitrarily large or negative, and training looks like it should be unstable. A plausible explanation for why it works is that LayerNorm2d has already normalized the input into a reasonable range, and SCA's output "weight" combined with LayerNorm's constraint is in fact already bounded in amplitude.
+This "looks wrong" design actually works—it is a counter-intuitive finding from the NAFNet paper. Intuitively, without sigmoid, the multiplicative coefficients can be arbitrarily large or negative, and training looks like it should be unstable. A plausible explanation for why it works is that LayerNorm2d has already normalized the input into a reasonable range, and SCA's output "weight" combined with LayerNorm's constraint is in fact already bounded in amplitude.
 
 ### The full NAFBlock
 
@@ -497,13 +660,6 @@ graph TD
         e2 --> e3[ReLU]
         e3 --> e4[conv 3x3]
         e4 --> e5[× 0.1]
-```mermaid
-graph TD
-    subgraph EDSRb["EDSR ResidualBlock 2017"]
-        e1[x] --> e2[conv 3x3]
-        e2 --> e3[ReLU]
-        e3 --> e4[conv 3x3]
-        e4 --> e5[× 0.1]
         e5 --> e6[+]
         e1 --> e6
         e6 --> e7[out]
@@ -550,111 +706,49 @@ graph TD
     style NAFb fill:#e8f5e9
 ```
 
-## 6.7 NAFNet (2022): Minimalist Nonlinear Gating
+Placing the four blocks together makes the eight-year evolution easier to feel: EDSR's pure two-layer conv plus residual; RCAN's added channel attention at the tail; RRDB's replacing the "conv chain" with "three-layer nested residual wrapping dense blocks"; NAFNet's return to "two simple paths" form but with the nonlinearity replaced by gating. Design complexity rises first then falls, settling at a point that is simpler than RRDB but more refined than EDSR.
 
-Chen et al. introduced **NAFNet (Nonlinear Activation Free Network)**, demonstrating that state-of-the-art restoration performance could be achieved while stripping away complex attention heads, GELU activations, and standard nonlinearities.
+### What NAFNet teaches us
 
-### SimpleGate Mechanism
+The most interesting part of the NAFNet paper is not its specific design but its **ablation study**:
 
-NAFNet replaces nonlinear activation functions (GELU, ReLU) with an element-wise channel-split multiplication:
+- Replacing SE with SCA: no change in quality
+- Replacing GELU with SimpleGate: no change in quality
+- Removing all LayerNorms: a slight drop, but small
+- Removing channel attention entirely: a drop, but limited
+- Replacing the spatial path's depthwise with ordinary 3×3: no change in quality
 
-$$
-\text{SimpleGate}(x) = x_1 \odot x_2, \quad \text{where } x = [x_1, x_2] \in \mathbb{R}^{B \times 2C \times H \times W}
-$$
+Conclusion:
 
-```python
-class SimpleGate(nn.Module):
-    """Channel-split element-wise multiplication gate."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
-```
+> **The key for low-level vision is the allocation of compute budget, not fancy architecture.**
+>
+> Given the same FLOPs, simple and complex networks differ very little in quality;
+> the "complexity" of complex networks mostly brings training instability and deployment difficulty.
 
-### Simplified Channel Attention (SCA)
+This conclusion has a major impact on engineering practice — **prefer simple CNNs in production environments**, unless there is clear evidence that a complex network brings a qualitative leap. The NAFNet paper's "simple does not lose to complex" is also why NAFNet remains a frequently-appearing baseline in 2024-2025 denoising / deblurring benchmarks—it is not surpassed; it is "good enough and easy to deploy."
 
-SCA eliminates the fully-connected bottleneck and sigmoid activations of standard SE modules, computing unnormalized channel multipliers directly via global average pooling and a single $1 \times 1$ convolution:
+## 6.8 Comparison of upsampling methods
 
-```python
-class SCA(nn.Module):
-    """Simplified Channel Attention."""
-    def __init__(self, ch: int):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv2d(ch, ch, 1)
+The position and method of upsampling are critical design decisions in low-level vision. Comparing the methods side by side.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.conv(self.pool(x))
-```
+| Method | Description | Pros | Cons |
+|------|------|------|------|
+| **bicubic + conv** | Input is bicubic-upsampled to HR, then CNN | Simple | Computation in HR space is expensive |
+| **transpose conv** | Deconvolution | Learns upsampling | Checkerboard artifacts |
+| **nearest + conv** | Nearest-neighbor copy + convolution | No artifacts | Poor parameter efficiency |
+| **bilinear + conv** | Bilinear + convolution | Smooth | Slightly blurry |
+| **PixelShuffle** | Sub-pixel conv | Highest parameter efficiency | Possible checkerboard early in training |
+| **PixelShuffle (ICNR init)** | Initialization fix | Fixes the checkerboard issue | Slightly more complex implementation |
 
-### Complete NAFBlock Implementation
+**How are checkerboard artifacts produced?** With transposed conv, stride $s$ and kernel size $k$, each input pixel "spreads" into $k$ output pixels, but the spread windows of adjacent input pixels overlap $k - s$ times in some positions and $k - s - 1$ times in others, so adjacent output pixels accumulate different numbers of "contributions," producing periodic brightness ripples with period $s$—visible to the eye as a checkerboard. PixelShuffle does not have this problem in principle, but if the preceding conv is poorly initialized, "the $r^2$ channels remapped into the same $r \times r$ block" can have very different initial values, and adjacent pixels after rearrangement also differ visibly, producing checkerboard early in training.
 
-```python
-class LayerNorm2d(nn.Module):
-    """2D Channel-wise Layer Normalization."""
-    def __init__(self, ch: int):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ch))
-        self.bias = nn.Parameter(torch.zeros(ch))
-        self.eps = 1e-6
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mu = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        x = (x - mu) / torch.sqrt(var + self.eps)
-        return x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
-
-
-class NAFBlock(nn.Module):
-    """Core building block of NAFNet."""
-    def __init__(self, ch: int, dw_expand: int = 2, ffn_expand: int = 2):
-        super().__init__()
-        # Spatial mixing path
-        self.norm1 = LayerNorm2d(ch)
-        self.conv1 = nn.Conv2d(ch, ch * dw_expand, 1)
-        self.dwconv = nn.Conv2d(ch * dw_expand, ch * dw_expand, 3,
-                                padding=1, groups=ch * dw_expand)
-        self.gate1 = SimpleGate()
-        self.sca = SCA(ch * dw_expand // 2)
-        self.conv2 = nn.Conv2d(ch * dw_expand // 2, ch, 1)
-
-        # Channel mixing path (FFN)
-        self.norm2 = LayerNorm2d(ch)
-        self.conv3 = nn.Conv2d(ch, ch * ffn_expand, 1)
-        self.gate2 = SimpleGate()
-        self.conv4 = nn.Conv2d(ch * ffn_expand // 2, ch, 1)
-
-        # Learnable residual scale parameters
-        self.beta  = nn.Parameter(torch.zeros((1, ch, 1, 1)))
-        self.gamma = nn.Parameter(torch.zeros((1, ch, 1, 1)))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Spatial path
-        y = self.conv2(self.sca(self.gate1(self.dwconv(self.conv1(self.norm1(x))))))
-        x = x + y * self.beta
-
-        # Channel path
-        y = self.conv4(self.gate2(self.conv3(self.norm2(x))))
-        return x + y * self.gamma
-```
-
-NAFNet demonstrated that **appropriate compute allocation and clean optimization paths matter more than architectural complexity**.
-
-## 6.8 Spatial Upsampling Mechanics: A Comparative Analysis
-
-| Upsampling Method | Computational Mechanism | Primary Advantage | Known Failure Mode | Recommended Context |
-|-------------------|------------------------|-------------------|--------------------|---------------------|
-| **Interpolation + Conv** | Fixed spatial resampling followed by conv | Straightforward implementation | High compute cost in HR space | Baseline prototyping |
-| **Transposed Conv** | Stride $> 1$ learnable deconvolution | Learns direct spatial mapping | Periodic checkerboard artifacts | Avoid in modern pipelines |
-| **PixelShuffle** | Channel-to-space tensor rearrangement | Peak parameter and compute efficiency | Initial checkerboard if uncalibrated | Standard modern default |
-| **PixelShuffle + ICNR** | PixelShuffle with grouped kernel initialization | Completely eliminates initialization ripple | Minor initialization setup step | **Production standard** |
-
-### ICNR Initialization Implementation
+**ICNR initialization** (Initialization for Convolutional NN with sub-pixel convolutions) solves PixelShuffle's initialization problem:
 
 ```python
-def icnr_init(tensor: torch.Tensor, scale: int = 2) -> torch.Tensor:
-    """Initializes convolution kernels prior to PixelShuffle to guarantee identical
-    sub-pixel feature initialization, preventing checkerboard artifacts.
-    """
+def icnr_init(tensor: torch.Tensor, scale: int = 2):
+    """Convolution weight initialization before PixelShuffle, avoids checkerboard
+    artifacts in the early stages of training.
+    Essence: make the initial weights of the r^2 sub-groups identical."""
     out_ch = tensor.shape[0]
     sub_ch = out_ch // (scale ** 2)
     sub_kernel = torch.zeros(sub_ch, *tensor.shape[1:])
@@ -664,33 +758,117 @@ def icnr_init(tensor: torch.Tensor, scale: int = 2) -> torch.Tensor:
     return tensor
 ```
 
-## 6.9 Normalization Layers in Image Restoration
+Concretely: first initialize $C$ channels of weights with Kaiming normal, then replicate each of those $C$ channels $r^2$ times to obtain $C r^2$ identical channels. After PixelShuffle rearrangement, "the $r^2$ channels mapped into the same $r \times r$ block" produce identical features at initialization, so adjacent pixel brightness is identical and the checkerboard vanishes. During training, the $r^2$ channels gradually diverge, letting the upsample actually work.
 
-| Normalization Variant | Reduction Dimensions | Operational Behavior in Low-Level Vision | Deployment Recommendation |
-|----------------------|----------------------|------------------------------------------|---------------------------|
-| **Batch Normalization (BN)** | $(B, H, W)$ per channel | Destroys absolute intensity scale; high batch variance | **Prohibited** in restoration |
-| **Group Normalization (GN)** | $(G, H, W)$ per channel group | Batch-independent; acceptable stability | Permitted in large backbones |
-| **Instance Normalization (IN)** | $(H, W)$ per channel instance | Strips global color and contrast distribution | Restricted to style transfer |
-| **Layer Normalization 2D (LN)** | $(C)$ per spatial coordinate | Deterministic per image; stabilizes attention/FFN | **Recommended** for modern backbones |
-| **No Normalization (Identity)** | None | Preserves exact linear dynamic range | **Recommended** for pure CNNs |
+Engineering experience: **PixelShuffle + ICNR initialization by default**, the artifact problem is essentially eliminated.
 
-## 6.10 Activation Functions
+## 6.9 Choice of normalization layer
 
-| Activation Function | Formulation | Operational Characteristics |
-|--------------------|-------------|-----------------------------|
-| **ReLU** | $\max(0, x)$ | Standard, computationally light, susceptible to dead neurons |
-| **LeakyReLU** | $\max(\alpha x, x), \alpha = 0.2$ | Prevents gradient saturation; optimal for GAN discriminators |
-| **SiLU / Swish** | $x \cdot \sigma(x)$ | Smooth continuous transition around zero; modern default |
-| **GELU** | $x \cdot \Phi(x)$ | Standard for Vision Transformers; continuous second derivatives |
-| **SimpleGate** | $x_1 \odot x_2$ | Zero extra parameters; linear scaling; optimal for NAFNet blocks |
+The choice of normalization layer is very different in low-level vision than in high-level vision.
 
-## 6.11 Production Reference Architecture: `SRBaseline`
+| Norm | Dim | In low-level vision | Recommendation |
+|-------|---------|-------------|-------|
+| **BatchNorm** | $(B, H, W)$ | Harmful (breaks scale, unstable at test) | Don't use |
+| **GroupNorm** | $(G, H, W)$ per channel group | Acceptable | Acceptable |
+| **InstanceNorm** | $(H, W)$ per channel | Used for style transfer, not suitable for denoising | Use with caution |
+| **LayerNorm 2d** | $(C)$ per pixel | Modern Transformer standard | Recommended |
+| **No Norm** | none | NAFNet/EDSR, etc. | Recommended |
 
-The following implementation provides a validated starting baseline for super-resolution tasks:
+The action dimensions of the four norms can be distinguished as follows:
+
+- **BatchNorm** computes mean/variance across $(B, H, W)$, one set of statistics per channel. Sensitive to batch size and to train/test consistency.
+- **GroupNorm** splits channels into $G$ groups, each group's mean/variance computed over $(H, W)$. Batch-independent, more stable than BN when batch sizes are small.
+- **InstanceNorm** is GroupNorm's $G = C$ limit—each channel's spatial mean/variance computed alone. Useful in style transfer because it removes the "image's overall color style"; but in denoising / super-resolution that is exactly the information you want to preserve.
+- **LayerNorm 2d** is GroupNorm's $G = 1$ limit—all channels together do "per-pixel normalization." Used in NAFNet/SwinIR/Restormer.
+
+**Why is LayerNorm OK in Transformer-based low-level vision while BN is not?**
+
+- BN normalizes across the batch dimension—the same pixel of the same image behaves differently in different batches, and at test time switching to EMA statistics shifts behavior again
+- LayerNorm normalizes across the channel dimension—it only looks at the feature vector of the current pixel; each image is independent, each pixel is independent
+
+LayerNorm is deterministic for a single image, **with no train-test mismatch**. Attention inside a Transformer block already scrambles the "per-token feature scale" heavily, so a normalization at each block's entry to pull the scale back is needed; LayerNorm fills that role without introducing BN's problems.
+
+Engineering practice:
+
+- Pure CNN networks: **No Norm** (EDSR/NAFNet style)
+- Transformer-based or hybrid networks with attention: **LayerNorm** (SwinIR/Restormer style)
+- Never use BN
+
+## 6.10 Choice of activation function
+
+| Activation | Form | In low-level vision |
+|------|------|-------------|
+| **ReLU** | $\max(0, x)$ | Used by EDSR, simple and stable |
+| **LeakyReLU** | $\max(0.01x, x)$ | Used by ESRGAN, avoids dead neurons |
+| **PReLU** | $\max(a x, x)$, $a$ learnable | Used in early SR, slightly more parameters |
+| **GELU** | $x \cdot \Phi(x)$ | Standard for Transformers |
+| **SiLU/Swish** | $x \cdot \sigma(x)$ | Modern default |
+| **SimpleGate** | $x_1 \odot x_2$ | NAFNet, zero compute |
+
+Several worth expanding. **LeakyReLU**'s negative slope (typical 0.01 or 0.2) solves ReLU's "dead neuron" problem—plain ReLU has zero gradient whenever a neuron has been outputting negative values long enough that its parameters are frozen; LeakyReLU gives the negative side a small slope so the gradient is always non-zero. LeakyReLU is essentially the default in GAN training, because GAN discriminators easily fall into "output is long-term negative" local modes.
+
+**GELU** nearly monopolizes Transformers, because its curve transitions smoothly around 0 (unlike ReLU's kink at 0), making attention-based network optimization more stable. In plain CNNs the difference between GELU and ReLU is small, but compute is slightly higher.
+
+**SiLU / Swish** is $x \cdot \sigma(x)$, with a curve nearly identical to GELU but simpler to implement; it is the de facto default in modern large models. In low-level vision it is commonly interchangeable with GELU.
+
+Engineering experience:
+
+- **Conservative choice**: LeakyReLU(0.2). Stable in all GAN-style training, avoids gradient death
+- **For efficiency**: SimpleGate—zero parameters, zero extra compute
+- **For quality**: SiLU/Swish
+
+## 6.11 Evolution of attention modules
+
+Attention in CNNs is mainly channel attention. The evolution path:
+
+| Module | Complexity | Origin |
+|------|-------|------|
+| **SE** | $C^2/r$ params | Squeeze-Excitation, 2018 |
+| **CA (RCAN)** | Same as SE | Brought into low-level vision |
+| **ECA** | $k$ params (k=3 or 5) | Efficient CA, 2020 |
+| **SCA** | $C^2$ params, no reduction | NAFNet, 2022 |
+| **Sim-AM** | 0 params | Energy-function-based |
+
+**ECA (Efficient Channel Attention)** replaces SE's two FC layers with a 1D convolution:
+
+```python
+class ECA(nn.Module):
+    """Efficient Channel Attention. Almost no parameters."""
+    def __init__(self, ch: int, k_size: int = 3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size,
+                              padding=(k_size - 1) // 2, bias=False)
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        y = self.avg_pool(x).squeeze(-1).squeeze(-1)  # (B, C)
+        y = y.unsqueeze(1)                             # (B, 1, C)
+        y = self.conv(y).squeeze(1)                    # (B, C)
+        y = torch.sigmoid(y).unsqueeze(-1).unsqueeze(-1)
+        return x * y
+```
+
+ECA's design premise is that "inter-channel dependencies are mostly local"—neighbor channels are more correlated, distant channels weakly related. A single 1D conv looking at $k$ neighbors is enough; SE's full connection is unnecessary. In low-level vision benchmarks, ECA and SE are essentially tied, but parameters drop from $C^2 / r$ to $k = 3$ or $5$.
+
+### Spatial Attention in low-level vision
+
+Modules like CBAM add spatial attention—letting the model learn an $(H, W)$ weight map and broadcast it across all channels. It works well in classification and detection, but **gains are limited in low-level vision**. Reasons:
+
+- Low-level vision outputs are per-pixel; pixels at any position matter—there is no "position to ignore"
+- Spatial attention's weight map has smoothness, effectively adding a low-pass filter on the output, which hurts sharpness
+- Genuinely useful long-range spatial dependency is captured by self-attention, not by simple spatial attention
+
+In real engineering, channel attention is the mainstream and spatial attention is rarely used. The self-attention of Chapter 7's Transformer is the real spatial-information modeling.
+
+## 6.12 A complete EDSR-style model
+
+Putting the above concepts together into a production-ready SR network. **This is the engineering baseline** — when you tackle a new task and don't know what to choose, start with this.
 
 ```python
 import torch
 import torch.nn as nn
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, ch: int, res_scale: float = 0.1):
@@ -702,7 +880,7 @@ class ResidualBlock(nn.Module):
         )
         self.res_scale = res_scale
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return x + self.body(x) * self.res_scale
 
 
@@ -712,42 +890,49 @@ class UpsampleBlock(nn.Module):
         layers = []
         if scale == 4:
             for _ in range(2):
-                layers += [
-                    nn.Conv2d(ch, ch * 4, 3, padding=1),
-                    nn.PixelShuffle(2)
-                ]
+                layers += [nn.Conv2d(ch, ch * 4, 3, padding=1),
+                           nn.PixelShuffle(2)]
         elif scale in (2, 3):
-            layers += [
-                nn.Conv2d(ch, ch * scale * scale, 3, padding=1),
-                nn.PixelShuffle(scale)
-            ]
+            layers += [nn.Conv2d(ch, ch * scale * scale, 3, padding=1),
+                       nn.PixelShuffle(scale)]
         self.up = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.up(x)
 
 
 class SRBaseline(nn.Module):
-    """Production-ready convolutional super-resolution baseline (1.5M parameters)."""
+    """Production-ready SR baseline.
+    Depth: 16 residual blocks + 64 channels, about 1.5M parameters.
+    Real-world performance: on RealESRGAN-pipeline data, with L1+VGG+RaGAN losses,
+            it reaches visual quality close to ESRGAN, with 2-3× faster training.
+    """
+
     def __init__(self, scale: int = 4, num_blocks: int = 16,
                  ch: int = 64, res_scale: float = 0.1):
         super().__init__()
         self.head = nn.Conv2d(3, ch, 3, padding=1)
-        self.body = nn.Sequential(*[
-            ResidualBlock(ch, res_scale) for _ in range(num_blocks)
-        ])
+        self.body = nn.Sequential(
+            *[ResidualBlock(ch, res_scale) for _ in range(num_blocks)]
+        )
         self.body_tail = nn.Conv2d(ch, ch, 3, padding=1)
         self.up = UpsampleBlock(ch, scale)
         self.tail = nn.Conv2d(ch, 3, 3, padding=1)
 
-        # Apply ICNR initialization across PixelShuffle projection layers
+        # ICNR initialization for the conv before PixelShuffle
+        # Note on scale: 4× total uses two ×2 steps, so ICNR scale=2 here matches
+        # the per-step scale inside UpsampleBlock. For ×3 direct upscaling, pass scale=3.
         per_step_scale = 2 if scale == 4 else scale
         for m in self.up.modules():
             if isinstance(m, nn.Conv2d):
                 self._icnr_init(m.weight, scale=per_step_scale)
 
     @staticmethod
-    def _icnr_init(weight: torch.Tensor, scale: int = 2):
+    def _icnr_init(weight, scale: int = 2):
+        """ICNR: initialize the convolution weights before PixelShuffle so that
+        the r^2 sub-groups have identical initial weights.
+        scale must equal the upsampling factor of PixelShuffle.
+        """
         out_ch = weight.shape[0]
         sub_ch = out_ch // (scale * scale)
         sub_kernel = torch.empty(sub_ch, *weight.shape[1:])
@@ -755,20 +940,70 @@ class SRBaseline(nn.Module):
         sub_kernel = sub_kernel.repeat(scale * scale, 1, 1, 1)
         weight.data.copy_(sub_kernel)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         feat = self.head(x)
         body = self.body_tail(self.body(feat)) + feat
-        return self.tail(self.up(body))
+        out = self.tail(self.up(body))
+        return out
 ```
 
-## 6.12 Chapter Summary
+This network, trained on RealESRGAN-pipeline synthetic data with L1 + VGG + RaGAN losses, can reach visual quality close to ESRGAN, with about 1.5M parameters—far smaller than ESRGAN's 17M. It is the "use this until you know what to choose" fallback.
 
-1. **Evolutionary Trajectory**: Convolutional restoration architectures evolved through systematic structural refinement: SRCNN (feasibility) $\to$ VDSR (depth + global residuals) $\to$ EDSR (removal of BN + tail PixelShuffle) $\to$ RCAN (channel attention) $\to$ RRDB (dense multi-scale feature reuse) $\to$ NAFNet (nonlinear-free gating).
-2. **Residual Learning as a Universal Standard**: Residual connections isolate high-frequency modeling and stabilize deep gradient propagation across all modern backbones.
-3. **Batch Normalization is Prohibited in Low-Level Vision**: Normalizing across spatial patches corrupts absolute pixel intensity scale and induces train-test distribution shifts.
-4. **Spatial Upsampling Standard**: Low-resolution feature extraction paired with tail PixelShuffle and ICNR initialization maximizes compute efficiency while eliminating checkerboard artifacts.
-5. **Architectural Simplicity vs. Data Scale**: NAFNet and Real-ESRGAN demonstrate that simple, well-conditioned convolutional architectures paired with robust synthetic data pipelines consistently match or exceed complex models in real-world deployment.
+## 6.13 Engineering experience for designing an SR network
+
+If you want to design a CNN enhancement network for a new task from scratch, consider the following in this order.
+
+### Step 1: set the compute budget
+
+- On-device (phone NPU): FLOPs ceiling ~0.5 GFLOPs, params < 1M
+- Real-time on a desktop GPU: FLOPs ceiling ~50 GFLOPs
+- Backend service (A100): up to 200 GFLOPs and beyond
+- Offline processing: no limit
+
+Pick budget first, then architecture. Trying to choose architecture first and squeeze budget after is almost guaranteed to require a rewrite.
+
+### Step 2: allocate the budget between depth and width
+
+Experience: **add depth before width**. Depth contributes more to receptive field and expressive power; width is just more channels and the marginal benefit decreases quickly. Concretely, increasing depth $L \to 2L$ grows receptive field and parameters linearly; increasing width $C \to 2C$ quadruples parameters with limited expressive-power gain.
+
+Typical configurations:
+
+- 1M params: 32 channels × 16 blocks
+- 5M params: 64 channels × 16 blocks
+- 16M params: 64 channels × 23 blocks (the ESRGAN configuration)
+- 50M params or more: consider switching to a Transformer architecture
+
+### Step 3: choose the upsampling location and method
+
+- 99% use PixelShuffle, placed at the tail of the network
+- Global residual from input LR to output HR, so the network only learns the high-frequency complement
+- ICNR initialization is essentially free; include it
+
+### Step 4: choose attention
+
+- Generic tasks: add an SCA or ECA (extremely low overhead, gains 0.1-0.2 dB in PSNR)
+- Tasks that especially need attention (faces, specific textures): consider CBAM or switching directly to a Transformer block
+- On-device deployment: skip attention if you can; softmax is expensive on NPUs
+
+### Step 5: training loss
+
+- PSNR-oriented: a single Charbonnier loss
+- Real-world SR: L1 + VGG + RaGAN (see Chapter 3)
+- Perception-oriented: lower the L1 weight, raise the VGG weight
+
+## 6.14 Summary
+
+1. **The evolution of CNNs in low-level vision is gradual**: SRCNN → VDSR (depth + residual) → EDSR (no BN + tail PixelShuffle) → RCAN (CA + residual-in-residual) → RRDB (dense + three-layer nested residual) → NAFNet (simplification + gating)
+2. **Residual learning is the de facto standard in low-level vision** — every modern network uses it
+3. **Batch Normalization is harmful in low-level vision** — it breaks scale, train-test mismatch; just remove it
+4. **PixelShuffle + ICNR initialization is the de facto standard for upsampling**
+5. **Channel Attention is an effective small improvement** (0.2-0.5 dB); SCA/ECA are low-overhead choices
+6. **NAFNet's lesson**: in low-level vision, what matters is compute-budget allocation, not fancy architecture
+7. **The order for designing a new network**: set budget → depth > width → PixelShuffle → add SCA → choose loss
+8. **The success of Real-ESRGAN proves**: using 2018's RRDB + 2021's data pipeline outperforms using a 2022 new architecture + old data
+
+The CNN story ends here. The next chapter brings Transformers into low-level vision and adds a new dimension to think about — **long-range dependency**. The receptive field of a CNN is local; the self-attention of a Transformer lets every pixel see every other pixel. This has different engineering consequences for denoising, deblurring, and super-resolution.
 
 ---
 
-> Next: [Transformers in Low-Level Vision](07-transformer.md) examines how self-attention mechanisms capture non-local spatial correlations in SwinIR, Restormer, and HAT.
+> Next chapter [Transformers in low-level vision](07-transformer.md) → SwinIR, Restormer, HAT, and how attention mechanisms take over part of the CNN's role.
